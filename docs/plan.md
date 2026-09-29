@@ -106,7 +106,8 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
   each carry their own SH palette (about one entry per splat), so the importer merges every chunk into one asset with
   one 65,536-entry palette. Levels are chosen per `lod-meta.json` leaf on the CPU, and with a budget they fill it
   (PlayCanvas's approach). Streaming (`gs.StreamingPoolSplats`) keeps the coarsest level resident and pages finer
-  levels through a fixed pool. The 13 Pro check is still to do.
+  levels through a fixed pool. `SHUCampusLevel` now renders from the Streamed SOG asset. The 13 Pro check is still to
+  do.
 
 ## 4. Blueprint
 

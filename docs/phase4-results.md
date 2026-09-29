@@ -16,9 +16,10 @@
 - **Not done:** the iPhone 13 Pro check, and the Win64 build (both still open from Phases 2–3).
 
 The Unreal-side changes are in **pending Perforce changelist 363 (not submitted)**, with a review snapshot in
-[integration/nanogs-phase4.patch](../integration/nanogs-phase4.patch). A new asset,
-`/Game/Gaussian/scene_nosky_streamed`, holds the campus scene as a Streamed SOG; it isn't in Perforce yet and the
-level still uses `scene_nosky_sog`.
+[integration/nanogs-phase4.patch](../integration/nanogs-phase4.patch). **`SHUCampusLevel` now renders from the new
+Streamed SOG asset `/Game/Gaussian/scene_nosky_streamed`.** Its source, the `lod-meta.json` folder built by
+`tools/phase4/make_streamed.sh` (537 files, 189 MB), is in `SourceData/scene_building_nosky_streamed/`. The asset,
+the source and the level are all in changelist 363. `scene_nosky_sog` stays in the changelist for comparison.
 
 ![NanoGS LOD vs Streamed SOG at 300K](img/phase4/quad_300k_facade_crop.jpg)
 
@@ -61,8 +62,9 @@ Checked record by record against the source chunks (4.76M splats):
   against the original PLY. Phones only evaluate SH band 1.
 - More k-means iterations don't help (0.393 at 4, 0.390 at 32); the palette size is the limit.
 
-The merge takes about 4 s in the standalone build. Inside the editor the SH clustering takes about 30 s, so a full
-import is about 30 s. The gap wasn't investigated; see Next.
+The merge takes about 4 s in the standalone build and about 6 s for a full import in the editor. In the headless
+automation run (`-nullrhi -unattended`) the SH clustering alone takes about 30 s, probably because that process
+has fewer worker threads.
 
 **NanoGS**
 
@@ -207,9 +209,7 @@ so 600K leaves room for camera motion. Without a budget, desktop views want 1.0�
 
 - iPhone 13 Pro: the Phase 2 and 3 checks, and Streamed SOG at the 300K budget with the 600K pool (streaming on
   device is untested; a failed read only leaves a leaf at a coarser level).
-- Decide whether `SHUCampusLevel` switches to `scene_nosky_streamed` (and add its source data to Perforce).
-- The SH merge is about 7× slower in the editor than in the standalone build; likely vectorization under Unreal's
-  compiler flags.
+- `DefaultLevel` still uses the original `scene_nosky` (PLY import); only `SHUCampusLevel` moved to Streamed SOG.
 
 ## Reproduce
 

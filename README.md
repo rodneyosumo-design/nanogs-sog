@@ -14,7 +14,7 @@ current ~112 bytes per splat, most of which is Float16 spherical harmonics.
 | 1 | Editor importer: `.sog` / SOG `meta.json` → cooked 20-byte records + tables (decision A) | **Done** — [results](docs/phase1-results.md); NanoGS side in pending Perforce changelist 363 |
 | 2 | GPU decode path in NanoGS's compute pass, 16-bit sort keys on mobile | **Implemented** — [results](docs/phase2-results.md); same changelist 363; iPhone 13 Pro capture still to do |
 | 3 | Mobile rasterization tuning (quad extents, reduced-resolution splat target) | **Implemented** — [results](docs/phase3-results.md); campus level on the SOG asset; also fixes the render budget; 13 Pro check still to do |
-| 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | **Implemented** — [results](docs/phase4-results.md); same changelist 363; at the 300K budget 29.8 vs 20.7 dB for NanoGS's LOD; 13 Pro check still to do |
+| 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | **Implemented** — [results](docs/phase4-results.md); same changelist 363; campus level now on the Streamed SOG asset; at the 300K budget 29.8 vs 20.7 dB for NanoGS's LOD; 13 Pro check still to do |
 
 Full plan: [docs/plan.md](docs/plan.md).
 
