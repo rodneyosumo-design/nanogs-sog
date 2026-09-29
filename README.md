@@ -23,8 +23,8 @@ Full plan: [docs/plan.md](docs/plan.md).
 | Path | Contents |
 |---|---|
 | `docs/` | Engineering plan, phase write-ups, comparison images |
-| `blueprint/SOGTypes.h` | CPU layout of the GPU-resident format (20-byte record, 112-byte constants, `PackSplat`) |
-| `blueprint/SOGDecode.metal` | GPU decode: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
+| `sog/SOGTypes.h` | CPU layout of the GPU-resident format (20-byte record, 112-byte constants, `PackSplat`) |
+| `shaders/SOGDecode.metal` | GPU decode: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
 | `tools/phase0/` | Reference SOG v2 decoder (Python), analysis, render comparison, blueprint tests |
 | `results/` | Phase 0 measurements (JSON), golden test vectors, the real asset's `meta.json` |
 | `data/` | Large generated files (SOG, PLYs, renders, test binaries). Git-ignored; recreate with the script below |

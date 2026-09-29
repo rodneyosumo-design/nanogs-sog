@@ -37,10 +37,10 @@ mkdir -p "$ROOT/docs/img/phase0" && cp "$DATA"/renders/*_compare.jpg "$ROOT/docs
 echo "== blueprint tests"
 cd "$HERE/blueprint_tests"
 ../.venv/bin/python export_test_data.py "$SOG" "$TEST"
-xcrun -sdk macosx metal -Werror -I "$ROOT/blueprint" -c sog_golden_test.metal -o "$TEST/sog_golden_test.air"
+xcrun -sdk macosx metal -Werror -I "$ROOT/shaders" -c sog_golden_test.metal -o "$TEST/sog_golden_test.air"
 xcrun -sdk macosx metallib "$TEST/sog_golden_test.air" -o "$TEST/sog_golden_test.metallib"
 swift run_metal_test.swift "$TEST" "$TEST/sog_golden_test.metallib" > "$RESULTS/metal_test_result.json"
-clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I "$ROOT/blueprint" test_pack.cpp -o "$TEST/test_pack"
+clang++ -std=c++17 -O2 -Wall -Wextra -Werror -I "$ROOT/sog" test_pack.cpp -o "$TEST/test_pack"
 "$TEST/test_pack" "$TEST" > "$RESULTS/pack_test_result.json"
 
 echo "== done: results in $RESULTS"
