@@ -92,6 +92,9 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
 - Premultiplied blending, read-only depth test against scene depth, no depth writes.
 - Antialias compensation for `antialias: true` assets.
 - Done when the Quad view with the crowd holds 30 fps on the 13 Pro.
+- Status (2026-09-29): implemented, see [phase3-results.md](phase3-results.md). Depth writes stay on (no
+  measurable cost on the M4), no sub-pixel culling, and the render budget now coarsens LOD instead of
+  dropping regions. The 13 Pro check is still to do.
 
 **Phase 4: API, streaming, memory.**
 - Keep the component plus console-variable API; add `gs.SortKeyBits` and `gs.ScreenPercentage` to device
