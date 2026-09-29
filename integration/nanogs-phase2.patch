@@ -1,0 +1,2871 @@
+# NanoGS changes for SOG Phase 2, on top of Phase 1 (nanogs-phase1.patch). Both are in pending Perforce
+# changelist 363 (not submitted). Excludes the Mac dylibs; Plugins/NanoGS/Shaders/Private/SOGDecode.ush is this
+# repo's shaders/SOGDecode.ush (tools/sync_nanogs.sh). Base: the Phase 1 state of the files below.
+
+diff -ruN a/Config/DefaultDeviceProfiles.ini b/Config/DefaultDeviceProfiles.ini
+--- a/Config/DefaultDeviceProfiles.ini	2026-09-29 13:57:15
++++ b/Config/DefaultDeviceProfiles.ini	2026-09-29 14:00:38
+@@ -4,6 +4,8 @@
+ bIsVisibleForAssets=True
+ +CVars=gs.OverrideSHOrder=1
+ +CVars=gs.OverrideLODErrorThreshold=0.08
++; NanoGS: 16-bit log-depth sort keys, 2 radix passes instead of 4
+++CVars=gs.SortKeyBits=16
+ +TextureLODGroups=(Group=TEXTUREGROUP_World,				MaxLODSize=1024,	OptionalMaxLODSize=512,		OptionalLODBias=0, MaxLODSize_Smaller=1024,		MaxLODSize_Smallest=512,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldNormalMap,		MaxLODSize=512,		OptionalMaxLODSize=128,		OptionalLODBias=0, MaxLODSize_Smaller=512,		MaxLODSize_Smallest=256,    LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldSpecular,		MaxLODSize=256,		OptionalMaxLODSize=64,		OptionalLODBias=0, MaxLODSize_Smaller=256,		MaxLODSize_Smallest=128,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+@@ -22,6 +24,8 @@
+ +CVars=gs.MaxRenderBudget=300000
+ +CVars=gs.OverrideSHOrder=1
+ +CVars=gs.OverrideLODErrorThreshold=0.08
++; NanoGS: 16-bit log-depth sort keys, 2 radix passes instead of 4
+++CVars=gs.SortKeyBits=16
+ +CVars=r.MobileContentScaleFactor=2
+ ; --- 2026-09-03 mobile perf tuning (UDS + general) ---
+ +CVars=r.MaterialQualityLevel=0
+diff -ruN a/Plugins/NanoGS/Shaders/Private/CalcDistances.usf b/Plugins/NanoGS/Shaders/Private/CalcDistances.usf
+--- a/Plugins/NanoGS/Shaders/Private/CalcDistances.usf	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Shaders/Private/CalcDistances.usf	1969-12-31 19:00:00
+@@ -1,52 +0,0 @@
+-// Copyright Epic Games, Inc. All Rights Reserved.
+-
+-//For each splat, extracts Z coordinate from ViewDataBuffer.Converts depth to sortable uint
+-
+-#include "/Engine/Public/Platform.ush"
+-#include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
+-
+-// Shader parameters
+-StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+-RWStructuredBuffer<uint> DistanceBuffer;
+-RWStructuredBuffer<uint> KeyBuffer;
+-uint SplatCount;
+-
+-#ifndef THREADGROUP_SIZE
+-#define THREADGROUP_SIZE 256
+-#endif
+-
+-[numthreads(THREADGROUP_SIZE, 1, 1)]
+-void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+-{
+-	uint splatIndex = DispatchThreadId.x;
+-	if (splatIndex >= SplatCount)
+-	{
+-		return;
+-	}
+-
+-	// Load clip position from view data
+-	float4 clipPos = ViewDataBuffer[splatIndex].ClipPosition;
+-
+-	// Invalid splat (behind camera) - marked with w <= 0
+-	if (clipPos.w <= 0.0)
+-	{
+-		DistanceBuffer[splatIndex] = 0xFFFFFFFF; // Sort to end
+-		KeyBuffer[splatIndex] = splatIndex;
+-		return;
+-	}
+-
+-	// Calculate depth (Z/W for perspective, normalized to [0,1])
+-	float depth = clipPos.z / clipPos.w;
+-
+-	// Convert to sortable uint for back-to-front sorting
+-	// UE uses reversed-Z: near=1, far=0. So ascending sort of depth values
+-	// naturally gives back-to-front order (far/small values first, near/large values last).
+-	uint depthBits = asuint(depth);
+-
+-	// Flip sign bit for proper float-to-sortable-uint conversion
+-	// This ensures correct ordering for both positive and negative floats
+-	depthBits ^= (-(int)(depthBits >> 31)) | 0x80000000;
+-
+-	DistanceBuffer[splatIndex] = depthBits;
+-	KeyBuffer[splatIndex] = splatIndex;
+-}
+diff -ruN a/Plugins/NanoGS/Shaders/Private/CalcViewData.usf b/Plugins/NanoGS/Shaders/Private/CalcViewData.usf
+--- a/Plugins/NanoGS/Shaders/Private/CalcViewData.usf	2026-08-10 20:17:51
++++ b/Plugins/NanoGS/Shaders/Private/CalcViewData.usf	2026-09-29 13:46:44
+@@ -4,11 +4,36 @@
+ 
+ #include "/Plugin/NanoGS/Private/GaussianSplatting.ush"
+ 
+-// Shader parameters
++#ifndef GS_SOG
++#define GS_SOG 0
++#endif
++
++// Shader parameters. Each permutation declares only the splat buffers it reads, so the other
++// permutation's buffers never need a binding.
++#if GS_SOG
++#include "/Plugin/NanoGS/Private/SOGDecode.ush"
++ByteAddressBuffer SOGRecordBuffer;   // 20 bytes/splat SOG records
++ByteAddressBuffer SOGTableBuffer;    // float[512]: scale LUT, then DC LUT
++ByteAddressBuffer SOGPaletteBuffer;  // half4 SH palette, (SHBufferCoeffs - 1) entries per label
++float4 SOGFileToLocalRow0;           // Rows of the SOG file -> local transform: xyz = 3x3, w = translation
++float4 SOGFileToLocalRow1;
++float4 SOGFileToLocalRow2;
++float3 SOGMeanMin;                   // Log-domain position range (meta.json means.mins / maxs)
++float3 SOGMeanMax;
++#else
+ ByteAddressBuffer PackedSplatBuffer;  // 16 bytes/splat packed data
+-ByteAddressBuffer SHBuffer;           // SH data (currently unused)
++ByteAddressBuffer SHBuffer;           // Float16 SH data, DC + higher-order coefficients
++#endif
+ RWStructuredBuffer<FGaussianSplatViewData> ViewDataBuffer; //pass calculated result to ViewDataBuffer
+ 
++// Depth-sort keys for the global radix sort, one per ViewDataBuffer entry (written when WriteSortKeys = 1)
++RWStructuredBuffer<uint> DistanceBuffer;  // sort key
++RWStructuredBuffer<uint> KeyBuffer;       // ViewDataBuffer index
++uint WriteSortKeys;
++uint SortKeyBits;          // 32: float depth keys; 16: log view depth over [near plane, far distance] (perspective only)
++float SortKeyLogNear;      // log2(near plane distance)
++float SortKeyInvLogRange;  // 1 / log2(far distance / near plane distance)
++
+ // Cluster visibility integration (UNIFIED APPROACH)
+ // SplatClusterIndexBuffer maps ALL splats (original + LOD) to their cluster
+ // - Original splats (index < OriginalSplatCount) -> leaf cluster ID
+@@ -67,25 +92,65 @@
+ 	return (LODClusterSelectedBitmap[bitmapIndex] & bitMask) != 0;
+ }
+ 
++// Sort key for a ViewDataBuffer entry. Ascending order is back-to-front; culled splats sort last.
++void WriteSortKey(uint outputIndex, float4 clipPos, bool bCulled)
++{
++	if (WriteSortKeys == 0u)
++	{
++		return;
++	}
++	uint key;
++	if (bCulled)
++	{
++		key = (SortKeyBits == 16u) ? 0xFFFFu : 0xFFFFFFFFu;
++	}
++	else if (SortKeyBits == 16u)
++	{
++		// Clip w is the view depth. Keys fall as depth grows; 0xFFFF stays reserved for culled splats.
++		// 65535 log steps over near..far (10 cm..1 km by default) resolve 0.014% of the depth.
++		float t = saturate((log2(clipPos.w) - SortKeyLogNear) * SortKeyInvLogRange);
++		key = (uint)round((1.0 - t) * 65534.0);
++	}
++	else
++	{
++		// Reversed-Z device depth (near = 1, far = 0) as a sortable uint: ascending = far first
++		key = asuint(clipPos.z / clipPos.w);
++		key ^= (-(int)(key >> 31)) | 0x80000000;
++	}
++	DistanceBuffer[outputIndex] = key;
++	KeyBuffer[outputIndex] = outputIndex;
++}
++
++uint PackClusterID(uint clusterID, uint lodLevel)
++{
++	return (clusterID & VIEWDATA_CLUSTER_ID_MASK) | ((lodLevel & 0x7Fu) << 24);
++}
++
+ // Helper: write an invalid (culled) splat into ViewDataBuffer
+ void WriteInvalidSplat(uint outputIndex, uint clusterID, uint lodLevel)
+ {
+ 	FGaussianSplatViewData viewData;
+-	viewData.ClipPosition = float4(0, 0, 0, -1);
+ 	viewData.TranslatedWorldPos = float3(0, 0, 0);
+-	viewData.TranslatedWorldPosPad = 0;
++	viewData.ClusterIDAndFlags = PackClusterID(clusterID, lodLevel) | VIEWDATA_CULLED;
+ 	viewData.PackedColorRG = 0;
+ 	viewData.PackedColorBA = 0;
+-	viewData.Axis1 = float2(0, 0);
+-	viewData.Axis2 = float2(0, 0);
+-	viewData.ClusterID = clusterID;
+-	viewData.Padding = lodLevel;
++	viewData.PackedAxis1 = 0;
++	viewData.PackedAxis2 = 0;
+ 	ViewDataBuffer[outputIndex] = viewData;
++	WriteSortKey(outputIndex, float4(0, 0, 0, 1), true);
+ }
+ 
+ // Core: transform a single splat to screen space and write to ViewDataBuffer
+ void ProcessSplat(uint splatIndex, uint outputIndex, uint selectedClusterID, uint selectedLODLevel)
+ {
++#if GS_SOG
++	// Decode the SOG record: position and covariance come out in the file frame and are mapped to local
++	const FSOGRecord sog = SOGLoadRecord(SOGRecordBuffer, splatIndex);
++	const float3x3 fileToLocal = float3x3(SOGFileToLocalRow0.xyz, SOGFileToLocalRow1.xyz, SOGFileToLocalRow2.xyz);
++	float3 localPos = mul(fileToLocal, SOGMean(sog, SOGMeanMin, SOGMeanMax))
++		+ float3(SOGFileToLocalRow0.w, SOGFileToLocalRow1.w, SOGFileToLocalRow2.w);
++	float opacity = SOGOpacity(sog.ScaleOpacity) * OpacityScale;
++#else
+ 	// Unpack splat data from packed buffer
+ 	FUnpackedSplat splat = UnpackSplat(PackedSplatBuffer, splatIndex);
+ 
+@@ -94,6 +159,7 @@
+ 	float3 scale = splat.Scale * SplatScale;
+ 	float4 colorOpacity = splat.ColorOpacity;
+ 	float opacity = colorOpacity.a * OpacityScale;
++#endif
+ 
+ 	// Transform to world space
+ 	float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+@@ -122,7 +188,11 @@
+ 	viewPos.y = clamp(viewPos.y / viewPos.z, -limY, limY) * viewPos.z;
+ 
+ 	// Calculate covariance
++#if GS_SOG
++	float3x3 cov3D_local = SOGCovarianceLocal(SOGQuat(sog.Quat), SOGScale(SOGTableBuffer, sog.ScaleOpacity) * SplatScale, fileToLocal);
++#else
+ 	float3x3 cov3D_local = CalcCovariance3D(rotation, scale);
++#endif
+ 	float3x3 localToWorldRot = (float3x3)LocalToWorld;
+ 	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+ 	float3x3 viewMat = (float3x3)WorldToView;
+@@ -160,6 +230,22 @@
+ 	// Compute final color
+ 	float3 finalColor;
+ 
++#if GS_SOG
++	{
++		const uint bands = UseSHRendering ? SHOrder : 0u;
++		float3 dirFile = float3(0, 0, 1);
++		if (bands > 0u)
++		{
++			// Camera -> splat direction in the SOG file frame (the frame the SH were trained in).
++			// fileToLocal is a scaled orthogonal matrix, so its transpose maps directions back.
++			float3 viewDirWorld = normalize(CameraPosition - worldPos.xyz);
++			float3 viewDirLocal = mul(viewDirWorld, transpose((float3x3)LocalToWorld));
++			dirFile = normalize(-mul(viewDirLocal, fileToLocal));
++		}
++		// SHBufferCoeffs counts the DC term; the palette holds only the higher-order coefficients
++		finalColor = SOGColor(SOGTableBuffer, SOGPaletteBuffer, sog, dirFile, bands, SHBufferCoeffs - 1u);
++	}
++#else
+ 	if (UseSHRendering && NumSHCoeffs > 0)
+ 	{
+ 		// View-dependent SH rendering
+@@ -208,19 +294,18 @@
+ 		// Output sRGB values directly — linear conversion deferred to composite pass.
+ 		finalColor = colorOpacity.rgb;
+ 	}
++#endif
+ 
+-	// Store view data
++	// Store view data (the vertex shader recomputes the clip position from TranslatedWorldPos)
+ 	FGaussianSplatViewData viewData;
+-	viewData.ClipPosition = clipPos;
+ 	viewData.TranslatedWorldPos = translatedWorldPos;
+-	viewData.TranslatedWorldPosPad = 0;
++	viewData.ClusterIDAndFlags = PackClusterID(selectedClusterID, selectedLODLevel);
+ 	viewData.PackedColorRG = PackHalf2x16(finalColor.rg);
+ 	viewData.PackedColorBA = PackHalf2x16(float2(finalColor.b, opacity));
+-	viewData.Axis1 = axis1;
+-	viewData.Axis2 = axis2;
+-	viewData.ClusterID = selectedClusterID;
+-	viewData.Padding = selectedLODLevel;
++	viewData.PackedAxis1 = PackHalf2x16(axis1);
++	viewData.PackedAxis2 = PackHalf2x16(axis2);
+ 	ViewDataBuffer[outputIndex] = viewData;
++	WriteSortKey(outputIndex, clipPos, false);
+ }
+ 
+ [numthreads(256, 1, 1)]
+diff -ruN a/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush b/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush
+--- a/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush	2026-09-29 13:46:27
+@@ -11,19 +11,20 @@
+ #define SH_C0 0.28209479177387814f
+ 
+ // Per-frame view data structure (must match C++ FGaussianSplatViewData)
+-// Total: 64 bytes per splat (with TranslatedWorldPos for velocity, 16-byte aligned)
++// Total: 32 bytes per splat. The vertex shader derives the clip position and the velocity from
++// TranslatedWorldPos with the current and previous frame's matrices.
+ struct FGaussianSplatViewData
+ {
+-	float4 ClipPosition;       // Clip space position (xyz, w)
+-	float3 TranslatedWorldPos; // Translated world position for velocity calculation
+-	float TranslatedWorldPosPad; // Padding for alignment
++	float3 TranslatedWorldPos; // Splat centre: world + PreViewTranslation of the frame it was computed in
++	uint ClusterIDAndFlags;    // Cluster ID (24 bits) | LOD level << 24 (7 bits) | VIEWDATA_CULLED
+ 	uint PackedColorRG;        // Half-float packed R,G
+-	uint PackedColorBA;        // Half-float packed B,A
+-	float2 Axis1;              // 2D covariance principal axis 1
+-	float2 Axis2;              // 2D covariance principal axis 2
+-	uint ClusterID;            // Cluster ID for debug visualization
+-	uint Padding;              // Padding for 16-byte alignment
++	uint PackedColorBA;        // Half-float packed B, opacity
++	uint PackedAxis1;          // Half-float packed 2D covariance principal axis 1 (NDC)
++	uint PackedAxis2;          // Half-float packed 2D covariance principal axis 2 (NDC)
+ };
++
++#define VIEWDATA_CLUSTER_ID_MASK 0x00FFFFFFu
++#define VIEWDATA_CULLED 0x80000000u   // Behind the camera, outside the frustum or not selected
+ 
+ // Chunk info for quantized data (must match C++ FGaussianChunkInfo)
+ struct FGaussianChunkInfo
+diff -ruN a/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf b/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf
+--- a/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf	2026-08-10 20:17:56
++++ b/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf	2026-09-29 13:47:10
+@@ -1,5 +1,5 @@
+ // Copyright Epic Games, Inc. All Rights Reserved.
+-// Shader version: 5 (Nanite-style velocity: use clip positions for both current/previous, no SV_Position conversion)
++// Shader version: 6 (32-byte view data: clip position and splat-centre velocity computed per vertex)
+ 
+ //RASTERIZATION, Vertex Shader + Pixel Shader
+ 
+@@ -30,22 +30,18 @@
+ }
+ 
+ // Vertex shader parameters
++// NOTE: All matrices are UN-JITTERED to ensure stable positions and velocity when camera is static
+ #if VERTEXSHADER
+ StructuredBuffer<FGaussianSplatViewData> ViewDataBuffer;
+ StructuredBuffer<uint> SortKeysBuffer;
+ uint SplatCount;
+ uint DebugMode;  // 0=off, 1=cluster colors (Nanite-style debug view)
+ uint EnableNanite;  // 1=Nanite enabled, 0=disabled (non-Nanite assets hidden in debug mode)
++float4x4 TranslatedWorldToClip;      // Current frame (same matrix CalcViewData projected with)
++float4x4 PrevTranslatedWorldToClip;  // Previous frame, for velocity
++float3 PrevTranslationDelta;         // PrevPreViewTranslation - PreViewTranslation
+ #endif
+ 
+-// Pixel shader parameters for velocity calculation
+-// NOTE: All matrices are UN-JITTERED to ensure stable velocity when camera is static
+-#if PIXELSHADER
+-float4x4 PrevTranslatedWorldToClip;  // Previous frame's un-jittered matrix for velocity
+-float3 PreViewTranslation;           // Current frame's pre-view translation
+-float3 PrevPreViewTranslation;       // Previous frame's pre-view translation
+-#endif
+-
+ // Convert HSV to RGB (Nanite-style saturated colors)
+ float3 HSVToRGB(float3 hsv)
+ {
+@@ -94,11 +90,18 @@
+ 	float4 Position : SV_POSITION;
+ 	float2 LocalPos : TEXCOORD0;
+ 	float4 Color : TEXCOORD1;
+-	uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
+-	float3 TranslatedWorldPos : TEXCOORD3;  // For velocity calculation in pixel shader
+-	float4 CenterClipPos : TEXCOORD4;       // Splat center clip position for velocity (Nanite-style)
++	nointerpolation uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
++	nointerpolation float4 Velocity : TEXCOORD3; // Encoded velocity of the splat centre (same for the whole quad)
+ };
+ 
++void WriteDegenerate(inout FVertexOutput Output)
++{
++	Output.Position = float4(0, 0, 0, 1);
++	Output.LocalPos = float2(0, 0);
++	Output.Color = float4(0, 0, 0, 0);
++	Output.Velocity = float4(0, 0, 0, 0);
++}
++
+ // Pixel shader output with velocity for TAA/TSR
+ struct FPixelOutput
+ {
+@@ -122,14 +125,10 @@
+ 	// Bounds guard: the instance count comes from GPU-written indirect args and the sort keys
+ 	// from GPU passes; clamp both against SplatCount (buffer capacity) so corrupt or stale GPU
+ 	// data can never drive out-of-bounds buffer reads.
++	Output.DebugFlag = 0;
+ 	if (InstanceId >= SplatCount)
+ 	{
+-		Output.DebugFlag = 0;
+-		Output.Position = float4(0, 0, 0, 1);
+-		Output.LocalPos = float2(0, 0);
+-		Output.Color = float4(0, 0, 0, 0);
+-		Output.TranslatedWorldPos = float3(0, 0, 0);
+-		Output.CenterClipPos = float4(0, 0, 0, 1);
++		WriteDegenerate(Output);
+ 		return Output;
+ 	}
+ 
+@@ -137,38 +136,24 @@
+ 	uint splatIndex = SortKeysBuffer[InstanceId];
+ 	if (splatIndex >= SplatCount)
+ 	{
+-		Output.DebugFlag = 0;
+-		Output.Position = float4(0, 0, 0, 1);
+-		Output.LocalPos = float2(0, 0);
+-		Output.Color = float4(0, 0, 0, 0);
+-		Output.TranslatedWorldPos = float3(0, 0, 0);
+-		Output.CenterClipPos = float4(0, 0, 0, 1);
++		WriteDegenerate(Output);
+ 		return Output;
+ 	}
+ 	FGaussianSplatViewData viewData = ViewDataBuffer[splatIndex];
+ 
+-	// Default: normal rendering mode
+-	Output.DebugFlag = 0;
+-	Output.TranslatedWorldPos = viewData.TranslatedWorldPos;
+-	Output.CenterClipPos = viewData.ClipPosition;
+-
+-	// Check validity (w <= 0 means invalid/behind camera)
+-	if (viewData.ClipPosition.w <= 0.0)
++	// Culled splats (behind the camera, outside the frustum, not selected) sort last and draw nothing
++	float4 clipPos = mul(float4(viewData.TranslatedWorldPos, 1.0), TranslatedWorldToClip);
++	if ((viewData.ClusterIDAndFlags & VIEWDATA_CULLED) != 0u || clipPos.w <= 0.0)
+ 	{
+-		// Output degenerate triangle
+-		Output.Position = float4(0, 0, 0, 1);
+-		Output.LocalPos = float2(0, 0);
+-		Output.Color = float4(0, 0, 0, 0);
+-		Output.TranslatedWorldPos = float3(0, 0, 0);
+-		Output.CenterClipPos = float4(0, 0, 0, 1);
++		WriteDegenerate(Output);
+ 		return Output;
+ 	}
+ 
+ 	// NDC position of splat center
+-	float2 ndc = viewData.ClipPosition.xy / viewData.ClipPosition.w;
++	float2 ndc = clipPos.xy / clipPos.w;
+ 
+ 	// Use covariance-based axes for quad offset
+-	float2 offset = corner.x * viewData.Axis1 + corner.y * viewData.Axis2;
++	float2 offset = corner.x * UnpackHalf2x16(viewData.PackedAxis1) + corner.y * UnpackHalf2x16(viewData.PackedAxis2);
+ 
+ 	// Unpack color
+ 	float2 rg = UnpackHalf2x16(viewData.PackedColorRG);
+@@ -183,16 +168,14 @@
+ 		{
+ 			// Show cluster colors - each cluster gets a unique random color
+ 			// Use opaque rendering for clear debug visualization (like Nanite)
+-			color.rgb = HashToColor(viewData.ClusterID);
++			color.rgb = HashToColor(viewData.ClusterIDAndFlags & VIEWDATA_CLUSTER_ID_MASK);
+ 			color.a = 1.0;  // Fully opaque for solid colors
+ 			Output.DebugFlag = 1;  // Skip Gaussian falloff in pixel shader
+ 		}
+ 		else
+ 		{
+ 			// Non-Nanite asset: don't render (background is already cleared to black)
+-			Output.Position = float4(0, 0, 0, 1);
+-			Output.LocalPos = float2(0, 0);
+-			Output.Color = float4(0, 0, 0, 0);
++			WriteDegenerate(Output);
+ 			return Output;
+ 		}
+ 	}
+@@ -201,13 +184,19 @@
+ 
+ 	// Final clip position
+ 	Output.Position = float4(
+-		(ndc + offset) * viewData.ClipPosition.w,
+-		viewData.ClipPosition.z,
+-		viewData.ClipPosition.w
++		(ndc + offset) * clipPos.w,
++		clipPos.z,
++		clipPos.w
+ 	);
+ 
+ 	Output.LocalPos = corner;
+ 
++	// Velocity for TAA/TSR, from the splat centre: current NDC minus the previous frame's. Both matrices
++	// are un-jittered, so a static camera gives zero velocity.
++	float4 prevClipPos = mul(float4(viewData.TranslatedWorldPos + PrevTranslationDelta, 1.0), PrevTranslatedWorldToClip);
++	float3 velocity = float3(ndc - prevClipPos.xy / prevClipPos.w, clipPos.z / clipPos.w - prevClipPos.z / prevClipPos.w);
++	Output.Velocity = EncodeVelocityToTexture(velocity);
++
+ 	return Output;
+ }
+ 
+@@ -217,27 +206,9 @@
+ 	FPixelOutput Output;
+ 	float4 color = Input.Color;
+ 
+-	// Calculate velocity for TAA/TSR reprojection
+-	// IMPORTANT: Both current and previous clip positions use UN-JITTERED projection matrices.
+-	// This ensures velocity is stable when camera is static (we skip CalcViewData recomputation
+-	// when camera doesn't move, so jittered positions would cause velocity errors).
++	// Velocity was computed per splat in the vertex shader
++	Output.Velocity = Input.Velocity;
+ 
+-	// Current NDC from the splat center's clip position (computed with un-jittered matrix)
+-	float2 CurrentNDC = Input.CenterClipPos.xy / Input.CenterClipPos.w;
+-
+-	// Previous frame: convert TranslatedWorldPos to previous frame's translated world space
+-	float3 WorldPos = Input.TranslatedWorldPos - PreViewTranslation;
+-	float3 PrevTranslatedWorldPos = WorldPos + PrevPreViewTranslation;
+-	float4 PrevClipPos = mul(float4(PrevTranslatedWorldPos, 1.0), PrevTranslatedWorldToClip);
+-	float2 PrevNDC = PrevClipPos.xy / PrevClipPos.w;
+-
+-	// No jitter subtraction needed - both matrices are un-jittered
+-
+-	// Compute velocity in NDC space (current - previous position)
+-	float CurrentDeviceZ = Input.CenterClipPos.z / Input.CenterClipPos.w;
+-	float PrevDeviceZ = PrevClipPos.z / PrevClipPos.w;
+-	float3 Velocity = float3(CurrentNDC - PrevNDC, CurrentDeviceZ - PrevDeviceZ);
+-
+ 	// Debug mode: solid opaque colors without Gaussian falloff (Nanite-style)
+ 	if (Input.DebugFlag != 0)
+ 	{
+@@ -249,7 +220,6 @@
+ 		}
+ 		// Output solid color (no premultiplied alpha, no Gaussian)
+ 		Output.Color = color;
+-		Output.Velocity = EncodeVelocityToTexture(Velocity);
+ 		return Output;
+ 	}
+ 
+@@ -282,7 +252,5 @@
+ 	}
+ 
+ 	Output.Color = color;
+-	// Output velocity for TAA/TSR (Nanite-style encoding)
+-	Output.Velocity = EncodeVelocityToTexture(Velocity);
+ 	return Output;
+ }
+diff -ruN a/Plugins/NanoGS/Shaders/Private/RadixSort.usf b/Plugins/NanoGS/Shaders/Private/RadixSort.usf
+--- a/Plugins/NanoGS/Shaders/Private/RadixSort.usf	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Shaders/Private/RadixSort.usf	2026-09-29 13:43:24
+@@ -1,5 +1,5 @@
+ // GPU Radix Sort - 8-bit LSD, SM5 compatible
+-// 4 passes processing bits 0-7, 8-15, 16-23, 24-31
++// 4 passes processing bits 0-7, 8-15, 16-23, 24-31 (2 passes for 16-bit keys, gs.SortKeyBits)
+ // Each pass: CountCS -> PrefixSumCS -> DigitPrefixSumCS -> ScatterCS
+ 
+ #include "/Engine/Public/Platform.ush"
+@@ -201,12 +201,13 @@
+ uint NumTiles;
+ uint UseIndirectSort;
+ 
+-groupshared uint SharedKeys[TILE_SIZE];
+-groupshared uint SharedVals[TILE_SIZE];
+-groupshared uint SharedDigits[TILE_SIZE];
+-groupshared uint SharedDigitOffsets[NUM_DIGITS]; // per-digit global scatter offset for this tile
+-groupshared uint SharedLocalHist[NUM_DIGITS];    // running count per digit for stable ranking
++// One bit per thread for each digit: word w of digit d holds threads 32w..32w+31 whose key has digit d
++#define MASK_WORDS (BLOCK_THREADS / 32)
+ 
++groupshared uint SharedDigitOffsets[NUM_DIGITS];            // per-digit global scatter offset for this tile
++groupshared uint SharedLocalHist[NUM_DIGITS];               // per-digit count from earlier passes of this tile
++groupshared uint SharedDigitMasks[NUM_DIGITS * MASK_WORDS]; // this pass's threads, by digit
++
+ [numthreads(BLOCK_THREADS, 1, 1)]
+ void ScatterCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID)
+ {
+@@ -218,79 +219,72 @@
+ 	uint sortCount = UseIndirectSort ? SortParams[0] : Count;
+ 	uint numTiles = UseIndirectSort ? SortParams[1] : NumTiles;
+ 
+-	// Load digit offsets for this tile into shared memory
++	// Load digit offsets for this tile into shared memory (thread = digit, NUM_DIGITS == BLOCK_THREADS)
+ 	// SharedDigitOffsets[d] = DigitOffsetBuffer[d] + HistogramBuffer[d * numTiles + tileIdx]
+ 	SharedDigitOffsets[threadIdx] = DigitOffsetBuffer[threadIdx] + HistogramBuffer[threadIdx * numTiles + tileIdx];
+-
+-	// Initialize running histogram for stable ranking
+ 	SharedLocalHist[threadIdx] = 0;
+-	GroupMemoryBarrierWithGroupSync();
++	[unroll]
++	for (uint clearWord = 0; clearWord < MASK_WORDS; clearWord++)
++	{
++		SharedDigitMasks[threadIdx * MASK_WORDS + clearWord] = 0;
++	}
+ 
+-	// Load keys, values, and digits into shared memory
++	// Each thread owns tile elements threadIdx + pass * BLOCK_THREADS (the order CountCS counted them in)
++	uint keys[KEYS_PER_THREAD];
++	uint vals[KEYS_PER_THREAD];
++	[unroll]
+ 	for (uint i = 0; i < KEYS_PER_THREAD; i++)
+ 	{
+-		uint localIdx = threadIdx + i * BLOCK_THREADS;
+-		uint globalIdx = tileStart + localIdx;
+-
+-		if (globalIdx < sortCount)
+-		{
+-			uint key = SrcKeys[globalIdx];
+-			SharedKeys[localIdx] = key;
+-			SharedVals[localIdx] = SrcVals[globalIdx];
+-			SharedDigits[localIdx] = (key >> RadixShift) & 0xFF;
+-		}
+-		else
+-		{
+-			SharedKeys[localIdx] = 0xFFFFFFFF;
+-			SharedVals[localIdx] = 0;
+-			SharedDigits[localIdx] = 0xFF;
+-		}
++		uint globalIdx = tileStart + threadIdx + i * BLOCK_THREADS;
++		keys[i] = (globalIdx < sortCount) ? SrcKeys[globalIdx] : 0xFFFFFFFF;
++		vals[i] = (globalIdx < sortCount) ? SrcVals[globalIdx] : 0;
+ 	}
+ 
+ 	GroupMemoryBarrierWithGroupSync();
+ 
+-	uint tileCount = min(TILE_SIZE, sortCount - tileStart);
+-
+-	// Process elements in KEYS_PER_THREAD passes of BLOCK_THREADS elements each.
+-	// Old approach: each element scanned ALL predecessors (0..localIdx-1), up to 1024 → O(N²).
+-	// New approach: split into 4 passes of 256. A running histogram tracks counts from
+-	// previous passes. Each element only scans within its 256-element pass → ~4x less work.
++	// Stable ranking in KEYS_PER_THREAD passes of BLOCK_THREADS elements. An element's rank within its
++	// digit = count from earlier passes (SharedLocalHist) + earlier threads of this pass with the same
++	// digit, read as popcounts of the digit's thread mask (at most MASK_WORDS words instead of scanning
++	// every earlier element).
++	const uint word = threadIdx >> 5;
++	const uint bit = 1u << (threadIdx & 31u);
++	[unroll]
+ 	for (uint pass = 0; pass < KEYS_PER_THREAD; pass++)
+ 	{
+-		uint localIdx = pass * BLOCK_THREADS + threadIdx;
+-
+-		if (localIdx < tileCount)
++		const bool active = (tileStart + pass * BLOCK_THREADS + threadIdx) < sortCount;
++		const uint digit = (keys[pass] >> RadixShift) & 0xFF;
++		if (active)
+ 		{
+-			uint myDigit = SharedDigits[localIdx];
++			InterlockedOr(SharedDigitMasks[digit * MASK_WORDS + word], bit);
++		}
+ 
+-			// Base rank: count of elements with same digit from all previous passes
+-			uint baseRank = SharedLocalHist[myDigit];
++		GroupMemoryBarrierWithGroupSync();
+ 
+-			// Intra-pass rank: count elements before me in THIS pass with same digit
+-			// Scan range is only threadIdx (0..255), not localIdx (0..1023)
+-			uint intraRank = 0;
+-			uint passStart = pass * BLOCK_THREADS;
+-			for (uint j = 0; j < threadIdx; j++)
++		if (active)
++		{
++			uint rank = SharedLocalHist[digit] + countbits(SharedDigitMasks[digit * MASK_WORDS + word] & (bit - 1u));
++			for (uint lowerWord = 0; lowerWord < word; lowerWord++)
+ 			{
+-				if (SharedDigits[passStart + j] == myDigit)
+-				{
+-					intraRank++;
+-				}
++				rank += countbits(SharedDigitMasks[digit * MASK_WORDS + lowerWord]);
+ 			}
+ 
+ 			// Scatter to sorted position
+-			uint dstIdx = SharedDigitOffsets[myDigit] + baseRank + intraRank;
+-			DstKeys[dstIdx] = SharedKeys[localIdx];
+-			DstVals[dstIdx] = SharedVals[localIdx];
++			uint dstIdx = SharedDigitOffsets[digit] + rank;
++			DstKeys[dstIdx] = keys[pass];
++			DstVals[dstIdx] = vals[pass];
+ 		}
+ 
+ 		GroupMemoryBarrierWithGroupSync();
+ 
+-		// Update running histogram with counts from this pass
+-		if (localIdx < tileCount)
++		// Thread = digit: fold this pass's count into the running histogram and clear the masks
++		uint passCount = 0;
++		[unroll]
++		for (uint foldWord = 0; foldWord < MASK_WORDS; foldWord++)
+ 		{
+-			InterlockedAdd(SharedLocalHist[SharedDigits[localIdx]], 1);
++			passCount += countbits(SharedDigitMasks[threadIdx * MASK_WORDS + foldWord]);
++			SharedDigitMasks[threadIdx * MASK_WORDS + foldWord] = 0;
+ 		}
++		SharedLocalHist[threadIdx] += passCount;
+ 
+ 		GroupMemoryBarrierWithGroupSync();
+ 	}
+diff -ruN a/Plugins/NanoGS/Shaders/Private/SOGDecode.ush b/Plugins/NanoGS/Shaders/Private/SOGDecode.ush
+--- a/Plugins/NanoGS/Shaders/Private/SOGDecode.ush	1969-12-31 19:00:00
++++ b/Plugins/NanoGS/Shaders/Private/SOGDecode.ush	2026-09-29 13:18:18
+@@ -0,0 +1,158 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++// GPU decode of SOG's 20-byte splat record (PlayCanvas "Spatially Ordered Gaussians" v2).
++// HLSL port of nanogs-sog/shaders/SOGDecode.metal. CPU mirror: Public/SOG/SOGTypes.h and SOGCodec.cpp.
++// Record layout (little-endian uint32 words):
++//   MeanXY       qx | qy << 16                       16-bit log-domain position
++//   MeanZLabel   qz | SH palette label << 16
++//   Quat         a | b << 8 | c << 16 | mode << 24   smallest-three, mode = index of the dropped component
++//   ScaleOpacity sx | sy << 8 | sz << 16 | opacity << 24
++//   DC           r | g << 8 | b << 16 | flags << 24  flags bit 0 = no view-dependent SH (NanoGS LOD splats)
++
++#pragma once
++
++#include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
++#include "/Plugin/NanoGS/Private/SphericalHarmonics.ush"
++
++#define SOG_RECORD_STRIDE 20
++#define SOG_FLAG_NO_SH 1u
++// Table buffer layout (float32): scale LUT exp(codebook) in [0, 256), DC LUT 0.5 + SH_C0 * codebook in [256, 512)
++#define SOG_TABLE_DC_OFFSET 256u
++// Palette entries are half4 (rgb + unused), SOGPaletteStride entries per label
++#define SOG_PALETTE_ENTRY_BYTES 8u
++
++struct FSOGRecord
++{
++	uint MeanXY;
++	uint MeanZLabel;
++	uint Quat;
++	uint ScaleOpacity;
++	uint DC;
++};
++
++FSOGRecord SOGLoadRecord(ByteAddressBuffer Records, uint SplatIndex)
++{
++	const uint Offset = SplatIndex * SOG_RECORD_STRIDE;
++	const uint4 Words = Records.Load4(Offset);
++	FSOGRecord Record;
++	Record.MeanXY = Words.x;
++	Record.MeanZLabel = Words.y;
++	Record.Quat = Words.z;
++	Record.ScaleOpacity = Words.w;
++	Record.DC = Records.Load(Offset + 16);
++	return Record;
++}
++
++float SOGTable(ByteAddressBuffer Tables, uint Index)
++{
++	return asfloat(Tables.Load(Index * 4));
++}
++
++// Position in the SOG file frame: dequantize, then undo the symmetric log.
++float3 SOGMean(FSOGRecord Record, float3 MeanMin, float3 MeanMax)
++{
++	const float3 Q = float3(Record.MeanXY & 0xFFFFu, Record.MeanXY >> 16, Record.MeanZLabel & 0xFFFFu) * (1.0 / 65535.0);
++	const float3 N = lerp(MeanMin, MeanMax, Q);
++	return sign(N) * (exp(abs(N)) - 1.0);
++}
++
++// Smallest-three quaternion, returned in NanoGS's (x, y, z, w) order.
++float4 SOGQuat(uint Packed)
++{
++	const float3 ABC = (float3(Packed & 0xFFu, (Packed >> 8) & 0xFFu, (Packed >> 16) & 0xFFu) * (1.0 / 255.0) - 0.5) * 1.41421356237;
++	const float D = sqrt(max(0.0, 1.0 - dot(ABC, ABC)));
++	const uint Mode = Packed >> 24;
++	float4 WXYZ;
++	if (Mode == 0u)
++	{
++		WXYZ = float4(D, ABC);
++	}
++	else if (Mode == 1u)
++	{
++		WXYZ = float4(ABC.x, D, ABC.yz);
++	}
++	else if (Mode == 2u)
++	{
++		WXYZ = float4(ABC.xy, D, ABC.z);
++	}
++	else
++	{
++		WXYZ = float4(ABC, D);
++	}
++	return normalize(WXYZ).yzwx;
++}
++
++float3 SOGScale(ByteAddressBuffer Tables, uint Packed)
++{
++	return float3(SOGTable(Tables, Packed & 0xFFu), SOGTable(Tables, (Packed >> 8) & 0xFFu), SOGTable(Tables, (Packed >> 16) & 0xFFu));
++}
++
++float SOGOpacity(uint Packed)
++{
++	return float(Packed >> 24) * (1.0 / 255.0);
++}
++
++// Covariance in the engine's local frame: M R diag(s^2) R^T M^T, with M (rows) the file -> local 3x3.
++// Valid when M is a rotation or reflection times a uniform scale (NanoGS: 100 * (z, x, -y), det < 0),
++// which leaves the quaternion itself untouched.
++float3x3 SOGCovarianceLocal(float4 QuatXYZW, float3 Scale, float3x3 FileToLocal)
++{
++	const float3x3 MR = mul(FileToLocal, QuatToMatrix(QuatXYZW));
++	float3x3 MRS;
++	MRS[0] = MR[0] * Scale;
++	MRS[1] = MR[1] * Scale;
++	MRS[2] = MR[2] * Scale;
++	return mul(MRS, transpose(MRS));
++}
++
++float3 SOGPaletteCoeff(ByteAddressBuffer Palette, uint BaseByte, uint Coeff)
++{
++	const uint2 Half4 = Palette.Load2(BaseByte + Coeff * SOG_PALETTE_ENTRY_BYTES);
++	return float3(f16tof32(Half4.x & 0xFFFFu), f16tof32(Half4.x >> 16), f16tof32(Half4.y & 0xFFFFu));
++}
++
++// Colour in the space NanoGS blends in (the 3DGS training space): DC from the table plus view-dependent SH
++// read from the palette band by band, using the same basis and signs as EvaluateSH. Dir is the
++// camera -> splat direction in the SOG file frame; Bands (0-3) caps the evaluated order.
++float3 SOGColor(ByteAddressBuffer Tables, ByteAddressBuffer Palette, FSOGRecord Record, float3 Dir, uint Bands, uint PaletteStride)
++{
++	float3 Color = float3(
++		SOGTable(Tables, SOG_TABLE_DC_OFFSET + (Record.DC & 0xFFu)),
++		SOGTable(Tables, SOG_TABLE_DC_OFFSET + ((Record.DC >> 8) & 0xFFu)),
++		SOGTable(Tables, SOG_TABLE_DC_OFFSET + ((Record.DC >> 16) & 0xFFu)));
++	if (Bands == 0u || ((Record.DC >> 24) & SOG_FLAG_NO_SH) != 0u)
++	{
++		return max(Color, 0.0);
++	}
++
++	const uint Base = (Record.MeanZLabel >> 16) * PaletteStride * SOG_PALETTE_ENTRY_BYTES;
++	const float x = Dir.x;
++	const float y = Dir.y;
++	const float z = Dir.z;
++	Color += SH_C1 * (-y * SOGPaletteCoeff(Palette, Base, 0) + z * SOGPaletteCoeff(Palette, Base, 1) - x * SOGPaletteCoeff(Palette, Base, 2));
++	if (Bands >= 2u)
++	{
++		const float xx = x * x;
++		const float yy = y * y;
++		const float zz = z * z;
++		const float xy = x * y;
++		const float yz = y * z;
++		const float xz = x * z;
++		Color += SH_C2_0 * xy * SOGPaletteCoeff(Palette, Base, 3)
++			+ SH_C2_1 * yz * SOGPaletteCoeff(Palette, Base, 4)
++			+ SH_C2_2 * (2.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 5)
++			+ SH_C2_3 * xz * SOGPaletteCoeff(Palette, Base, 6)
++			+ SH_C2_4 * (xx - yy) * SOGPaletteCoeff(Palette, Base, 7);
++		if (Bands >= 3u)
++		{
++			Color += SH_C3_0 * y * (3.0 * xx - yy) * SOGPaletteCoeff(Palette, Base, 8)
++				+ SH_C3_1 * xy * z * SOGPaletteCoeff(Palette, Base, 9)
++				+ SH_C3_2 * y * (4.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 10)
++				+ SH_C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * SOGPaletteCoeff(Palette, Base, 11)
++				+ SH_C3_4 * x * (4.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 12)
++				+ SH_C3_5 * z * (xx - yy) * SOGPaletteCoeff(Palette, Base, 13)
++				+ SH_C3_6 * x * (xx - 3.0 * yy) * SOGPaletteCoeff(Palette, Base, 14);
++		}
++	}
++	return max(Color, 0.0);
++}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp	2026-09-29 12:46:43
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp	2026-09-29 13:23:05
+@@ -99,7 +99,7 @@
+ 		CreateColorTextureFromData();
+ 		UE_LOG(LogTemp, Log, TEXT("GaussianSplatAsset::PostLoad - ColorTexture recreated successfully"));
+ 	}
+-	else
++	else if (!bHasSOGData)  // SOG assets render from their records and have no colour texture
+ 	{
+ 		UE_LOG(LogTemp, Warning, TEXT("GaussianSplatAsset::PostLoad - No ColorTextureBulkData to restore (might be old asset format)"));
+ 	}
+@@ -252,6 +252,19 @@
+ 	TArray<FVector> Positions;
+ 
+ 	const int64 DataSize = PositionBulkData.GetBulkDataSize();
++	if (DataSize == 0 && SplatCount > 0
++		&& SOGRecordBulkData.GetBulkDataSize() == int64(SplatCount) * int64(sizeof(sog::PackedSplat)))
++	{
++		// SOG asset: decode the records the way CalcViewData does
++		Positions.SetNum(SplatCount);
++		const sog::PackedSplat* Records = static_cast<const sog::PackedSplat*>(SOGRecordBulkData.LockReadOnly());
++		for (int32 i = 0; i < SplatCount; i++)
++		{
++			Positions[i] = FVector(GaussianSplatSOG::DecodePosition(SOGConstants, Records[i]));
++		}
++		SOGRecordBulkData.Unlock();
++		return Positions;
++	}
+ 	if (SplatCount == 0 || DataSize == 0)
+ 	{
+ 		return Positions;
+@@ -676,6 +689,35 @@
+ 	}
+ }
+ 
++void UGaussianSplatAsset::InitializeFromSOG(const TArray<FGaussianSplatData>& InSplats, const sog::DecodedAsset& Source,
++	const TArray<sog::PackedSplat>& Records, EGaussianQualityLevel InQuality)
++{
++	check(Records.Num() == InSplats.Num());
++	SplatCount = InSplats.Num();
++	ImportQuality = InQuality;
++	SHBands = int32(Source.shBands);
++
++	CalculateBounds(InSplats);
++	ClearNanoGSSplatData();
++	SetSOGData(Source, Records);
++	GenerateThumbnail(InSplats);
++
++	UE_LOG(LogTemp, Log, TEXT("GaussianSplatAsset: Initialized %d splats from SOG (records %lld bytes, palette %lld bytes)"),
++		SplatCount, GetSOGRecordDataSize(), GetSOGPaletteDataSize());
++}
++
++void UGaussianSplatAsset::ClearNanoGSSplatData()
++{
++	PositionBulkData.RemoveBulkData();
++	OtherBulkData.RemoveBulkData();
++	SHBulkData.RemoveBulkData();
++	ColorTextureBulkData.RemoveBulkData();
++	ColorTextureWidth = 0;
++	ColorTextureHeight = 0;
++	ColorTexture = nullptr;
++	ChunkData.Empty();
++}
++
+ void UGaussianSplatAsset::SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records)
+ {
+ 	check(Records.Num() == SplatCount);
+@@ -808,16 +850,18 @@
+ 	// Store the cluster hierarchy
+ 	ClusterHierarchy = MoveTemp(NewClusterHierarchy);
+ 
+-	// Reinitialize from the new splat data (now includes LOD splats)
+-	InitializeFromSplatData(SplatData, ImportQuality);
+-
+-	// SOG sources: records follow the builder's order; merged LOD splats are quantized to SOG
++	// Reinitialize from the new splat data (now includes LOD splats). SOG sources store SOG records only:
++	// the source records in the builder's order, then the merged LOD splats quantized to SOG.
+ 	if (bIsSOG)
+ 	{
+ 		TArray<sog::PackedSplat> Records;
+ 		GaussianSplatSOG::BuildRecords(SOGSource, SplatOrder, SplatData, OriginalSplatCount, Records);
+-		SetSOGData(SOGSource, Records);
++		InitializeFromSOG(SplatData, SOGSource, Records, ImportQuality);
+ 	}
++	else
++	{
++		InitializeFromSplatData(SplatData, ImportQuality);
++	}
+ 
+ 	// Enable Nanite
+ 	bEnableNanite = true;
+@@ -859,10 +903,14 @@
+ 			if (ReadSourceSplats(SplatData, SOGSource, bIsSOG, ErrorMessage))
+ 			{
+ 				// Reinitialize with original splats only (no LOD)
+-				InitializeFromSplatData(SplatData, ImportQuality);
+ 				if (bIsSOG)
+ 				{
+-					SetSOGData(SOGSource, TArray<sog::PackedSplat>(SOGSource.splats.data(), int32(SOGSource.splats.size())));
++					InitializeFromSOG(SplatData, SOGSource,
++						TArray<sog::PackedSplat>(SOGSource.splats.data(), int32(SOGSource.splats.size())), ImportQuality);
++				}
++				else
++				{
++					InitializeFromSplatData(SplatData, ImportQuality);
+ 				}
+ 				UE_LOG(LogTemp, Log, TEXT("ClearNaniteClusterHierarchy: Restored %d original splats"), SplatData.Num());
+ 			}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-09-29 13:19:47
+@@ -4,6 +4,38 @@
+ #include "GaussianSplatAsset.h"
+ #include "RHICommandList.h"
+ 
++namespace
++{
++	/** Static ByteAddressBuffer holding Data; a zeroed 16-byte dummy when Data is empty, so it can always be bound. */
++	void CreateRawBuffer(FRHICommandListBase& RHICmdList, const TCHAR* Name, const void* Data, uint32 NumBytes,
++		FBufferRHIRef& OutBuffer, FShaderResourceViewRHIRef& OutSRV)
++	{
++		const uint32 Size = FMath::Max(NumBytes, 16u);
++		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
++			Name,
++			Size,
++			0,
++			BUF_Static | BUF_ShaderResource | BUF_ByteAddressBuffer)
++			.SetInitialState(ERHIAccess::SRVMask);
++		OutBuffer = RHICmdList.CreateBuffer(Desc);
++
++		void* Dest = RHICmdList.LockBuffer(OutBuffer, 0, Size, RLM_WriteOnly);
++		if (NumBytes > 0)
++		{
++			FMemory::Memcpy(Dest, Data, NumBytes);
++		}
++		else
++		{
++			FMemory::Memzero(Dest, Size);
++		}
++		RHICmdList.UnlockBuffer(OutBuffer);
++
++		OutSRV = RHICmdList.CreateShaderResourceView(
++			OutBuffer, FRHIViewDesc::CreateBufferSRV()
++				.SetType(FRHIViewDesc::EBufferType::Raw));
++	}
++}
++
+ FGaussianSplatRenderData::FGaussianSplatRenderData()
+ {
+ }
+@@ -31,8 +63,41 @@
+ 	SplatCount = Asset->GetSplatCount();
+ 	PositionFormat = Asset->PositionFormat;
+ 
+-	// --- Pack splat data (16 bytes/splat) ---
++	if (Asset->HasSOGData())
+ 	{
++		// --- SOG payload: records, lookup tables and SH palette, decoded per frame by CalcViewData ---
++		Asset->GetSOGRecordData(SOGRecordData);
++		Asset->GetSOGPaletteData(SOGPaletteData);
++		SOGTableData.Reset(512);
++		SOGTableData.Append(Asset->GetSOGScaleLUT());
++		SOGTableData.Append(Asset->GetSOGDCLUT());
++
++		const int64 ExpectedRecordBytes = int64(SplatCount) * int64(sizeof(sog::PackedSplat));
++		if (SOGRecordData.Num() != ExpectedRecordBytes || SOGTableData.Num() != 512)
++		{
++			UE_LOG(LogTemp, Error, TEXT("GaussianSplatRenderData: '%s' has a corrupt SOG payload (%d record bytes for %d splats, %d table entries); not rendering it"),
++				*AssetName, SOGRecordData.Num(), SplatCount, SOGTableData.Num());
++			SOGRecordData.Empty();
++			SOGPaletteData.Empty();
++			SOGTableData.Empty();
++			return;
++		}
++
++		const sog::AssetConstants& Constants = Asset->GetSOGConstants();
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			// fileToLocal is column-major: element (row r, column c) at [c * 4 + r]
++			SOGFileToLocalRows[Row] = FVector4f(Constants.fileToLocal[Row], Constants.fileToLocal[4 + Row],
++				Constants.fileToLocal[8 + Row], Constants.fileToLocal[12 + Row]);
++		}
++		SOGMeanMin = FVector3f(Constants.meanMin[0], Constants.meanMin[1], Constants.meanMin[2]);
++		SOGMeanMax = FVector3f(Constants.meanMax[0], Constants.meanMax[1], Constants.meanMax[2]);
++		SHBands = Asset->SOGSHBands;
++		bHasSOG = true;
++	}
++	else
++	{
++		// --- Pack splat data (16 bytes/splat) ---
+ 		TArray<uint8> RawPositionData;
+ 		TArray<uint8> RawOtherData;
+ 		TArray<uint8> RawColorTextureData;
+@@ -90,8 +155,8 @@
+ 	// Load chunk data
+ 	CachedChunkData = Asset->ChunkData;
+ 
+-	// Load SH data
+-	if (Asset->SHBands > 0)
++	// Load SH data (SOG assets keep theirs in the palette)
++	if (!bHasSOG && Asset->SHBands > 0)
+ 	{
+ 		Asset->GetSHData(SHData);
+ 		SHBands = Asset->SHBands;
+@@ -194,8 +259,21 @@
+ 		SharedBufferCount++;
+ 	}
+ 
+-	// --- SH buffer (always create at least a dummy for shader binding) ---
++	// --- SOG buffers (replace the packed splat and SH buffers) ---
++	if (bHasSOG)
+ 	{
++		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGRecordBuffer"), SOGRecordData.GetData(), SOGRecordData.Num(),
++			SOGRecordBuffer, SOGRecordBufferSRV);
++		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGTableBuffer"), SOGTableData.GetData(), SOGTableData.Num() * sizeof(float),
++			SOGTableBuffer, SOGTableBufferSRV);
++		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGPaletteBuffer"), SOGPaletteData.GetData(), SOGPaletteData.Num(),
++			SOGPaletteBuffer, SOGPaletteBufferSRV);
++		SharedBufferCount += 3;
++	}
++
++	// --- SH buffer (always create at least a dummy for shader binding; SOG assets don't read it) ---
++	if (!bHasSOG)
++	{
+ 		uint32 SHDataSize = SHData.Num();
+ 		if (SHDataSize == 0)
+ 		{
+@@ -338,6 +416,9 @@
+ 	// Free CPU-side cached data after GPU upload
+ 	PackedSplatData.Empty();
+ 	SHData.Empty();
++	SOGRecordData.Empty();
++	SOGPaletteData.Empty();
++	SOGTableData.Empty();
+ 	CachedChunkData.Empty();
+ 	CachedClusterData.Empty();
+ 	CachedSplatClusterIndices.Empty();
+@@ -361,5 +442,11 @@
+ 	ClusterBufferSRV.SafeRelease();
+ 	SplatClusterIndexBuffer.SafeRelease();
+ 	SplatClusterIndexBufferSRV.SafeRelease();
++	SOGRecordBuffer.SafeRelease();
++	SOGRecordBufferSRV.SafeRelease();
++	SOGTableBuffer.SafeRelease();
++	SOGTableBufferSRV.SafeRelease();
++	SOGPaletteBuffer.SafeRelease();
++	SOGPaletteBufferSRV.SafeRelease();
+ 	bGPUBuffersCreated = false;
+ }
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-08-10 20:08:14
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-09-29 13:57:31
+@@ -22,7 +22,7 @@
+ extern TAutoConsoleVariable<int32> CVarShowClusterBounds;
+ extern TAutoConsoleVariable<int32> CVarDebugForceLODLevel;
+ 
+-// Helper: Set pixel shader velocity parameters using self-tracked previous frame data.
++// Helper: Set the vertex shader's clip and velocity parameters using self-tracked previous frame data.
+ // UE5's PrevViewInfo is not populated for PostOpaqueRender callbacks, so we store
+ // current frame matrices and use them as "previous" data next frame.
+ // Data is tracked per-view (keyed by FSceneViewState*) to handle multiple viewports
+@@ -31,8 +31,8 @@
+ // IMPORTANT: We use UN-JITTERED projection matrices for velocity calculation.
+ // This ensures ClipPosition is stable when camera is static (we skip CalcViewData
+ // when camera doesn't move, so jittered positions would cause velocity errors).
+-static void SetVelocityPSParameters(
+-	FGaussianSplatPS::FParameters& PSParameters,
++static void SetSplatViewParameters(
++	FGaussianSplatVS::FParameters& VSParameters,
+ 	const FSceneView& View,
+ 	FGaussianGlobalAccumulator* Accumulator)
+ {
+@@ -50,20 +50,20 @@
+ 		PrevData = Accumulator->PrevFrameDataPerView.Find(ViewKey);
+ 	}
+ 
++	VSParameters.TranslatedWorldToClip = FMatrix44f(CurTranslatedVP);
+ 	if (PrevData)
+ 	{
+-		PSParameters.PrevTranslatedWorldToClip = FMatrix44f(PrevData->TranslatedViewProjectionMatrix);
+-		PSParameters.PrevPreViewTranslation = FVector3f(PrevData->PreViewTranslation);
++		VSParameters.PrevTranslatedWorldToClip = FMatrix44f(PrevData->TranslatedViewProjectionMatrix);
++		// Delta in double precision: translated positions stay small, world positions may not
++		VSParameters.PrevTranslationDelta = FVector3f(PrevData->PreViewTranslation - CurPreViewTranslation);
+ 	}
+ 	else
+ 	{
+ 		// First frame for this view: use current frame data (produces zero velocity)
+-		PSParameters.PrevTranslatedWorldToClip = FMatrix44f(CurTranslatedVP);
+-		PSParameters.PrevPreViewTranslation = FVector3f(CurPreViewTranslation);
++		VSParameters.PrevTranslatedWorldToClip = FMatrix44f(CurTranslatedVP);
++		VSParameters.PrevTranslationDelta = FVector3f::ZeroVector;
+ 	}
+ 
+-	PSParameters.PreViewTranslation = FVector3f(CurPreViewTranslation);
+-
+ 	// Store current frame data for next frame
+ 	if (Accumulator && ViewKey)
+ 	{
+@@ -93,6 +93,35 @@
+ 	return Value;
+ }
+ 
++// CalcViewData reads either SOG records (GS_SOG) or NanoGS's packed splats + SH buffer; each permutation
++// declares only its own buffers, so only those are bound.
++static FGaussianSplatCalcViewDataCS::FPermutationDomain GetCalcViewDataPermutation(const FGaussianSplatGPUResources* GPUResources)
++{
++	FGaussianSplatCalcViewDataCS::FPermutationDomain PermutationVector;
++	PermutationVector.Set<FGaussianSplatCalcViewDataCS::FSOGDim>(GPUResources->bHasSOG);
++	return PermutationVector;
++}
++
++static void SetSplatSourceParameters(FGaussianSplatCalcViewDataCS::FParameters& Parameters, const FGaussianSplatGPUResources* GPUResources)
++{
++	if (GPUResources->bHasSOG)
++	{
++		Parameters.SOGRecordBuffer    = GPUResources->SOGRecordBufferSRV;
++		Parameters.SOGTableBuffer     = GPUResources->SOGTableBufferSRV;
++		Parameters.SOGPaletteBuffer   = GPUResources->SOGPaletteBufferSRV;
++		Parameters.SOGFileToLocalRow0 = GPUResources->SOGFileToLocalRows[0];
++		Parameters.SOGFileToLocalRow1 = GPUResources->SOGFileToLocalRows[1];
++		Parameters.SOGFileToLocalRow2 = GPUResources->SOGFileToLocalRows[2];
++		Parameters.SOGMeanMin         = GPUResources->SOGMeanMin;
++		Parameters.SOGMeanMax         = GPUResources->SOGMeanMax;
++	}
++	else
++	{
++		Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
++		Parameters.SHBuffer          = GPUResources->SHBufferSRV;
++	}
++}
++
+ // Compute WorldToPLY matrix for SH evaluation
+ // SH coefficients are stored in PLY space, so we need to transform view direction from world to PLY space
+ // This combines: (1) WorldToLocal from actor transform, and (2) LocalToPLY coordinate system conversion
+@@ -121,7 +150,7 @@
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewData);
+ 
+-	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), GetCalcViewDataPermutation(GPUResources));
+ 
+ 	if (!ComputeShader.IsValid())
+ 	{
+@@ -133,9 +162,15 @@
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 
+ 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+-	Parameters.SHBuffer = GPUResources->SHBufferSRV;
++	SetSplatSourceParameters(Parameters, GPUResources);
+ 	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferUAV;
++	// Per-proxy path (unused by the renderer): no sort keys
++	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
++	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
++	Parameters.WriteSortKeys = 0;
++	Parameters.SortKeyBits = 32;
++	Parameters.SortKeyLogNear = 0.0f;
++	Parameters.SortKeyInvLogRange = 0.0f;
+ 
+ 	// Cluster visibility integration (UNIFIED APPROACH)
+ 	Parameters.SplatClusterIndexBuffer = GPUResources->SplatClusterIndexBufferSRV;
+@@ -216,41 +251,6 @@
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ }
+ 
+-void FGaussianSplatRenderer::DispatchCalcDistances(
+-	FRHICommandListImmediate& RHICmdList,
+-	FGaussianSplatGPUResources* GPUResources,
+-	int32 SplatCount)
+-{
+-	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistances);
+-
+-	TShaderMapRef<FGaussianSplatCalcDistancesCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-
+-	if (!ComputeShader.IsValid())
+-	{
+-		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcDistancesCS shader not valid"));
+-		return;
+-	}
+-
+-	// Transition buffers
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SortDistanceBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SortKeysBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-
+-	FGaussianSplatCalcDistancesCS::FParameters Parameters;
+-	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferSRV;
+-	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
+-	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
+-	Parameters.SplatCount = SplatCount;
+-
+-	// Dispatch only for actual SplatCount — no power-of-2 padding needed for radix sort
+-	const uint32 ThreadGroupSize = 256;
+-	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)SplatCount, ThreadGroupSize);
+-
+-	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+-	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+-	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);
+-	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+-}
+-
+ void FGaussianSplatRenderer::DispatchRadixSort(
+ 	FRHICommandListImmediate& RHICmdList,
+ 	FGaussianSplatGPUResources* GPUResources,
+@@ -623,11 +623,11 @@
+ 	// Pass Nanite enabled state for debug visualization (non-Nanite assets render black in debug mode)
+ 	VSParameters.EnableNanite = GPUResources->bEnableNanite ? 1 : 0;
+ 
++	SetSplatViewParameters(VSParameters, View, nullptr);
+ 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+ 
+-	// Pixel shader parameters
++	// Pixel shader parameters (none: velocity comes from the vertex shader)
+ 	FGaussianSplatPS::FParameters PSParameters;
+-	SetVelocityPSParameters(PSParameters, View, nullptr);
+ 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+ 
+ 	// Draw instanced quads
+@@ -772,7 +772,7 @@
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataCompacted);
+ 
+-	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), GetCalcViewDataPermutation(GPUResources));
+ 	if (!ComputeShader.IsValid())
+ 	{
+ 		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcViewDataCS shader not valid"));
+@@ -783,9 +783,15 @@
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 
+ 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+-	Parameters.SHBuffer = GPUResources->SHBufferSRV;
++	SetSplatSourceParameters(Parameters, GPUResources);
+ 	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferUAV;
++	// Per-proxy path (unused by the renderer): no sort keys
++	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
++	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
++	Parameters.WriteSortKeys = 0;
++	Parameters.SortKeyBits = 32;
++	Parameters.SortKeyLogNear = 0.0f;
++	Parameters.SortKeyInvLogRange = 0.0f;
+ 
+ 	// Cluster visibility data (needed for debug visualization)
+ 	Parameters.SplatClusterIndexBuffer = GPUResources->SplatClusterIndexBufferSRV;
+@@ -857,40 +863,6 @@
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ViewDataBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ }
+ 
+-void FGaussianSplatRenderer::DispatchCalcDistancesIndirect(
+-	FRHICommandListImmediate& RHICmdList,
+-	FGaussianSplatGPUResources* GPUResources)
+-{
+-	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesIndirect);
+-
+-	TShaderMapRef<FGaussianSplatCalcDistancesCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	if (!ComputeShader.IsValid())
+-	{
+-		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcDistancesCS shader not valid"));
+-		return;
+-	}
+-
+-	// Transition buffers
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SortDistanceBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SortKeysBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-
+-	// No need to clear distance buffer - indirect radix sort only sorts VisibleSplatCount elements,
+-	// and DrawSplats only renders VisibleSplatCount instances via indirect draw.
+-	// Unused buffer entries beyond VisibleSplatCount are never read.
+-
+-	FGaussianSplatCalcDistancesCS::FParameters Parameters;
+-	Parameters.ViewDataBuffer = GPUResources->ViewDataBufferSRV;
+-	Parameters.DistanceBuffer = GPUResources->SortDistanceBufferUAV;
+-	Parameters.KeyBuffer = GPUResources->SortKeysBufferUAV;
+-	Parameters.SplatCount = GPUResources->TotalSplatCount;  // Max count for bounds
+-
+-	// INDIRECT DISPATCH
+-	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+-	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+-	RHICmdList.DispatchIndirectComputeShader(GPUResources->IndirectDispatchArgsBuffer, 0);
+-	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+-}
+-
+ //----------------------------------------------------------------------
+ // Global Accumulator dispatch implementations
+ //----------------------------------------------------------------------
+@@ -906,11 +878,12 @@
+ 	float SplatScale,
+ 	bool bUseLODRendering,
+ 	uint32 GlobalBaseOffset,
+-	FGaussianGlobalAccumulator* GlobalAccumulator)
++	FGaussianGlobalAccumulator* GlobalAccumulator,
++	const FGaussianSortKeyParams& SortKeys)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
+ 
+-	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), GetCalcViewDataPermutation(GPUResources));
+ 	if (!ComputeShader.IsValid())
+ 	{
+ 		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcViewDataCS shader not valid"));
+@@ -918,14 +891,23 @@
+ 	}
+ 
+ 	// Transition global buffer to UAV for writing (Unknown covers both first-proxy and subsequent calls)
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
++	RHICmdList.Transition({
++		FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute) });
+ 
+ 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+-	Parameters.SHBuffer = GPUResources->SHBufferSRV;
++	SetSplatSourceParameters(Parameters, GPUResources);
+ 
+ 	// Write into the GLOBAL buffer at GlobalBaseOffset
+ 	Parameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferUAV;
++	// Sort keys go straight into the global sort buffers, one per ViewDataBuffer entry
++	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
++	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
++	Parameters.WriteSortKeys = 1;
++	Parameters.SortKeyBits = SortKeys.Bits;
++	Parameters.SortKeyLogNear = SortKeys.LogNear;
++	Parameters.SortKeyInvLogRange = SortKeys.InvLogRange;
+ 
+ 	// Cluster visibility
+ 	Parameters.SplatClusterIndexBuffer = GPUResources->SplatClusterIndexBufferSRV;
+@@ -1004,47 +986,14 @@
+ 	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+ 	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);
+ 	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+-	// Note: caller is responsible for the final SRVCompute transition after all proxies have written
++	// Note: the caller makes GlobalViewDataBuffer readable by the draw (SRVGraphics) after all proxies have written
+ }
+ 
+-void FGaussianSplatRenderer::DispatchCalcDistancesGlobal(
+-	FRHICommandListImmediate& RHICmdList,
+-	FGaussianGlobalAccumulator* GlobalAccumulator,
+-	int32 TotalSplatCount)
+-{
+-	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesGlobal);
+-
+-	TShaderMapRef<FGaussianSplatCalcDistancesCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	if (!ComputeShader.IsValid())
+-	{
+-		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcDistancesCS shader not valid"));
+-		return;
+-	}
+-
+-	// Transition global ViewData to SRV (all proxies have finished writing)
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-
+-	FGaussianSplatCalcDistancesCS::FParameters Parameters;
+-	Parameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferSRV;
+-	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
+-	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
+-	Parameters.SplatCount = TotalSplatCount;
+-
+-	const uint32 ThreadGroupSize = 256;
+-	const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)TotalSplatCount, ThreadGroupSize);
+-
+-	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+-	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+-	RHICmdList.DispatchComputeShader(NumGroups, 1, 1);
+-	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+-}
+-
+ void FGaussianSplatRenderer::DispatchRadixSortGlobal(
+ 	FRHICommandListImmediate& RHICmdList,
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+-	int32 TotalSplatCount)
++	int32 TotalSplatCount,
++	const FGaussianSortKeyParams& SortKeys)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRadixSortGlobal);
+ 
+@@ -1080,13 +1029,20 @@
+ 		GlobalAccumulator->GlobalSortKeysBufferAlt
+ 	};
+ 
++	// Keys and indices were written by CalcViewData
++	RHICmdList.Transition({
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute) });
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBufferAlt, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBufferAlt, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalRadixHistogramBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalRadixDigitOffsetBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortParamsBuffer, ERHIAccess::Unknown, ERHIAccess::SRVCompute));
+ 
+-	for (uint32 Pass = 0; Pass < 4; Pass++)
++	// 8 bits per radix pass: 4 passes for 32-bit keys, 2 for 16-bit keys. Both counts are even,
++	// so the sorted result always ends in the primary buffers [0].
++	const uint32 NumPasses = SortKeys.NumRadixPasses();
++	for (uint32 Pass = 0; Pass < NumPasses; Pass++)
+ 	{
+ 		uint32 RadixShift = Pass * 8;
+ 		uint32 SrcIdx = Pass & 1;
+@@ -1167,7 +1123,7 @@
+ 		RHICmdList.Transition(FRHITransitionInfo(KeyBuffers[DstIdx], ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 	}
+ 
+-	// After 4 passes (even), result is in primary buffers [0]
++	// After an even number of passes, result is in primary buffers [0]
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVGraphics));
+ }
+ 
+@@ -1242,10 +1198,10 @@
+ 	VSParameters.DebugMode = static_cast<uint32>(FMath::Max(0, DebugMode));
+ 	VSParameters.EnableNanite = 1;
+ 
++	SetSplatViewParameters(VSParameters, View, GlobalAccumulator);
+ 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+ 
+ 	FGaussianSplatPS::FParameters PSParameters;
+-	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+ 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+ 
+ 	RHICmdList.SetStreamSource(0, nullptr, 0);
+@@ -1361,11 +1317,12 @@
+ 	float SplatScale,
+ 	int32 ProxyIndex,
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+-	uint32 MaxRenderBudget)
++	uint32 MaxRenderBudget,
++	const FGaussianSortKeyParams& SortKeys)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataCompactedGlobal);
+ 
+-	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FGaussianSplatCalcViewDataCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), GetCalcViewDataPermutation(GPUResources));
+ 	if (!ComputeShader.IsValid())
+ 	{
+ 		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcViewDataCS shader not valid"));
+@@ -1373,14 +1330,23 @@
+ 	}
+ 
+ 	// Transition global ViewData buffer to UAV (Unknown handles first proxy and subsequent proxies)
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
++	RHICmdList.Transition({
++		FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute) });
+ 
+ 	FGaussianSplatCalcViewDataCS::FParameters Parameters;
+-	Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+-	Parameters.SHBuffer = GPUResources->SHBufferSRV;
++	SetSplatSourceParameters(Parameters, GPUResources);
+ 
+ 	// Write into GLOBAL buffer
+ 	Parameters.ViewDataBuffer = GlobalAccumulator->GlobalViewDataBufferUAV;
++	// Sort keys go straight into the global sort buffers, one per ViewDataBuffer entry
++	Parameters.DistanceBuffer = GlobalAccumulator->GlobalSortDistanceBufferUAV;
++	Parameters.KeyBuffer = GlobalAccumulator->GlobalSortKeysBufferUAV;
++	Parameters.WriteSortKeys = 1;
++	Parameters.SortKeyBits = SortKeys.Bits;
++	Parameters.SortKeyLogNear = SortKeys.LogNear;
++	Parameters.SortKeyInvLogRange = SortKeys.InvLogRange;
+ 
+ 	// Cluster visibility data
+ 	Parameters.SplatClusterIndexBuffer   = GPUResources->SplatClusterIndexBufferSRV;
+@@ -1449,44 +1415,13 @@
+ 	RHICmdList.DispatchIndirectComputeShader(GPUResources->IndirectDispatchArgsBuffer, 0);
+ 	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+ 
+-	// Note: caller transitions GlobalViewDataBuffer to SRVCompute after all proxies are done
++	// Note: the caller makes GlobalViewDataBuffer readable by the draw (SRVGraphics) after all proxies are done
+ }
+ 
+-void FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(
+-	FRHICommandListImmediate& RHICmdList,
+-	FGaussianGlobalAccumulator* GlobalAccumulator)
+-{
+-	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcDistancesGlobalIndirect);
+-
+-	TShaderMapRef<FGaussianSplatCalcDistancesCS> ComputeShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	if (!ComputeShader.IsValid())
+-	{
+-		UE_LOG(LogTemp, Warning, TEXT("FGaussianSplatCalcDistancesCS shader not valid"));
+-		return;
+-	}
+-
+-	// All proxies have finished writing — transition global ViewData to SRV
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalViewDataBuffer,    ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::Unknown,   ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer,     ERHIAccess::Unknown,   ERHIAccess::UAVCompute));
+-
+-	FGaussianSplatCalcDistancesCS::FParameters Parameters;
+-	Parameters.ViewDataBuffer  = GlobalAccumulator->GlobalViewDataBufferSRV;
+-	Parameters.DistanceBuffer  = GlobalAccumulator->GlobalSortDistanceBufferUAV;
+-	Parameters.KeyBuffer       = GlobalAccumulator->GlobalSortKeysBufferUAV;
+-	// AllocatedCount is always >= TotalVisible — safe upper bound for the shader guard
+-	Parameters.SplatCount      = GlobalAccumulator->AllocatedCount;
+-
+-	// GlobalCalcDistIndirectArgsBuffer is in IndirectArgs state from DispatchPrefixSumVisibleCounts
+-	SetComputePipelineState(RHICmdList, ComputeShader.GetComputeShader());
+-	SetShaderParameters(RHICmdList, ComputeShader, ComputeShader.GetComputeShader(), Parameters);
+-	RHICmdList.DispatchIndirectComputeShader(GlobalAccumulator->GlobalCalcDistIndirectArgsBuffer, 0);
+-	UnsetShaderUAVs(RHICmdList, ComputeShader, ComputeShader.GetComputeShader());
+-}
+-
+ void FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(
+ 	FRHICommandListImmediate& RHICmdList,
+-	FGaussianGlobalAccumulator* GlobalAccumulator)
++	FGaussianGlobalAccumulator* GlobalAccumulator,
++	const FGaussianSortKeyParams& SortKeys)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRadixSortGlobalIndirect);
+ 
+@@ -1519,6 +1454,10 @@
+ 		GlobalAccumulator->GlobalSortKeysBufferAlt
+ 	};
+ 
++	// Keys and indices were written by CalcViewData
++	RHICmdList.Transition({
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute) });
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortDistanceBufferAlt,  ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBufferAlt,      ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalRadixHistogramBuffer,   ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+@@ -1526,8 +1465,10 @@
+ 	// GlobalSortParamsBuffer and GlobalSortIndirectArgsGlobalBuffer are already
+ 	// in SRVCompute / IndirectArgs state from DispatchPrefixSumVisibleCounts
+ 
+-	// 4 radix passes: bits 0-7, 8-15, 16-23, 24-31
+-	for (uint32 Pass = 0; Pass < 4; Pass++)
++	// 8 bits per radix pass: 4 passes for 32-bit keys, 2 for 16-bit keys. Both counts are even,
++	// so the sorted result always ends in the primary buffers [0].
++	const uint32 NumPasses = SortKeys.NumRadixPasses();
++	for (uint32 Pass = 0; Pass < NumPasses; Pass++)
+ 	{
+ 		uint32 RadixShift = Pass * 8;
+ 		uint32 SrcIdx = Pass & 1;
+@@ -1608,7 +1549,7 @@
+ 		RHICmdList.Transition(FRHITransitionInfo(KeyBuffers[DstIdx],  ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 	}
+ 
+-	// After 4 passes (even), result is in primary buffers [0]
++	// After an even number of passes, result is in primary buffers [0]
+ 	RHICmdList.Transition(FRHITransitionInfo(GlobalAccumulator->GlobalSortKeysBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVGraphics));
+ }
+ 
+@@ -1682,10 +1623,10 @@
+ 	VSParameters.DebugMode       = static_cast<uint32>(FMath::Max(0, DebugMode));
+ 	VSParameters.EnableNanite    = 1;
+ 
++	SetSplatViewParameters(VSParameters, View, GlobalAccumulator);
+ 	SetShaderParameters(RHICmdList, VertexShader, VertexShader.GetVertexShader(), VSParameters);
+ 
+ 	FGaussianSplatPS::FParameters PSParameters;
+-	SetVelocityPSParameters(PSParameters, View, GlobalAccumulator);
+ 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+ 
+ 	RHICmdList.SetStreamSource(0, nullptr, 0);
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp	2026-09-29 12:40:46
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp	2026-09-29 13:21:24
+@@ -71,6 +71,25 @@
+ 		Out.shCoeffs = 0;
+ 	}
+ 
++	FVector3f DecodePosition(const sog::AssetConstants& Constants, const sog::PackedSplat& Record)
++	{
++		const uint32 Q[3] = { Record.meanXY & 0xFFFFu, Record.meanXY >> 16, Record.meanZ_label & 0xFFFFu };
++		double File[3];
++		for (int32 K = 0; K < 3; ++K)
++		{
++			const double N = double(Constants.meanMin[K]) + (double(Constants.meanMax[K]) - double(Constants.meanMin[K])) * (double(Q[K]) / 65535.0);
++			File[K] = N < 0.0 ? -(FMath::Exp(-N) - 1.0) : FMath::Exp(N) - 1.0;
++		}
++		// fileToLocal is column-major: element (row r, column c) at [c * 4 + r]
++		const float* M = Constants.fileToLocal;
++		double Local[3];
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			Local[Row] = M[Row] * File[0] + M[4 + Row] * File[1] + M[8 + Row] * File[2] + M[12 + Row];
++		}
++		return FVector3f(float(Local[0]), float(Local[1]), float(Local[2]));
++	}
++
+ 	void BuildRecords(const sog::DecodedAsset& Asset, const TArray<int32>& Order,
+ 		const TArray<FGaussianSplatData>& Splats, int32 NumBase, TArray<sog::PackedSplat>& OutRecords)
+ 	{
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-27 15:43:52
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-29 13:20:06
+@@ -51,6 +51,13 @@
+ 	LeafClusterCount = SharedData->LeafClusterCount;
+ 	LODSplatCount = SharedData->LODSplatCount;
+ 	bHasLODSplats = SharedData->bHasLODSplats;
++	bHasSOG = SharedData->bHasSOG;
++	for (int32 Row = 0; Row < 3; ++Row)
++	{
++		SOGFileToLocalRows[Row] = SharedData->SOGFileToLocalRows[Row];
++	}
++	SOGMeanMin = SharedData->SOGMeanMin;
++	SOGMeanMax = SharedData->SOGMeanMax;
+ 
+ 	// Initialize render resource
+ 	if (!bInitialized)
+@@ -75,6 +82,12 @@
+ 	PackedSplatBufferSRV = SharedData->PackedSplatBufferSRV;
+ 	SHBuffer = SharedData->SHBuffer;
+ 	SHBufferSRV = SharedData->SHBufferSRV;
++	SOGRecordBuffer = SharedData->SOGRecordBuffer;
++	SOGRecordBufferSRV = SharedData->SOGRecordBufferSRV;
++	SOGTableBuffer = SharedData->SOGTableBuffer;
++	SOGTableBufferSRV = SharedData->SOGTableBufferSRV;
++	SOGPaletteBuffer = SharedData->SOGPaletteBuffer;
++	SOGPaletteBufferSRV = SharedData->SOGPaletteBufferSRV;
+ 	ChunkBuffer = SharedData->ChunkBuffer;
+ 	ChunkBufferSRV = SharedData->ChunkBufferSRV;
+ 	IndexBuffer = SharedData->IndexBuffer;
+@@ -107,6 +120,12 @@
+ 	PackedSplatBufferSRV.SafeRelease();
+ 	SHBuffer.SafeRelease();
+ 	SHBufferSRV.SafeRelease();
++	SOGRecordBuffer.SafeRelease();
++	SOGRecordBufferSRV.SafeRelease();
++	SOGTableBuffer.SafeRelease();
++	SOGTableBufferSRV.SafeRelease();
++	SOGPaletteBuffer.SafeRelease();
++	SOGPaletteBufferSRV.SafeRelease();
+ 	ChunkBuffer.SafeRelease();
+ 	ChunkBufferSRV.SafeRelease();
+ 	IndexBuffer.SafeRelease();
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-09-29 13:47:29
+@@ -6,7 +6,6 @@
+ 
+ // Implement global shaders
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCalcViewDataCS, "/Plugin/NanoGS/Private/CalcViewData.usf", "MainCS", SF_Compute);
+-IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCalcDistancesCS, "/Plugin/NanoGS/Private/CalcDistances.usf", "MainCS", SF_Compute);
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatVS, "/Plugin/NanoGS/Private/GaussianSplatRendering.usf", "MainVS", SF_Vertex);
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatPS, "/Plugin/NanoGS/Private/GaussianSplatRendering.usf", "MainPS", SF_Pixel);
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositeVS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "MainVS", SF_Vertex);
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-08-28 01:21:55
++++ b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-09-29 13:49:00
+@@ -13,11 +13,19 @@
+ #include "Engine/Engine.h"
+ #include "RenderGraphBuilder.h"
+ #include "RenderGraphUtils.h"
++#include "RHIGPUReadback.h"
+ #include "SceneView.h"
+ #include "ScreenPass.h"
+ 
+ #define LOCTEXT_NAMESPACE "FNanoGSModule"
+ 
++// GPU stats: named columns in `stat gpu`, ProfileGPU and CSV profiles (-csvGpuStats). Culling + view data
++// and sorting are timed inside the prepare pass (NanoGSViewData, NanoGSSort); they do not nest.
++DECLARE_GPU_STAT_NAMED(NanoGSViewData, TEXT("NanoGS view data"));
++DECLARE_GPU_STAT_NAMED(NanoGSSort, TEXT("NanoGS sort"));
++DECLARE_GPU_STAT_NAMED(NanoGSDraw, TEXT("NanoGS draw"));
++DECLARE_GPU_STAT_NAMED(NanoGSComposite, TEXT("NanoGS composite"));
++
+ // Pass 2 parameter struct: declares IntermediateTexture as an RDG-tracked shader resource
+ // so that RDG inserts the proper RTV→SRV barrier between Pass 1 (write) and Pass 2 (read).
+ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianCompositePassParameters, )
+@@ -87,6 +95,140 @@
+ 	TEXT(" >=0: Override all splat components (higher = coarser LOD sooner; mobile: 0.06-0.1)"),
+ 	ECVF_RenderThreadSafe | ECVF_Scalability);
+ 
++/** Sort key precision. 16-bit keys halve the radix passes; intended for mobile device profiles. */
++TAutoConsoleVariable<int32> CVarGSSortKeyBits(
++	TEXT("gs.SortKeyBits"),
++	32,
++	TEXT("Bits per Gaussian splat depth-sort key.\n")
++	TEXT(" 32: float depth, 4 radix passes (default)\n")
++	TEXT(" 16: log view depth from the near plane to gs.SortKeyFarDistance, 2 radix passes\n")
++	TEXT("     (perspective views only; orthographic views keep 32-bit keys)"),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
++TAutoConsoleVariable<float> CVarGSSortKeyFarDistance(
++	TEXT("gs.SortKeyFarDistance"),
++	100000.0f,
++	TEXT("Far end (cm) of the 16-bit log-depth sort key range; splats beyond it share the farthest key.\n")
++	TEXT("With the default 10 cm near plane and 1 km, keys resolve 0.014% of the view depth."),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
++/** Debug: check the GPU sort output (order and permutation) on readback and log the result. */
++TAutoConsoleVariable<int32> CVarGSValidateSort(
++	TEXT("gs.ValidateSort"),
++	0,
++	TEXT("Debug: 1 = read back sorted splat keys and indices (one frame in flight at a time) and log whether\n")
++	TEXT("the keys are non-decreasing and the indices are a permutation. Leave at 0 for normal rendering."),
++	ECVF_RenderThreadSafe);
++
++namespace
++{
++	/** Render-thread state for gs.ValidateSort: at most one readback in flight. */
++	struct FSortValidation
++	{
++		TUniquePtr<FRHIGPUBufferReadback> Keys;
++		TUniquePtr<FRHIGPUBufferReadback> Values;
++		TUniquePtr<FRHIGPUBufferReadback> Params;
++		uint32 Capacity = 0;
++		uint32 CPUCount = 0;   // sorted count when known on the CPU; 0 = read it from the sort params buffer
++		uint32 KeyBits = 32;
++		bool bPending = false;
++	};
++	FSortValidation GSortValidation;
++
++	/** After a global sort: copy keys, indices and (indirect path) the GPU count for checking later. */
++	void EnqueueSortValidation(FRHICommandListImmediate& RHICmdList, FGaussianGlobalAccumulator* Accumulator,
++		uint32 CPUCount, uint32 KeyBits)
++	{
++		FSortValidation& V = GSortValidation;
++		if (V.bPending || !Accumulator->GlobalSortDistanceBuffer.IsValid())
++		{
++			return;
++		}
++		if (!V.Keys.IsValid())
++		{
++			V.Keys = MakeUnique<FRHIGPUBufferReadback>(TEXT("NanoGSValidateSortKeys"));
++			V.Values = MakeUnique<FRHIGPUBufferReadback>(TEXT("NanoGSValidateSortValues"));
++			V.Params = MakeUnique<FRHIGPUBufferReadback>(TEXT("NanoGSValidateSortParams"));
++		}
++		V.Capacity = Accumulator->AllocatedCount;
++		V.CPUCount = CPUCount;
++		V.KeyBits = KeyBits;
++		const uint32 NumBytes = V.Capacity * sizeof(uint32);
++
++		// After the sort: distances are UAVCompute, sorted indices SRVGraphics, sort params SRVCompute
++		RHICmdList.Transition({
++			FRHITransitionInfo(Accumulator->GlobalSortDistanceBuffer, ERHIAccess::UAVCompute, ERHIAccess::CopySrc),
++			FRHITransitionInfo(Accumulator->GlobalSortKeysBuffer, ERHIAccess::SRVGraphics, ERHIAccess::CopySrc),
++			FRHITransitionInfo(Accumulator->GlobalSortParamsBuffer, ERHIAccess::SRVCompute, ERHIAccess::CopySrc) });
++		V.Keys->EnqueueCopy(RHICmdList, Accumulator->GlobalSortDistanceBuffer, NumBytes);
++		V.Values->EnqueueCopy(RHICmdList, Accumulator->GlobalSortKeysBuffer, NumBytes);
++		V.Params->EnqueueCopy(RHICmdList, Accumulator->GlobalSortParamsBuffer, 2 * sizeof(uint32));
++		RHICmdList.Transition({
++			FRHITransitionInfo(Accumulator->GlobalSortDistanceBuffer, ERHIAccess::CopySrc, ERHIAccess::UAVCompute),
++			FRHITransitionInfo(Accumulator->GlobalSortKeysBuffer, ERHIAccess::CopySrc, ERHIAccess::SRVGraphics),
++			FRHITransitionInfo(Accumulator->GlobalSortParamsBuffer, ERHIAccess::CopySrc, ERHIAccess::SRVCompute) });
++		V.bPending = true;
++	}
++
++	/** Check a finished readback: keys non-decreasing, indices a permutation of [0, count). */
++	void PollSortValidation()
++	{
++		FSortValidation& V = GSortValidation;
++		if (!V.bPending || !V.Keys->IsReady() || !V.Values->IsReady() || !V.Params->IsReady())
++		{
++			return;
++		}
++		const uint32* SortParams = static_cast<const uint32*>(V.Params->Lock(2 * sizeof(uint32)));
++		const uint32 Count = FMath::Min(V.CPUCount > 0 ? V.CPUCount : SortParams[0], V.Capacity);
++		V.Params->Unlock();
++
++		const uint32* Keys = static_cast<const uint32*>(V.Keys->Lock(V.Capacity * sizeof(uint32)));
++		const uint32* Values = static_cast<const uint32*>(V.Values->Lock(V.Capacity * sizeof(uint32)));
++		const uint32 KeyLimit = V.KeyBits == 16 ? 0xFFFFu : 0xFFFFFFFFu;
++		uint32 Inversions = 0, KeysOutOfRange = 0, BadIndices = 0, Duplicates = 0, Invalid = 0;
++		TBitArray<> Seen(false, int32(Count));
++		for (uint32 I = 0; I < Count; ++I)
++		{
++			Inversions += (I > 0 && Keys[I] < Keys[I - 1]) ? 1 : 0;
++			KeysOutOfRange += Keys[I] > KeyLimit ? 1 : 0;
++			Invalid += Keys[I] == KeyLimit ? 1 : 0;
++			if (Values[I] >= Count)
++			{
++				++BadIndices;
++			}
++			else if (Seen[int32(Values[I])])
++			{
++				++Duplicates;
++			}
++			else
++			{
++				Seen[int32(Values[I])] = true;
++			}
++		}
++		V.Keys->Unlock();
++		V.Values->Unlock();
++		V.bPending = false;
++
++		const bool bOk = Inversions == 0 && KeysOutOfRange == 0 && BadIndices == 0 && Duplicates == 0;
++		UE_LOG(LogTemp, Display, TEXT("gs.ValidateSort: %s - %u keys (%u-bit, %u culled): %u inversions, %u keys out of range, %u bad indices, %u duplicates"),
++			bOk ? TEXT("OK") : TEXT("FAILED"), Count, V.KeyBits, Invalid, Inversions, KeysOutOfRange, BadIndices, Duplicates);
++	}
++}
++
++static FGaussianSortKeyParams GetSortKeyParams(const FSceneView& View)
++{
++	FGaussianSortKeyParams SortKeys;
++	if (CVarGSSortKeyBits.GetValueOnRenderThread() == 16 && View.IsPerspectiveProjection())
++	{
++		const float Near = FMath::Max(View.NearClippingDistance, 0.01f);
++		const float Far = FMath::Max(CVarGSSortKeyFarDistance.GetValueOnRenderThread(), Near * 2.0f);
++		SortKeys.Bits = 16;
++		SortKeys.LogNear = FMath::Log2(Near);
++		SortKeys.InvLogRange = 1.0f / FMath::Log2(Far / Near);
++	}
++	return SortKeys;
++}
++
+ // Export for other modules
+ int32 GGaussianSplatShowClusterBounds = 0;
+ 
+@@ -146,6 +288,8 @@
+ 		return;
+ 	}
+ 
++	PollSortValidation();
++
+ 	FRDGBuilder& GraphBuilder = *Parameters.GraphBuilder;
+ 	const FSceneView* SceneView = reinterpret_cast<const FSceneView*>(Parameters.View);
+ 
+@@ -216,7 +360,7 @@
+ 
+ 	//------------------------------------------------------------------
+ 	// GLOBAL ACCUMULATOR PATH: Phase 1 (per-proxy CalcViewData) +
+-	// Phase 2 (single CalcDistances + RadixSort) + single DrawSplats
++	// Phase 2 (single RadixSort over keys written by CalcViewData) + single DrawSplats
+ 	//------------------------------------------------------------------
+ 
+ 		// Build the list of visible proxies and compute total splat count (CPU-side)
+@@ -313,6 +457,9 @@
+ 
+ 		FGaussianGlobalAccumulator* RawAccumulator = GlobalAccumulator.Get();
+ 
++		// Depth-sort key encoding for this view (gs.SortKeyBits)
++		const FGaussianSortKeyParams SortKeys = GetSortKeyParams(*SceneView);
++
+ 		// Read render budget for global accumulator buffer cap.
+ 		// Disable budget when forcing LOD level — the debug command needs to show
+ 		// all assets regardless of splat count (user expects to see quality vs performance).
+@@ -345,7 +492,7 @@
+ 			ERDGPassFlags::None,
+ 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, RawAccumulator,
+ 			 CurrentVP, CurrentDebugMode,
+-			 CurrentDebugForceLODLevel, MaxRenderBudget, PassState](FRHICommandListImmediate& RHICmdList)
++			 CurrentDebugForceLODLevel, MaxRenderBudget, SortKeys, PassState](FRHICommandListImmediate& RHICmdList)
+ 			{
+ 				if (!SceneView) return;
+ 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatPrepare_Global);
+@@ -429,95 +576,105 @@
+ 
+ 					if (!bCanSkipAdjusted)
+ 					{
+-						// --------------------------------------------------
+-						// Phase 0: Per-proxy culling + compaction + indirect args
+-						// Early-out: skip proxies once cumulative splat count
+-						// exceeds MaxRenderBudget (CPU-side estimate using total
+-						// splat count as conservative upper bound for visible count).
+-						// Proxies are sorted by distance, so closer ones get priority.
+-						// --------------------------------------------------
+ 						int32 NumProcessedProxies = 0;
+-						uint32 CumulativeSplatCount = 0;
+-
+-						for (const auto& Info : ValidProxies)
+ 						{
+-							// Budget early-out: if cumulative total already exceeds budget,
+-							// skip culling/compaction for remaining (farther) proxies
+-							if (MaxRenderBudget > 0 && CumulativeSplatCount >= MaxRenderBudget)
++							RHI_BREADCRUMB_EVENT_STAT(RHICmdList, NanoGSViewData, "NanoGSViewData");
++							// --------------------------------------------------
++							// Phase 0: Per-proxy culling + compaction + indirect args
++							// Early-out: skip proxies once cumulative splat count
++							// exceeds MaxRenderBudget (CPU-side estimate using total
++							// splat count as conservative upper bound for visible count).
++							// Proxies are sorted by distance, so closer ones get priority.
++							// --------------------------------------------------
++							uint32 CumulativeSplatCount = 0;
++
++							for (const auto& Info : ValidProxies)
+ 							{
+-								break;
+-							}
++								// Budget early-out: if cumulative total already exceeds budget,
++								// skip culling/compaction for remaining (farther) proxies
++								if (MaxRenderBudget > 0 && CumulativeSplatCount >= MaxRenderBudget)
++								{
++									break;
++								}
+ 
+-							FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+-							if (!GPUResources) continue;  // Extra safety check
+-							int32 SplatCount = Info.Proxy->GetSplatCount();
+-							int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
++								FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
++								if (!GPUResources) continue;  // Extra safety check
++								int32 SplatCount = Info.Proxy->GetSplatCount();
++								int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+ 
+-							// Cluster culling → fills ClusterVisibilityBitmap
+-							FGaussianSplatRenderer::DispatchClusterCulling(
+-								RHICmdList, *SceneView, GPUResources,
+-								Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
++								// Cluster culling → fills ClusterVisibilityBitmap
++								FGaussianSplatRenderer::DispatchClusterCulling(
++									RHICmdList, *SceneView, GPUResources,
++									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
+ 
+-							// Compact → fills CompactedSplatIndices + VisibleSplatCountBuffer
+-							FGaussianSplatRenderer::DispatchCompactSplats(
+-								RHICmdList, GPUResources,
+-								SplatCount, OriginalSplatCount, Info.bUseLODRendering);
++								// Compact → fills CompactedSplatIndices + VisibleSplatCountBuffer
++								FGaussianSplatRenderer::DispatchCompactSplats(
++									RHICmdList, GPUResources,
++									SplatCount, OriginalSplatCount, Info.bUseLODRendering);
+ 
+-							// PrepareIndirectArgs → fills IndirectDispatchArgsBuffer for CalcViewData
+-							FGaussianSplatRenderer::DispatchPrepareIndirectArgs(RHICmdList, GPUResources);
++								// PrepareIndirectArgs → fills IndirectDispatchArgsBuffer for CalcViewData
++								FGaussianSplatRenderer::DispatchPrepareIndirectArgs(RHICmdList, GPUResources);
+ 
+-							CumulativeSplatCount += (uint32)SplatCount;
+-							NumProcessedProxies++;
+-						}
++								CumulativeSplatCount += (uint32)SplatCount;
++								NumProcessedProxies++;
++							}
+ 
+-						// --------------------------------------------------
+-						// Phase 1: Gather visible counts + GPU prefix sum
+-						// Only gather from proxies that were actually processed
+-						// --------------------------------------------------
+-						for (int32 i = 0; i < NumProcessedProxies; i++)
+-						{
+-							FGaussianSplatGPUResources* GPUResources = ValidProxies[i].Proxy->GetGPUResources();
+-							if (!GPUResources) continue;  // Extra safety check
+-							FGaussianSplatRenderer::DispatchGatherVisibleCount(
+-								RHICmdList, GPUResources, RawAccumulator, i);
+-						}
++							// --------------------------------------------------
++							// Phase 1: Gather visible counts + GPU prefix sum
++							// Only gather from proxies that were actually processed
++							// --------------------------------------------------
++							for (int32 i = 0; i < NumProcessedProxies; i++)
++							{
++								FGaussianSplatGPUResources* GPUResources = ValidProxies[i].Proxy->GetGPUResources();
++								if (!GPUResources) continue;  // Extra safety check
++								FGaussianSplatRenderer::DispatchGatherVisibleCount(
++									RHICmdList, GPUResources, RawAccumulator, i);
++							}
+ 
+-						// Single 1-thread dispatch: computes prefix sums + writes all indirect args
+-						FGaussianSplatRenderer::DispatchPrefixSumVisibleCounts(
+-							RHICmdList, RawAccumulator, NumProcessedProxies, MaxRenderBudget);
++							// Single 1-thread dispatch: computes prefix sums + writes all indirect args
++							FGaussianSplatRenderer::DispatchPrefixSumVisibleCounts(
++								RHICmdList, RawAccumulator, NumProcessedProxies, MaxRenderBudget);
+ 
+-						// --------------------------------------------------
+-						// Phase 2: Per-proxy CalcViewData → global buffer
+-						// (indirect dispatch, only visible splats per proxy)
+-						// Only process proxies that went through culling/compaction
+-						// --------------------------------------------------
+-						for (int32 i = 0; i < NumProcessedProxies; i++)
+-						{
+-							const auto& Info = ValidProxies[i];
+-							FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+-							if (!GPUResources) continue;  // Extra safety check
+-							int32 SplatCount = Info.Proxy->GetSplatCount();
+-							int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
++							// --------------------------------------------------
++							// Phase 2: Per-proxy CalcViewData → global buffer
++							// (indirect dispatch, only visible splats per proxy)
++							// Only process proxies that went through culling/compaction
++							// --------------------------------------------------
++							for (int32 i = 0; i < NumProcessedProxies; i++)
++							{
++								const auto& Info = ValidProxies[i];
++								FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
++								if (!GPUResources) continue;  // Extra safety check
++								int32 SplatCount = Info.Proxy->GetSplatCount();
++								int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+ 
+-							FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
+-								RHICmdList, *SceneView, GPUResources,
+-								Info.LocalToWorld,
+-								SplatCount,
+-								OriginalSplatCount,
+-								Info.Proxy->GetSHOrder(),
+-								Info.Proxy->GetOpacityScale(),
+-								Info.Proxy->GetSplatScale(),
+-								i,
+-								RawAccumulator,
+-								MaxRenderBudget);
++								FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
++									RHICmdList, *SceneView, GPUResources,
++									Info.LocalToWorld,
++									SplatCount,
++									OriginalSplatCount,
++									Info.Proxy->GetSHOrder(),
++									Info.Proxy->GetOpacityScale(),
++									Info.Proxy->GetSplatScale(),
++									i,
++									RawAccumulator,
++									MaxRenderBudget,
++									SortKeys);
++							}
+ 						}
+ 
+ 						// --------------------------------------------------
+-						// Phase 3: Single global CalcDistances + RadixSort
++						// Phase 3: Single global RadixSort (CalcViewData wrote the keys)
+ 						// (all indirect — count driven by GPU prefix sum)
+ 						// --------------------------------------------------
+-						FGaussianSplatRenderer::DispatchCalcDistancesGlobalIndirect(RHICmdList, RawAccumulator);
+-						FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(RHICmdList, RawAccumulator);
++						{
++							RHI_BREADCRUMB_EVENT_STAT(RHICmdList, NanoGSSort, "NanoGSSort");
++							FGaussianSplatRenderer::DispatchRadixSortGlobalIndirect(RHICmdList, RawAccumulator, SortKeys);
++						}
++						if (CVarGSValidateSort.GetValueOnRenderThread() != 0)
++						{
++							EnqueueSortValidation(RHICmdList, RawAccumulator, 0, SortKeys.Bits);
++						}
+ 
+ 						// Update caches — only for processed proxies
+ 						RawAccumulator->bHasCachedSortData = true;
+@@ -570,55 +727,65 @@
+ 
+ 					if (!bCanSkipAdjusted)
+ 					{
+-						// --------------------------------------------------
+-						// Phase 1: Per-proxy ClusterCulling + CalcViewData
+-						// --------------------------------------------------
+-						for (const auto& Info : ValidProxies)
+ 						{
+-							// Skip proxies that would write beyond the render budget
+-							if (MaxRenderBudget > 0 && Info.GlobalBaseOffset >= MaxRenderBudget)
++							RHI_BREADCRUMB_EVENT_STAT(RHICmdList, NanoGSViewData, "NanoGSViewData");
++							// --------------------------------------------------
++							// Phase 1: Per-proxy ClusterCulling + CalcViewData
++							// --------------------------------------------------
++							for (const auto& Info : ValidProxies)
+ 							{
+-								break;  // All subsequent proxies also exceed the budget
+-							}
++								// Skip proxies that would write beyond the render budget
++								if (MaxRenderBudget > 0 && Info.GlobalBaseOffset >= MaxRenderBudget)
++								{
++									break;  // All subsequent proxies also exceed the budget
++								}
+ 
+-							FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+-							if (!GPUResources) continue;  // Extra safety check
++								FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
++								if (!GPUResources) continue;  // Extra safety check
+ 
+-							// Cluster culling for Nanite-enabled proxies
+-							if (GPUResources->bEnableNanite && GPUResources->bHasClusterData)
+-							{
+-								FGaussianSplatRenderer::DispatchClusterCulling(
++								// Cluster culling for Nanite-enabled proxies
++								if (GPUResources->bEnableNanite && GPUResources->bHasClusterData)
++								{
++									FGaussianSplatRenderer::DispatchClusterCulling(
++										RHICmdList, *SceneView, GPUResources,
++										Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
++								}
++
++								// CalcViewData → writes to GlobalViewDataBuffer at GlobalBaseOffset.
++								// A proxy can straddle the budget: its base fits but base + SplatCount
++								// overruns the budget-capped global buffers (48MB cap = 750k splats on
++								// iOS wrote OOB at 48MB+ offsets). Clamp to the remaining capacity —
++								// the sort and draw below already use CappedTotalSplatCount.
++								int32 ProxySplatCount = Info.Proxy->GetSplatCount();
++								if (MaxRenderBudget > 0 && Info.GlobalBaseOffset + (uint32)ProxySplatCount > MaxRenderBudget)
++								{
++									ProxySplatCount = (int32)(MaxRenderBudget - Info.GlobalBaseOffset);
++								}
++								FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
+ 									RHICmdList, *SceneView, GPUResources,
+-									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
++									Info.LocalToWorld,
++									ProxySplatCount,
++									Info.Proxy->GetSHOrder(),
++									Info.Proxy->GetOpacityScale(),
++									Info.Proxy->GetSplatScale(),
++									Info.bUseLODRendering,
++									Info.GlobalBaseOffset,
++									RawAccumulator,
++									SortKeys);
+ 							}
+-
+-							// CalcViewData → writes to GlobalViewDataBuffer at GlobalBaseOffset.
+-							// A proxy can straddle the budget: its base fits but base + SplatCount
+-							// overruns the budget-capped global buffers (48MB cap = 750k splats on
+-							// iOS wrote OOB at 48MB+ offsets). Clamp to the remaining capacity —
+-							// the sort and draw below already use CappedTotalSplatCount.
+-							int32 ProxySplatCount = Info.Proxy->GetSplatCount();
+-							if (MaxRenderBudget > 0 && Info.GlobalBaseOffset + (uint32)ProxySplatCount > MaxRenderBudget)
+-							{
+-								ProxySplatCount = (int32)(MaxRenderBudget - Info.GlobalBaseOffset);
+-							}
+-							FGaussianSplatRenderer::DispatchCalcViewDataGlobal(
+-								RHICmdList, *SceneView, GPUResources,
+-								Info.LocalToWorld,
+-								ProxySplatCount,
+-								Info.Proxy->GetSHOrder(),
+-								Info.Proxy->GetOpacityScale(),
+-								Info.Proxy->GetSplatScale(),
+-								Info.bUseLODRendering,
+-								Info.GlobalBaseOffset,
+-								RawAccumulator);
+ 						}
+ 
+ 						// --------------------------------------------------
+-						// Phase 2: Single global CalcDistances + RadixSort
++						// Phase 2: Single global RadixSort (CalcViewData wrote the keys)
+ 						// --------------------------------------------------
+-						FGaussianSplatRenderer::DispatchCalcDistancesGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
+-						FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount);
++						{
++							RHI_BREADCRUMB_EVENT_STAT(RHICmdList, NanoGSSort, "NanoGSSort");
++							FGaussianSplatRenderer::DispatchRadixSortGlobal(RHICmdList, RawAccumulator, (int32)CappedTotalSplatCount, SortKeys);
++						}
++						if (CVarGSValidateSort.GetValueOnRenderThread() != 0)
++						{
++							EnqueueSortValidation(RHICmdList, RawAccumulator, CappedTotalSplatCount, SortKeys.Bits);
++						}
+ 
+ 						// Update caches
+ 						RawAccumulator->bHasCachedSortData = true;
+@@ -654,34 +821,37 @@
+ 		);
+ 
+ 		// Pass 1b (raster): draw the sorted splats into the intermediate RT.
+-		GraphBuilder.AddPass(
+-			RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
+-			Pass1Parameters,
+-			ERDGPassFlags::Raster,
+-			[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, PassState](FRHICommandListImmediate& RHICmdList)
+-			{
+-				if (!SceneView) return;
+-				if (PassState->ValidProxies.Num() == 0 || PassState->NewTotalSplatCount == 0)
++		{
++			RDG_EVENT_SCOPE_STAT(GraphBuilder, NanoGSDraw, "NanoGSDraw");
++			GraphBuilder.AddPass(
++				RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
++				Pass1Parameters,
++				ERDGPassFlags::Raster,
++				[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, PassState](FRHICommandListImmediate& RHICmdList)
+ 				{
+-					return;
+-				}
+-				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
++					if (!SceneView) return;
++					if (PassState->ValidProxies.Num() == 0 || PassState->NewTotalSplatCount == 0)
++					{
++						return;
++					}
++					SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatRendering_Global);
+ 
+-				if (PassState->bUseIndirectDraw)
+-				{
+-					// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
+-					FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
+-						RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
++					if (PassState->bUseIndirectDraw)
++					{
++						// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
++						FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
++							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
++					}
++					else
++					{
++						// Single draw call for ALL proxies (capped to render budget)
++						FGaussianSplatRenderer::DrawSplatsGlobal(
++							RHICmdList, *SceneView, RawAccumulator,
++							SharedIndexBuffer, (int32)PassState->DrawSplatCount, DebugMode);
++					}
+ 				}
+-				else
+-				{
+-					// Single draw call for ALL proxies (capped to render budget)
+-					FGaussianSplatRenderer::DrawSplatsGlobal(
+-						RHICmdList, *SceneView, RawAccumulator,
+-						SharedIndexBuffer, (int32)PassState->DrawSplatCount, DebugMode);
+-				}
+-			}
+-		);
++			);
++		}
+ 
+ 		// Pass 2: Composite intermediate sRGB RT onto SceneColor (sRGB → linear conversion)
+ 		// Use FGaussianCompositePassParameters to declare IntermediateTexture as an RDG-tracked
+@@ -694,21 +864,24 @@
+ 		Pass2Parameters->IntermediateTexture = IntermediateTexture;
+ 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
+ 
+-		GraphBuilder.AddPass(
+-			RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
+-			Pass2Parameters,
+-			ERDGPassFlags::Raster,
+-			[SceneView, IntermediateTexture](FRHICommandListImmediate& RHICmdList)
+-			{
+-				if (!SceneView) return;
++		{
++			RDG_EVENT_SCOPE_STAT(GraphBuilder, NanoGSComposite, "NanoGSComposite");
++			GraphBuilder.AddPass(
++				RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
++				Pass2Parameters,
++				ERDGPassFlags::Raster,
++				[SceneView, IntermediateTexture](FRHICommandListImmediate& RHICmdList)
++				{
++					if (!SceneView) return;
+ 
+-				FRHITexture* IntermediateRHI = IntermediateTexture->GetRHI();
+-				if (!IntermediateRHI) return;
++					FRHITexture* IntermediateRHI = IntermediateTexture->GetRHI();
++					if (!IntermediateRHI) return;
+ 
+-				FGaussianSplatRenderer::CompositeToSceneColor(
+-					RHICmdList, *SceneView, IntermediateRHI);
+-			}
+-		);
++					FGaussianSplatRenderer::CompositeToSceneColor(
++						RHICmdList, *SceneView, IntermediateRHI);
++				}
++			);
++		}
+ }
+ 
+ void FNanoGSModule::ShutdownModule()
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianDataTypes.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianDataTypes.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianDataTypes.h	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianDataTypes.h	2026-09-29 13:46:27
+@@ -113,40 +113,32 @@
+ /**
+  * Per-frame view data computed by compute shader, used by vertex shader
+  * This structure must match the HLSL definition in GaussianDataTypes.ush
+- * Total: 64 bytes per splat (with TranslatedWorldPos for velocity, 16-byte aligned)
++ * Total: 32 bytes per splat; the vertex shader derives clip position and velocity from TranslatedWorldPos
+  */
+ USTRUCT()
+ struct FGaussianSplatViewData
+ {
+ 	GENERATED_BODY()
+ 
+-	/** Clip space position (xyz/w) */
+-	FVector4f ClipPosition = FVector4f::Zero();
+-
+-	/** Translated world position for velocity calculation (world + PreViewTranslation) */
++	/** Splat centre: world position + PreViewTranslation of the frame it was computed in */
+ 	FVector3f TranslatedWorldPos = FVector3f::ZeroVector;
+ 
+-	/** Padding after TranslatedWorldPos for alignment */
+-	float TranslatedWorldPosPad = 0.0f;
++	/** Cluster ID (24 bits) | LOD level << 24 (7 bits) | culled flag (bit 31) */
++	uint32 ClusterIDAndFlags = 0;
+ 
+ 	/** Half-float packed R,G channels */
+ 	uint32 PackedColorRG = 0;
+ 
+-	/** Half-float packed B,A channels */
++	/** Half-float packed B channel and opacity */
+ 	uint32 PackedColorBA = 0;
+ 
+-	/** 2D covariance principal axis 1 (screen space) */
+-	FVector2f Axis1 = FVector2f::ZeroVector;
++	/** Half-float packed 2D covariance principal axis 1 (NDC) */
++	uint32 PackedAxis1 = 0;
+ 
+-	/** 2D covariance principal axis 2 (screen space) */
+-	FVector2f Axis2 = FVector2f::ZeroVector;
+-
+-	/** Cluster ID for debug visualization (Nanite-style) */
+-	uint32 ClusterID = 0;
+-
+-	/** Padding for 16-byte alignment */
+-	uint32 Padding = 0;
++	/** Half-float packed 2D covariance principal axis 2 (NDC) */
++	uint32 PackedAxis2 = 0;
+ };
++static_assert(sizeof(FGaussianSplatViewData) == 32, "FGaussianSplatViewData must match GaussianDataTypes.ush (32 bytes)");
+ 
+ /**
+  * Chunk info for quantized/compressed data
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-09-29 13:49:11
+@@ -11,12 +11,12 @@
+  * Owned by FGaussianSplattingModule (render-thread lifetime).
+  *
+  * All proxies write their CalcViewData output into GlobalViewDataBuffer at their
+- * respective GlobalBaseOffset. Then a single CalcDistances + RadixSort + DrawSplats
++ * respective GlobalBaseOffset (and its sort keys). Then a single RadixSort + DrawSplats
+  * covers all splats from all proxies in one pass.
+  *
+  * Execution flow each frame:
+  *   Phase 1 (per-proxy): ClusterCulling → CalcViewData → GlobalViewDataBuffer[BaseOffset + i]
+- *   Phase 2 (once):      CalcDistances(GlobalViewDataBuffer) → RadixSort → DrawSplats
++ *   Phase 2 (once):      RadixSort(keys written by CalcViewData) → DrawSplats
+  */
+ struct NANOGS_API FGaussianGlobalAccumulator
+ {
+@@ -24,7 +24,7 @@
+ 	// Global GPU buffers
+ 	//----------------------------------------------------------------------
+ 
+-	/** View data for all proxies concatenated (written by CalcViewData, read by CalcDistances + VS) */
++	/** View data for all proxies concatenated (written by CalcViewData, read by the VS) */
+ 	FBufferRHIRef GlobalViewDataBuffer;
+ 	FUnorderedAccessViewRHIRef GlobalViewDataBufferUAV;
+ 	FShaderResourceViewRHIRef GlobalViewDataBufferSRV;
+@@ -73,7 +73,7 @@
+ 	FUnorderedAccessViewRHIRef GlobalBaseOffsetsBufferUAV;
+ 	FShaderResourceViewRHIRef GlobalBaseOffsetsBufferSRV;
+ 
+-	/** [3] — indirect dispatch args for CalcDistances: { ceil(TotalVisible/256), 1, 1 } */
++	/** [3] — { ceil(TotalVisible/256), 1, 1 } (was CalcDistances' dispatch; CalcViewData now writes the keys) */
+ 	FBufferRHIRef GlobalCalcDistIndirectArgsBuffer;
+ 	FUnorderedAccessViewRHIRef GlobalCalcDistIndirectArgsBufferUAV;
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h	2026-09-29 12:41:19
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h	2026-09-29 13:21:02
+@@ -57,9 +57,12 @@
+ 	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting")
+ 	int64 GetMemoryUsage() const;
+ 
+-	/** Check if asset has valid data */
++	/** Check if asset has valid data (NanoGS's own buffers, or SOG records for SOG assets) */
+ 	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting")
+-	bool IsValid() const { return SplatCount > 0 && PositionBulkData.GetBulkDataSize() > 0; }
++	bool IsValid() const
++	{
++		return SplatCount > 0 && (PositionBulkData.GetBulkDataSize() > 0 || SOGRecordBulkData.GetBulkDataSize() > 0);
++	}
+ 
+ 	/** Check if cluster hierarchy is available */
+ 	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting|Clustering")
+@@ -237,8 +240,8 @@
+ 	void InitializeFromSplatData(const TArray<FGaussianSplatData>& InSplats, EGaussianQualityLevel InQuality);
+ 
+ 	/**
+-	 * Decompress and return all splat positions (for debugging)
+-	 * @return Array of world-space positions
++	 * Decompress and return all splat positions (for debugging); SOG assets decode their records
++	 * @return Array of local-space positions (cm)
+ 	 */
+ 	UFUNCTION(BlueprintCallable, Category = "Gaussian Splatting|Debug")
+ 	TArray<FVector> GetDecompressedPositions() const;
+@@ -291,8 +294,9 @@
+ 	/** Shared render data (lazy-initialized, shared across all proxies) */
+ 	TSharedPtr<FGaussianSplatRenderData> RenderData;
+ 
+-	//~ SOG payload: present for assets imported from .sog files. Records follow the same splat order as
+-	//~ the legacy buffers (including NanoGS LOD splats), so either path can render any splat index.
++	//~ SOG payload: present for assets imported from .sog files, which render from it alone (GPU decode in
++	//~ CalcViewData) and store none of NanoGS's own position / rotation / colour / SH buffers. Records
++	//~ include NanoGS LOD splats, in the cluster builder's order.
+ 
+ 	/** True when the asset carries SOG GPU records (imported from a .sog file). */
+ 	UPROPERTY(VisibleAnywhere, Category = "SOG")
+@@ -321,7 +325,14 @@
+ 	int64 GetSOGPaletteDataSize() const { return SOGPaletteBulkData.GetBulkDataSize(); }
+ 
+ #if WITH_EDITOR
+-	/** Store the SOG payload: Records must match the legacy buffers' splat order and count. */
++	/**
++	 * Initialize a SOG asset: bounds and thumbnail from the decoded splats, the SOG payload from Records
++	 * (one per splat, same order), and no NanoGS position / rotation / colour / SH data.
++	 */
++	void InitializeFromSOG(const TArray<FGaussianSplatData>& InSplats, const sog::DecodedAsset& Source,
++		const TArray<sog::PackedSplat>& Records, EGaussianQualityLevel InQuality);
++
++	/** Store the SOG payload: Records must match SplatCount. */
+ 	void SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records);
+ 
+ 	/** Remove the SOG payload. */
+@@ -338,6 +349,9 @@
+ #if WITH_EDITOR
+ 	/** Read the source file (PLY or SOG) into CPU splats; fills OutSOG for SOG sources. */
+ 	bool ReadSourceSplats(TArray<FGaussianSplatData>& OutSplats, sog::DecodedAsset& OutSOG, bool& bOutIsSOG, FString& OutError) const;
++
++	/** Drop NanoGS's own splat buffers (positions, rotation/scale, colour texture, SH, chunks). */
++	void ClearNanoGSSplatData();
+ #endif
+ 
+ private:
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-09-29 13:18:57
+@@ -66,8 +66,24 @@
+ 	FBufferRHIRef SplatClusterIndexBuffer;
+ 	FShaderResourceViewRHIRef SplatClusterIndexBufferSRV;
+ 
++	/** SOG assets render from these instead of the packed splat and SH buffers:
++	 *  20-byte records, the scale + DC lookup tables (float[512]) and the half4 SH palette. */
++	FBufferRHIRef SOGRecordBuffer;
++	FShaderResourceViewRHIRef SOGRecordBufferSRV;
++	FBufferRHIRef SOGTableBuffer;
++	FShaderResourceViewRHIRef SOGTableBufferSRV;
++	FBufferRHIRef SOGPaletteBuffer;
++	FShaderResourceViewRHIRef SOGPaletteBufferSRV;
++
+ 	// ---- Metadata ----
+ 
++	/** True when the asset renders from its SOG payload (GPU decode in CalcViewData). */
++	bool bHasSOG = false;
++	/** SOG file -> local transform as three rows (xyz = 3x3, w = translation), and the log-domain position range. */
++	FVector4f SOGFileToLocalRows[3] = { FVector4f::Zero(), FVector4f::Zero(), FVector4f::Zero() };
++	FVector3f SOGMeanMin = FVector3f::ZeroVector;
++	FVector3f SOGMeanMax = FVector3f::ZeroVector;
++
+ 	int32 SplatCount = 0;
+ 	int32 SHBands = 0;
+ 	int32 ClusterCount = 0;
+@@ -83,6 +99,9 @@
+ 
+ 	TArray<uint8> PackedSplatData;
+ 	TArray<uint8> SHData;
++	TArray<uint8> SOGRecordData;
++	TArray<uint8> SOGPaletteData;
++	TArray<float> SOGTableData;
+ 	TArray<FGaussianChunkInfo> CachedChunkData;
+ 	TArray<FGaussianGPUCluster> CachedClusterData;
+ 	TArray<uint32> CachedSplatClusterIndices;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-09-29 13:48:05
+@@ -12,6 +12,19 @@
+ struct FGaussianGlobalAccumulator;
+ 
+ /**
++ * Sort key encoding for one view (gs.SortKeyBits): 32-bit float depth keys sorted in 4 radix passes, or
++ * 16-bit log view-depth keys over [near plane, gs.SortKeyFarDistance] sorted in 2 (perspective views only).
++ */
++struct FGaussianSortKeyParams
++{
++	uint32 Bits = 32;
++	float LogNear = 0.0f;      // log2(near plane distance)
++	float InvLogRange = 0.0f;  // 1 / log2(far distance / near plane distance)
++
++	uint32 NumRadixPasses() const { return Bits / 8; }
++};
++
++/**
+  * Handles the rendering of Gaussian Splats
+  * Orchestrates compute passes for view calculation, sorting, and final rendering
+  */
+@@ -38,15 +51,6 @@
+ 	);
+ 
+ 	/**
+-	 * Dispatch the distance calculation compute shader
+-	 */
+-	static void DispatchCalcDistances(
+-		FRHICommandListImmediate& RHICmdList,
+-		FGaussianSplatGPUResources* GPUResources,
+-		int32 SplatCount
+-	);
+-
+-	/**
+ 	 * Dispatch radix sort for back-to-front ordering
+ 	 */
+ 	static void DispatchRadixSort(
+@@ -136,15 +140,6 @@
+ 		float SplatScale
+ 	);
+ 
+-	/**
+-	 * Dispatch CalcDistances with indirect dispatch
+-	 * Only processes visible splats
+-	 */
+-	static void DispatchCalcDistancesIndirect(
+-		FRHICommandListImmediate& RHICmdList,
+-		FGaussianSplatGPUResources* GPUResources
+-	);
+-
+ 	//----------------------------------------------------------------------
+ 	// Global Accumulator dispatch (one-draw-call path)
+ 	//----------------------------------------------------------------------
+@@ -164,17 +159,8 @@
+ 		float SplatScale,
+ 		bool bUseLODRendering,
+ 		uint32 GlobalBaseOffset,
+-		FGaussianGlobalAccumulator* GlobalAccumulator
+-	);
+-
+-	/**
+-	 * Dispatch CalcDistances over the full global ViewDataBuffer.
+-	 * Must be called after all Phase-1 CalcViewData dispatches.
+-	 */
+-	static void DispatchCalcDistancesGlobal(
+-		FRHICommandListImmediate& RHICmdList,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+-		int32 TotalSplatCount
++		const FGaussianSortKeyParams& SortKeys
+ 	);
+ 
+ 	/**
+@@ -183,7 +169,8 @@
+ 	static void DispatchRadixSortGlobal(
+ 		FRHICommandListImmediate& RHICmdList,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+-		int32 TotalSplatCount
++		int32 TotalSplatCount,
++		const FGaussianSortKeyParams& SortKeys
+ 	);
+ 
+ 	/**
+@@ -202,7 +189,7 @@
+ 	//----------------------------------------------------------------------
+ 	// Global Accumulator + Nanite Compaction dispatch (one-draw-call path)
+ 	// Phase sequence: GatherVisibleCount × N → PrefixSumVisibleCounts ×1 →
+-	//   CalcViewDataCompactedGlobal × N → CalcDistancesGlobalIndirect ×1 →
++	//   CalcViewDataCompactedGlobal × N (writes the sort keys too) →
+ 	//   RadixSortGlobalIndirect ×1 → DrawSplatsGlobalIndirect ×1
+ 	//----------------------------------------------------------------------
+ 
+@@ -247,25 +234,18 @@
+ 		float SplatScale,
+ 		int32 ProxyIndex,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+-		uint32 MaxRenderBudget
++		uint32 MaxRenderBudget,
++		const FGaussianSortKeyParams& SortKeys
+ 	);
+ 
+ 	/**
+-	 * CalcDistances over the global ViewDataBuffer using indirect dispatch
+-	 * (count from GlobalCalcDistIndirectArgsBuffer written by PrefixSumCS).
+-	 */
+-	static void DispatchCalcDistancesGlobalIndirect(
+-		FRHICommandListImmediate& RHICmdList,
+-		FGaussianGlobalAccumulator* GlobalAccumulator
+-	);
+-
+-	/**
+ 	 * Radix sort over the global distance/key buffers using indirect dispatch
+ 	 * (count/numTiles from GlobalSortParamsBuffer written by PrefixSumCS).
+ 	 */
+ 	static void DispatchRadixSortGlobalIndirect(
+ 		FRHICommandListImmediate& RHICmdList,
+-		FGaussianGlobalAccumulator* GlobalAccumulator
++		FGaussianGlobalAccumulator* GlobalAccumulator,
++		const FGaussianSortKeyParams& SortKeys
+ 	);
+ 
+ 	/**
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h	2026-09-29 12:40:34
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h	2026-09-29 13:21:18
+@@ -35,6 +35,9 @@
+ 	/** Inverse of ToSplatData for one splat: Unreal local space back to the SOG file frame. */
+ 	NANOGS_API void FromSplatData(const FGaussianSplatData& In, sog::SplatFloat& Out);
+ 
++	/** A record's position in Unreal local space (cm) from the asset's stored constants, as the GPU decodes it. */
++	NANOGS_API FVector3f DecodePosition(const sog::AssetConstants& Constants, const sog::PackedSplat& Record);
++
+ 	/**
+ 	 * GPU records for a Nanite-built asset: the first NumBase records are the source records in the
+ 	 * cluster builder's order (Order[i] = source index of splat i), the rest are NanoGS's merged LOD
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-08-28 01:22:02
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-09-29 13:19:57
+@@ -32,7 +32,11 @@
+ 	void Initialize(UGaussianSplatAsset* Asset);
+ 
+ 	/** Check if resources are valid */
+-	bool IsValid() const { return bInitialized && SplatCount > 0 && (PackedSplatBufferSRV.IsValid() || ColorTextureSRV.IsValid()); }
++	bool IsValid() const
++	{
++		return bInitialized && SplatCount > 0
++			&& (PackedSplatBufferSRV.IsValid() || SOGRecordBufferSRV.IsValid() || ColorTextureSRV.IsValid());
++	}
+ 
+ 	/** Get number of splats */
+ 	int32 GetSplatCount() const { return SplatCount; }
+@@ -58,6 +62,21 @@
+ 	/** Spherical harmonics buffer */
+ 	FBufferRHIRef SHBuffer;
+ 	FShaderResourceViewRHIRef SHBufferSRV;
++
++	/** SOG assets: 20-byte records, scale + DC tables and half4 SH palette (shared, replace the two above) */
++	FBufferRHIRef SOGRecordBuffer;
++	FShaderResourceViewRHIRef SOGRecordBufferSRV;
++	FBufferRHIRef SOGTableBuffer;
++	FShaderResourceViewRHIRef SOGTableBufferSRV;
++	FBufferRHIRef SOGPaletteBuffer;
++	FShaderResourceViewRHIRef SOGPaletteBufferSRV;
++
++	/** True when CalcViewData decodes SOG records for this asset */
++	bool bHasSOG = false;
++	/** SOG file -> local transform rows (xyz = 3x3, w = translation) and log-domain position range */
++	FVector4f SOGFileToLocalRows[3] = { FVector4f::Zero(), FVector4f::Zero(), FVector4f::Zero() };
++	FVector3f SOGMeanMin = FVector3f::ZeroVector;
++	FVector3f SOGMeanMax = FVector3f::ZeroVector;
+ 
+ 	/** Chunk info buffer */
+ 	FBufferRHIRef ChunkBuffer;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-08-10 20:06:35
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-09-29 13:49:11
+@@ -19,10 +19,31 @@
+ 	DECLARE_GLOBAL_SHADER(FGaussianSplatCalcViewDataCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCalcViewDataCS, FGlobalShader);
+ 
++	/** Decode SOG records (20 bytes/splat + SH palette) instead of NanoGS's packed splats and SH buffer. */
++	class FSOGDim : SHADER_PERMUTATION_BOOL("GS_SOG");
++	using FPermutationDomain = TShaderPermutationDomain<FSOGDim>;
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		// Packed-splat permutation (GS_SOG = 0)
+ 		SHADER_PARAMETER_SRV(ByteAddressBuffer, PackedSplatBuffer)  // 16 bytes/splat packed data
+-		SHADER_PARAMETER_SRV(ByteAddressBuffer, SHBuffer)           // SH data (currently unused)
++		SHADER_PARAMETER_SRV(ByteAddressBuffer, SHBuffer)           // Float16 SH, DC + higher-order coefficients
++		// SOG permutation (GS_SOG = 1)
++		SHADER_PARAMETER_SRV(ByteAddressBuffer, SOGRecordBuffer)    // 20 bytes/splat SOG records
++		SHADER_PARAMETER_SRV(ByteAddressBuffer, SOGTableBuffer)     // float[512]: scale LUT, then DC LUT
++		SHADER_PARAMETER_SRV(ByteAddressBuffer, SOGPaletteBuffer)   // half4 SH palette
++		SHADER_PARAMETER(FVector4f, SOGFileToLocalRow0)             // file -> local rows (xyz 3x3, w translation)
++		SHADER_PARAMETER(FVector4f, SOGFileToLocalRow1)
++		SHADER_PARAMETER(FVector4f, SOGFileToLocalRow2)
++		SHADER_PARAMETER(FVector3f, SOGMeanMin)
++		SHADER_PARAMETER(FVector3f, SOGMeanMax)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
++		// Depth-sort keys, one per ViewDataBuffer entry (global paths; see FGaussianSortKeyParams)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, DistanceBuffer)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, KeyBuffer)
++		SHADER_PARAMETER(uint32, WriteSortKeys)
++		SHADER_PARAMETER(uint32, SortKeyBits)
++		SHADER_PARAMETER(float, SortKeyLogNear)
++		SHADER_PARAMETER(float, SortKeyInvLogRange)
+ 		// Cluster visibility integration (UNIFIED APPROACH)
+ 		// SplatClusterIndexBuffer maps ALL splats to their cluster (original->leaf, LOD->parent)
+ 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SplatClusterIndexBuffer)
+@@ -152,33 +173,6 @@
+ };
+ 
+ /**
+- * Compute shader for calculating sort distances (depth) for each splat
+- */
+-class FGaussianSplatCalcDistancesCS : public FGlobalShader
+-{
+-	DECLARE_GLOBAL_SHADER(FGaussianSplatCalcDistancesCS);
+-	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCalcDistancesCS, FGlobalShader);
+-
+-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+-		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, DistanceBuffer)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, KeyBuffer)
+-		SHADER_PARAMETER(uint32, SplatCount)
+-	END_SHADER_PARAMETER_STRUCT()
+-
+-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+-	{
+-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+-	}
+-
+-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+-	{
+-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+-		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 256);
+-	}
+-};
+-
+-/**
+  * Vertex shader for rendering Gaussian splats as quads
+  */
+ class FGaussianSplatVS : public FGlobalShader
+@@ -192,6 +186,11 @@
+ 		SHADER_PARAMETER(uint32, SplatCount)
+ 		SHADER_PARAMETER(uint32, DebugMode)  // 0=off, 1=cluster colors (Nanite-style debug)
+ 		SHADER_PARAMETER(uint32, EnableNanite)  // 1=Nanite enabled, 0=disabled (hidden in debug mode)
++		// Clip position and velocity of each splat centre. UN-JITTERED matrices, so a static camera
++		// keeps positions stable and gives zero velocity.
++		SHADER_PARAMETER(FMatrix44f, TranslatedWorldToClip)
++		SHADER_PARAMETER(FMatrix44f, PrevTranslatedWorldToClip)
++		SHADER_PARAMETER(FVector3f, PrevTranslationDelta)  // PrevPreViewTranslation - PreViewTranslation
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+@@ -208,14 +207,8 @@
+ 	DECLARE_GLOBAL_SHADER(FGaussianSplatPS);
+ 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPS, FGlobalShader);
+ 
++	// Velocity is computed per splat in the vertex shader
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+-		// Velocity calculation: transform translated world position to previous clip space
+-		// NOTE: Uses UN-JITTERED matrix to ensure stable velocity when camera is static
+-		SHADER_PARAMETER(FMatrix44f, PrevTranslatedWorldToClip)
+-		// PreViewTranslation for converting TranslatedWorld back to World
+-		SHADER_PARAMETER(FVector3f, PreViewTranslation)
+-		// Previous frame's PreViewTranslation for correct velocity calculation
+-		SHADER_PARAMETER(FVector3f, PrevPreViewTranslation)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+@@ -498,7 +491,7 @@
+ /**
+  * PrefixSumCS: 1 thread total.
+  * Computes prefix sums over GlobalVisibleCountArray and writes all indirect
+- * dispatch/draw args for the global Phase-3 passes (CalcDistances, RadixSort, DrawSplats).
++ * dispatch/draw args for the global Phase-3 passes (RadixSort, DrawSplats).
+  */
+ class FPrefixSumVisibleCountsCS : public FGlobalShader
+ {
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp	2026-09-29 12:50:46
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp	2026-09-29 13:22:47
+@@ -256,12 +256,12 @@
+ 	Asset->SourceFilePath = FilePath;
+ 	Asset->SHBands = int32(Decoded.shBands);
+ 
+-	// The legacy buffers keep the asset renderable by the current pipeline; the SOG records carry the
+-	// same splats in the same order for the GPU decode path.
+-	SlowTask.EnterProgressFrame(55.0f, FText::FromString(TEXT("Compressing splat data...")));
+-	Asset->InitializeFromSplatData(SplatData, QualityLevel);
++	// SOG assets render from the SOG payload alone (GPU decode in CalcViewData); the decoded splats only
++	// provide the bounds and thumbnail.
++	SlowTask.EnterProgressFrame(55.0f, FText::FromString(TEXT("Storing SOG records...")));
+ 	Asset->ClusterHierarchy.Reset();
+-	Asset->SetSOGData(Decoded, TArray<sog::PackedSplat>(Decoded.splats.data(), int32(Decoded.splats.size())));
++	Asset->InitializeFromSOG(SplatData, Decoded,
++		TArray<sog::PackedSplat>(Decoded.splats.data(), int32(Decoded.splats.size())), QualityLevel);
+ 
+ 	Asset->MarkPackageDirty();
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-09-29 12:51:14
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-09-29 13:23:44
+@@ -9,6 +9,7 @@
+ 
+ #if WITH_DEV_AUTOMATION_TESTS
+ 
++#include "GaussianClusterBuilder.h"
+ #include "GaussianSplatAsset.h"
+ #include "GaussianSplatAssetFactory.h"
+ #include "GaussianSplatSOG.h"
+@@ -31,22 +32,6 @@
+ 		return FPlatformMisc::GetEnvironmentVariable(TEXT("NANOGS_SOG_TESTDATA"));
+ 	}
+ 
+-	/** Local-space (cm) position of one record, same arithmetic as GaussianSplatSOG::ToSplatData. */
+-	FVector3f DecodeLocalPosition(const sog::DecodedAsset& Ranges, const sog::PackedSplat& Record)
+-	{
+-		sog::DecodedAsset One;
+-		for (int32 K = 0; K < 3; ++K)
+-		{
+-			One.meanMin[K] = Ranges.meanMin[K];
+-			One.meanMax[K] = Ranges.meanMax[K];
+-		}
+-		One.count = 1;
+-		One.splats.push_back(Record);
+-		sog::SplatFloat S;
+-		sog::DecodeSplat(One, 0, S);
+-		return FVector3f(S.position[2] * 100.0f, S.position[0] * 100.0f, -S.position[1] * 100.0f);
+-	}
+-
+ 	bool LoadBytes(const FString& Path, TArray<uint8>& Out)
+ 	{
+ 		return FFileHelper::LoadFileToArray(Out, *Path);
+@@ -150,8 +135,12 @@
+ 	TestTrue(TEXT("Half-float palette identical to the Phase 0 reference"),
+ 		LoadBytes(Dir / TEXT("blueprint_test/palette_half4.bin"), RefPalette) && Palette == RefPalette);
+ 	TestEqual(TEXT("Lookup tables"), Asset->GetSOGScaleLUT().Num() + Asset->GetSOGDCLUT().Num(), 512);
++	TestTrue(TEXT("SOG asset stores none of NanoGS's own splat buffers"),
++		Asset->GetPositionDataSize() == 0 && Asset->GetOtherDataSize() == 0 && Asset->GetSHDataSize() == 0
++		&& Asset->GetColorTextureDataSize() == 0 && Asset->ChunkData.IsEmpty());
++	TestTrue(TEXT("SOG asset is valid without them"), Asset->IsValid());
+ 
+-	// Nanite build: records must stay aligned with the legacy buffers, splat for splat
++	// Nanite build
+ 	if (!TestTrue(TEXT("Nanite build succeeds"), Asset->BuildNaniteClusterHierarchy()))
+ 	{
+ 		return false;
+@@ -161,32 +150,67 @@
+ 	Asset->GetSOGRecordData(Records);
+ 	TestEqual(TEXT("One SOG record per splat after the Nanite build"), Records.Num(), Total * int32(sizeof(sog::PackedSplat)));
+ 	TestEqual(TEXT("SOG constants count"), int32(Asset->GetSOGConstants().count), Total);
++	TestEqual(TEXT("Nanite build keeps the asset SOG-only"), Asset->GetPositionDataSize() + Asset->GetSHDataSize(), int64(0));
+ 
+-	sog::DecodedAsset Ranges;
++	// Reference: the same build on float splats (the cluster builder is deterministic), so every record can
++	// be checked against the splat it must hold.
++	sog::DecodedAsset Source;
+ 	FString Error;
+-	NanoGSReadSOG(SourcePath, Ranges, Error);
++	NanoGSReadSOG(SourcePath, Source, Error);
++	TArray<FGaussianSplatData> Expected;
++	GaussianSplatSOG::ToSplatData(Source, Expected);
++	FGaussianClusterHierarchy ExpectedHierarchy;
++	FGaussianClusterBuilder::FBuildSettings Settings;
++	Settings.SplatsPerCluster = 128;
++	Settings.MaxChildrenPerCluster = 8;
++	Settings.bReorderSplats = true;
++	Settings.bGenerateLOD = true;
++	FGaussianClusterBuilder::BuildClusterHierarchy(Expected, ExpectedHierarchy, Settings);
++	Expected.Append(ExpectedHierarchy.LODSplats);
++	if (!TestEqual(TEXT("Reference build has the same splat count"), Expected.Num(), Total))
++	{
++		return false;
++	}
++
+ 	const sog::PackedSplat* Packed = reinterpret_cast<const sog::PackedSplat*>(Records.GetData());
+-	const TArray<FVector> Legacy = Asset->GetDecompressedPositions();
+-	double BaseErr = 0.0, LodErr = 0.0;
++	const sog::AssetConstants& Constants = Asset->GetSOGConstants();
++	const TArray<float>& ScaleLUT = Asset->GetSOGScaleLUT();
++	const TArray<FVector> Decoded = Asset->GetDecompressedPositions();
++	double BaseErr = 0.0, LodErr = 0.0, LodScaleLog = 0.0, LodScaleLogSum = 0.0, LodOpacity = 0.0, DecodedErr = 0.0;
+ 	int32 LodNoSH = 0;
+-	for (int32 I = 0; I < Total && I < Legacy.Num(); ++I)
++	for (int32 I = 0; I < Total; ++I)
+ 	{
+-		const double Err = (FVector(DecodeLocalPosition(Ranges, Packed[I])) - Legacy[I]).GetAbsMax();
++		const FVector3f Position = GaussianSplatSOG::DecodePosition(Constants, Packed[I]);
++		const double Err = double((Position - Expected[I].Position).GetAbsMax());
++		DecodedErr = FMath::Max(DecodedErr, (FVector(Position) - Decoded[I]).GetAbsMax());
+ 		if (I < Base)
+ 		{
+ 			BaseErr = FMath::Max(BaseErr, Err);
++			continue;
+ 		}
+-		else
++		LodErr = FMath::Max(LodErr, Err);
++		LodNoSH += ((Packed[I].dc >> 24) & sog::kFlagNoSH) ? 1 : 0;
++		// Local scale axes are file (z, x, y), times 100
++		const uint32 SO = Packed[I].scaleOpacity;
++		const FVector3f Scale(ScaleLUT[(SO >> 16) & 0xFF] * 100.0f, ScaleLUT[SO & 0xFF] * 100.0f, ScaleLUT[(SO >> 8) & 0xFF] * 100.0f);
++		for (int32 K = 0; K < 3; ++K)
+ 		{
+-			LodErr = FMath::Max(LodErr, Err);
+-			LodNoSH += ((Packed[I].dc >> 24) & sog::kFlagNoSH) ? 1 : 0;
++			const double LogErr = FMath::Abs(FMath::Loge(double(Scale[K]) / double(FMath::Max(Expected[I].Scale[K], 1e-12f))));
++			LodScaleLog = FMath::Max(LodScaleLog, LogErr);
++			LodScaleLogSum += LogErr;
+ 		}
++		LodOpacity = FMath::Max(LodOpacity, FMath::Abs(double(SO >> 24) / 255.0 - double(Expected[I].Opacity)));
+ 	}
+-	AddInfo(FString::Printf(TEXT("Nanite: %d base + %d LOD splats, %d clusters; position vs legacy buffer: base %.3g cm, LOD %.3g cm"),
+-		Base, Total - Base, Asset->GetClusterCount(), BaseErr, LodErr));
+-	TestTrue(TEXT("Base splats follow the builder's reordering exactly"), BaseErr <= 1e-3);
++	const int32 NumLod = Total - Base;
++	AddInfo(FString::Printf(TEXT("Nanite: %d base + %d LOD splats, %d clusters; position vs reference build: base %.3g cm, LOD %.3g cm; ")
++		TEXT("LOD scale |log error| max %.3g mean %.3g; LOD opacity max %.3g"),
++		Base, NumLod, Asset->GetClusterCount(), BaseErr, LodErr, LodScaleLog, LodScaleLogSum / FMath::Max(1, 3 * NumLod), LodOpacity));
++	TestTrue(TEXT("Base splats follow the builder's reordering"), BaseErr <= 0.01);
+ 	TestTrue(TEXT("LOD splats quantize within 0.1 cm"), LodErr <= 0.1);
+-	TestEqual(TEXT("Every LOD splat is flagged as having no SH"), LodNoSH, Total - Base);
++	TestTrue(TEXT("LOD scales stay within the codebook's resolution"), LodScaleLog <= 0.25);
++	TestTrue(TEXT("LOD opacity within one 8-bit step"), LodOpacity <= 0.5 / 255.0 + 1e-6);
++	TestEqual(TEXT("Every LOD splat is flagged as having no SH"), LodNoSH, NumLod);
++	TestTrue(TEXT("GetDecompressedPositions decodes the SOG records"), Decoded.Num() == Total && DecodedErr == 0.0);
+ 
+ 	// Save (version 6) and reload from disk
+ 	FSavePackageArgs SaveArgs;

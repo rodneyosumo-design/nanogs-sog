@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copy this repo's SOG library and libwebp into the NanoGS plugin, or check the copies are identical.
+# Copy this repo's SOG library, HLSL decode and libwebp into the NanoGS plugin, or check the copies are identical.
 # usage: tools/sync_nanogs.sh [--check] [<NanoGS plugin dir>]
 # The plugin files are Perforce-controlled: open them for edit (p4 edit) before syncing.
 set -euo pipefail
@@ -13,8 +13,9 @@ fi
 PLUGIN="${1:-/Volumes/External SSD/Unreal Projects/SHUTourDemo/Plugins/NanoGS}"
 SRC="$PLUGIN/Source"
 
-# repo file -> plugin location
+# repo file -> plugin location (Source/ unless the destination starts with Shaders/)
 PAIRS=(
+    "shaders/SOGDecode.ush|Shaders/Private/SOGDecode.ush"
     "sog/SOGTypes.h|NanoGS/Public/SOG/SOGTypes.h"
     "sog/SOGCodec.h|NanoGS/Public/SOG/SOGCodec.h"
     "sog/SOGCodec.cpp|NanoGS/Private/SOG/SOGCodec.cpp"
@@ -30,10 +31,14 @@ WEBP_DST="$SRC/NanoGSEditor/Private/ThirdParty/libwebp"
 status=0
 for pair in "${PAIRS[@]}"; do
     from="$ROOT/${pair%%|*}"
-    to="$SRC/${pair##*|}"
+    dst="${pair##*|}"
+    case "$dst" in
+        Shaders/*) to="$PLUGIN/$dst" ;;
+        *) to="$SRC/$dst" ;;
+    esac
     if [ "$CHECK" = 1 ]; then
         if ! cmp -s "$from" "$to"; then
-            echo "differs: ${pair##*|}"
+            echo "differs: $dst"
             status=1
         fi
     else
