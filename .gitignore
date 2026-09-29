@@ -1,0 +1,10 @@
+# generated data (SOG files, PLYs, renders, test binaries) — recreate with tools/phase0/run_phase0.sh
+/data/
+
+# tool environments
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+.DS_Store
