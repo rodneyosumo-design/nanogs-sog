@@ -1,0 +1,1191 @@
+# NanoGS changes for SOG Phase 1 — snapshot of pending Perforce changelist 363 (not submitted).
+# Excludes files vendored verbatim from this repo (sog/ -> Source/*/SOG, third_party/libwebp) and the Mac dylibs.
+# Base: //depot/SHUTourDemo/Plugins/NanoGS as of change 362.
+
+--- a/Plugins/NanoGS/Source/NanoGS/NanoGS.Build.cs
++++ b/Plugins/NanoGS/Source/NanoGS/NanoGS.Build.cs
+@@ -18,9 +18,14 @@
+ 				// Access Renderer private headers for FViewInfo::ViewRect (screen percentage support)
+ 				System.IO.Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private"),
+ 				System.IO.Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Internal"),
++				// Vendored SOG codec (nanogs-sog repository) uses bare includes between its files
++				System.IO.Path.Combine(ModuleDirectory, "Public/SOG"),
+ 			}
+ 		);
+ 
++		// The vendored SOG codec is compiled here and used by NanoGSEditor too: export it with this module's API.
++		PublicDefinitions.Add("SOG_API=NANOGS_API");
++
+ 		PublicDependencyModuleNames.AddRange(
+ 			new string[]
+ 			{
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp
+@@ -5,7 +5,8 @@
+ bool FGaussianClusterBuilder::BuildClusterHierarchy(
+ 	TArray<FGaussianSplatData>& InOutSplats,
+ 	FGaussianClusterHierarchy& OutHierarchy,
+-	const FBuildSettings& Settings)
++	const FBuildSettings& Settings,
++	TArray<int32>* OutSplatOrder)
+ {
+ 	// Reset output
+ 	OutHierarchy.Reset();
+@@ -30,7 +31,7 @@
+ 
+ 	// Step 2: Sort splats by Morton code for spatial locality
+ 	TArray<int32> SortedIndices;
+-	SortSplatsByMortonCode(InOutSplats, GlobalBounds, Settings.bReorderSplats, SortedIndices);
++	SortSplatsByMortonCode(InOutSplats, GlobalBounds, Settings.bReorderSplats, SortedIndices, OutSplatOrder);
+ 	UE_LOG(LogTemp, Log, TEXT("  Sorted splats by Morton code"));
+ 
+ 	// Step 3: Create leaf clusters
+@@ -158,7 +159,8 @@
+ 	TArray<FGaussianSplatData>& InOutSplats,
+ 	const FBox& GlobalBounds,
+ 	bool bReorder,
+-	TArray<int32>& OutSortedIndices)
++	TArray<int32>& OutSortedIndices,
++	TArray<int32>* OutOriginalIndices)
+ {
+ 	const int32 NumSplats = InOutSplats.Num();
+ 
+@@ -186,6 +188,20 @@
+ 		OutSortedIndices[i] = SortEntries[i].OriginalIndex;
+ 	}
+ 
++	// Before the reorder below resets OutSortedIndices to identity, record where each splat came from
++	if (OutOriginalIndices)
++	{
++		*OutOriginalIndices = bReorder ? OutSortedIndices : TArray<int32>();
++		if (!bReorder)
++		{
++			OutOriginalIndices->SetNum(NumSplats);
++			for (int32 i = 0; i < NumSplats; i++)
++			{
++				(*OutOriginalIndices)[i] = i;
++			}
++		}
++	}
++
+ 	// Reorder splat array if requested
+ 	if (bReorder)
+ 	{
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp
+@@ -6,6 +6,7 @@
+ #include "TextureResource.h"
+ #include "GaussianClusterBuilder.h"
+ #include "PLYFileReader.h"
++#include "GaussianSplatSOG.h"
+ 
+ #if WITH_EDITOR
+ #include "Misc/ScopedSlowTask.h"
+@@ -35,11 +36,12 @@
+ 	Super::Serialize(Ar);
+ 
+ 	int32 Magic = GAUSSIAN_SPLAT_ASSET_MAGIC;
+-	int32 Version = GAUSSIAN_SPLAT_ASSET_VERSION;
++	int32 Version = bHasSOGData ? GAUSSIAN_SPLAT_ASSET_VERSION : GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY;
+ 	Ar << Magic;
+ 	Ar << Version;
+ 
+-	if (Ar.IsLoading() && (Magic != GAUSSIAN_SPLAT_ASSET_MAGIC || Version != GAUSSIAN_SPLAT_ASSET_VERSION))
++	if (Ar.IsLoading() && (Magic != GAUSSIAN_SPLAT_ASSET_MAGIC
++		|| Version < GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY || Version > GAUSSIAN_SPLAT_ASSET_VERSION))
+ 	{
+ 		UE_LOG(LogTemp, Error, TEXT("GaussianSplatAsset: Incompatible asset format (Magic=0x%08X, Version=%d). Please reimport the asset."), Magic, Version);
+ 		return;
+@@ -66,6 +68,21 @@
+ 	Ar << bEnableNanite;
+ 	Ar << OriginalSplatCount;
+ 	Ar << ClusterHierarchy;
++
++	// SOG payload (Version 6+, only written when bHasSOGData)
++	if (Version >= GAUSSIAN_SPLAT_ASSET_VERSION)
++	{
++		for (float& Value : SOGConstants.fileToLocal) { Ar << Value; }
++		for (float& Value : SOGConstants.meanMin) { Ar << Value; }
++		Ar << SOGConstants.count;
++		for (float& Value : SOGConstants.meanMax) { Ar << Value; }
++		Ar << SOGConstants.shCoeffs;
++		Ar << SOGConstants.antialias;
++		Ar << SOGScaleLUT;
++		Ar << SOGDCLUT;
++		SOGRecordBulkData.Serialize(Ar, this);
++		SOGPaletteBulkData.Serialize(Ar, this);
++	}
+ }
+ 
+ void UGaussianSplatAsset::PostLoad()
+@@ -113,6 +130,8 @@
+ 	TotalBytes += SHBulkData.GetBulkDataSize();
+ 	TotalBytes += ChunkData.Num() * sizeof(FGaussianChunkInfo);
+ 	TotalBytes += ColorTextureBulkData.GetBulkDataSize();
++	TotalBytes += SOGRecordBulkData.GetBulkDataSize();
++	TotalBytes += SOGPaletteBulkData.GetBulkDataSize();
+ 
+ 	if (ColorTexture)
+ 	{
+@@ -611,7 +630,94 @@
+ 	}
+ }
+ 
++void UGaussianSplatAsset::GetSOGRecordData(TArray<uint8>& OutData)
++{
++	const int64 DataSize = SOGRecordBulkData.GetBulkDataSize();
++	if (DataSize > 0)
++	{
++		OutData.SetNumUninitialized(static_cast<int32>(DataSize));
++		void* Dest = OutData.GetData();
++		SOGRecordBulkData.GetCopy(&Dest, /*bDiscardInternalCopy*/ true);
++	}
++	else
++	{
++		OutData.Empty();
++	}
++}
++
++void UGaussianSplatAsset::GetSOGPaletteData(TArray<uint8>& OutData)
++{
++	const int64 DataSize = SOGPaletteBulkData.GetBulkDataSize();
++	if (DataSize > 0)
++	{
++		OutData.SetNumUninitialized(static_cast<int32>(DataSize));
++		void* Dest = OutData.GetData();
++		SOGPaletteBulkData.GetCopy(&Dest, /*bDiscardInternalCopy*/ true);
++	}
++	else
++	{
++		OutData.Empty();
++	}
++}
++
+ #if WITH_EDITOR
++namespace
++{
++	void WriteBulkData(FByteBulkData& Bulk, const void* Data, int64 Bytes)
++	{
++		Bulk.Lock(LOCK_READ_WRITE);
++		void* Dest = Bulk.Realloc(Bytes);
++		if (Bytes > 0)
++		{
++			FMemory::Memcpy(Dest, Data, Bytes);
++		}
++		Bulk.Unlock();
++		Bulk.SetBulkDataFlags(BULKDATA_Force_NOT_InlinePayload);
++	}
++}
++
++void UGaussianSplatAsset::SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records)
++{
++	check(Records.Num() == SplatCount);
++	SOGConstants = sog::MakeConstants(Source, sog::kNanoGSFileToLocal);
++	SOGConstants.count = uint32(Records.Num());
++	SOGScaleLUT = TArray<float>(Source.scaleLUT, 256);
++	SOGDCLUT = TArray<float>(Source.dcLUT, 256);
++	WriteBulkData(SOGRecordBulkData, Records.GetData(), int64(Records.Num()) * int64(sizeof(sog::PackedSplat)));
++	WriteBulkData(SOGPaletteBulkData, Source.paletteHalf4.data(), int64(Source.paletteHalf4.size()) * int64(sizeof(uint16)));
++	bHasSOGData = true;
++	SOGSHBands = int32(Source.shBands);
++	SOGPaletteCount = int32(Source.paletteCount);
++}
++
++void UGaussianSplatAsset::ClearSOGData()
++{
++	bHasSOGData = false;
++	SOGSHBands = 0;
++	SOGPaletteCount = 0;
++	SOGConstants = sog::AssetConstants{};
++	SOGScaleLUT.Empty();
++	SOGDCLUT.Empty();
++	SOGRecordBulkData.RemoveBulkData();
++	SOGPaletteBulkData.RemoveBulkData();
++}
++
++bool UGaussianSplatAsset::ReadSourceSplats(TArray<FGaussianSplatData>& OutSplats, sog::DecodedAsset& OutSOG,
++	bool& bOutIsSOG, FString& OutError) const
++{
++	bOutIsSOG = GaussianSplatSOG::IsSOGPath(SourceFilePath);
++	if (bOutIsSOG)
++	{
++		if (!GaussianSplatSOG::Read(SourceFilePath, OutSOG, OutError))
++		{
++			return false;
++		}
++		GaussianSplatSOG::ToSplatData(OutSOG, OutSplats);
++		return true;
++	}
++	return FPLYFileReader::ReadPLYFile(SourceFilePath, OutSplats, OutError);
++}
++
+ bool UGaussianSplatAsset::BuildNaniteClusterHierarchy()
+ {
+ 	// Check if source file exists
+@@ -630,19 +736,21 @@
+ 	FScopedSlowTask SlowTask(100.0f, FText::FromString(TEXT("Building Nanite Cluster Hierarchy...")));
+ 	SlowTask.MakeDialog(true);
+ 
+-	// Step 1: Re-read PLY file
+-	SlowTask.EnterProgressFrame(30.0f, FText::FromString(TEXT("Reading PLY file...")));
++	// Step 1: Re-read the source file (PLY or SOG)
++	SlowTask.EnterProgressFrame(30.0f, FText::FromString(TEXT("Reading source file...")));
+ 
+ 	TArray<FGaussianSplatData> SplatData;
+ 	FString ErrorMessage;
++	sog::DecodedAsset SOGSource;
++	bool bIsSOG = false;
+ 
+-	if (!FPLYFileReader::ReadPLYFile(SourceFilePath, SplatData, ErrorMessage))
++	if (!ReadSourceSplats(SplatData, SOGSource, bIsSOG, ErrorMessage))
+ 	{
+-		UE_LOG(LogTemp, Error, TEXT("BuildNaniteClusterHierarchy: Failed to read PLY file: %s"), *ErrorMessage);
++		UE_LOG(LogTemp, Error, TEXT("BuildNaniteClusterHierarchy: Failed to read source file: %s"), *ErrorMessage);
+ 		return false;
+ 	}
+ 
+-	UE_LOG(LogTemp, Log, TEXT("BuildNaniteClusterHierarchy: Read %d splats from PLY file"), SplatData.Num());
++	UE_LOG(LogTemp, Log, TEXT("BuildNaniteClusterHierarchy: Read %d splats from %s file"), SplatData.Num(), bIsSOG ? TEXT("SOG") : TEXT("PLY"));
+ 
+ 	// Store original splat count before LOD splats are appended
+ 	OriginalSplatCount = SplatData.Num();
+@@ -657,8 +765,9 @@
+ 	BuildSettings.bReorderSplats = true;
+ 	BuildSettings.bGenerateLOD = true;
+ 
++	TArray<int32> SplatOrder;
+ 	bool bClusteringSucceeded = FGaussianClusterBuilder::BuildClusterHierarchy(
+-		SplatData, NewClusterHierarchy, BuildSettings);
++		SplatData, NewClusterHierarchy, BuildSettings, bIsSOG ? &SplatOrder : nullptr);
+ 
+ 	if (!bClusteringSucceeded)
+ 	{
+@@ -702,6 +811,14 @@
+ 	// Reinitialize from the new splat data (now includes LOD splats)
+ 	InitializeFromSplatData(SplatData, ImportQuality);
+ 
++	// SOG sources: records follow the builder's order; merged LOD splats are quantized to SOG
++	if (bIsSOG)
++	{
++		TArray<sog::PackedSplat> Records;
++		GaussianSplatSOG::BuildRecords(SOGSource, SplatOrder, SplatData, OriginalSplatCount, Records);
++		SetSOGData(SOGSource, Records);
++	}
++
+ 	// Enable Nanite
+ 	bEnableNanite = true;
+ 
+@@ -731,16 +848,22 @@
+ 	// If we have LOD splats appended, we need to re-read the original data
+ 	if (OriginalSplatCount > 0 && OriginalSplatCount < SplatCount)
+ 	{
+-		// Re-read the original PLY file to get clean splat data without LOD splats
++		// Re-read the original source file to get clean splat data without LOD splats
+ 		if (!SourceFilePath.IsEmpty() && FPaths::FileExists(SourceFilePath))
+ 		{
+ 			TArray<FGaussianSplatData> SplatData;
+ 			FString ErrorMessage;
++			sog::DecodedAsset SOGSource;
++			bool bIsSOG = false;
+ 
+-			if (FPLYFileReader::ReadPLYFile(SourceFilePath, SplatData, ErrorMessage))
++			if (ReadSourceSplats(SplatData, SOGSource, bIsSOG, ErrorMessage))
+ 			{
+ 				// Reinitialize with original splats only (no LOD)
+ 				InitializeFromSplatData(SplatData, ImportQuality);
++				if (bIsSOG)
++				{
++					SetSOGData(SOGSource, TArray<sog::PackedSplat>(SOGSource.splats.data(), int32(SOGSource.splats.size())));
++				}
+ 				UE_LOG(LogTemp, Log, TEXT("ClearNaniteClusterHierarchy: Restored %d original splats"), SplatData.Num());
+ 			}
+ 			else
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h
+@@ -58,12 +58,14 @@
+ 	 * @param InOutSplats Splat data array - will be reordered if bReorderSplats is true
+ 	 * @param OutHierarchy Output cluster hierarchy
+ 	 * @param Settings Build configuration
++	 * @param OutSplatOrder Optional: receives the reordering, OutSplatOrder[i] = original index of splat i
+ 	 * @return true if successful, false on error
+ 	 */
+ 	static bool BuildClusterHierarchy(
+ 		TArray<FGaussianSplatData>& InOutSplats,
+ 		FGaussianClusterHierarchy& OutHierarchy,
+-		const FBuildSettings& Settings = FBuildSettings());
++		const FBuildSettings& Settings = FBuildSettings(),
++		TArray<int32>* OutSplatOrder = nullptr);
+ 
+ private:
+ 	/**
+@@ -97,7 +99,8 @@
+ 		TArray<FGaussianSplatData>& InOutSplats,
+ 		const FBox& GlobalBounds,
+ 		bool bReorder,
+-		TArray<int32>& OutSortedIndices);
++		TArray<int32>& OutSortedIndices,
++		TArray<int32>* OutOriginalIndices = nullptr);
+ 
+ 	/**
+ 	 * Create leaf clusters from sorted splats
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h
+@@ -7,6 +7,7 @@
+ #include "Serialization/BulkData.h"
+ #include "GaussianDataTypes.h"
+ #include "GaussianClusterTypes.h"
++#include "SOG/SOGTypes.h"
+ #include "GaussianSplatAsset.generated.h"
+ 
+ // Forward declaration
+@@ -20,7 +21,9 @@
+ 
+ // Serialization magic/version for format identification
+ #define GAUSSIAN_SPLAT_ASSET_MAGIC   0x47535056  // "GSPV"
+-#define GAUSSIAN_SPLAT_ASSET_VERSION 5  // SH buffer now includes DC coefficient for view-dependent rendering
++#define GAUSSIAN_SPLAT_ASSET_VERSION 6         // 6: optional SOG payload (records, tables, palette)
++#define GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY 5  // 5: SH buffer includes the DC coefficient. Assets without
++                                               // SOG data are still written as 5 so older builds load them.
+ 
+ /**
+  * Asset containing Gaussian Splatting data loaded from PLY files
+@@ -288,6 +291,55 @@
+ 	/** Shared render data (lazy-initialized, shared across all proxies) */
+ 	TSharedPtr<FGaussianSplatRenderData> RenderData;
+ 
++	//~ SOG payload: present for assets imported from .sog files. Records follow the same splat order as
++	//~ the legacy buffers (including NanoGS LOD splats), so either path can render any splat index.
++
++	/** True when the asset carries SOG GPU records (imported from a .sog file). */
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	bool bHasSOGData = false;
++
++	/** Spherical-harmonic bands in the SOG palette (0-3). */
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	int32 SOGSHBands = 0;
++
++	/** Entries in the SOG SH palette. */
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	int32 SOGPaletteCount = 0;
++
++	bool HasSOGData() const { return bHasSOGData; }
++	const sog::AssetConstants& GetSOGConstants() const { return SOGConstants; }
++	const TArray<float>& GetSOGScaleLUT() const { return SOGScaleLUT; }
++	const TArray<float>& GetSOGDCLUT() const { return SOGDCLUT; }
++
++	/** Copy the 20-byte SOG records (SplatCount of them) for GPU upload; discards the bulk cache. */
++	void GetSOGRecordData(TArray<uint8>& OutData);
++
++	/** Copy the half4 SOG SH palette (SOGPaletteCount * shCoeffs entries) for GPU upload. */
++	void GetSOGPaletteData(TArray<uint8>& OutData);
++
++	int64 GetSOGRecordDataSize() const { return SOGRecordBulkData.GetBulkDataSize(); }
++	int64 GetSOGPaletteDataSize() const { return SOGPaletteBulkData.GetBulkDataSize(); }
++
++#if WITH_EDITOR
++	/** Store the SOG payload: Records must match the legacy buffers' splat order and count. */
++	void SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records);
++
++	/** Remove the SOG payload. */
++	void ClearSOGData();
++#endif
++
++private:
++	sog::AssetConstants SOGConstants{};   // serialized in Serialize() (version 6)
++	TArray<float> SOGScaleLUT;            // 256 entries: exp(scale codebook)
++	TArray<float> SOGDCLUT;               // 256 entries: 0.5 + SH_C0 * sh0 codebook
++	FByteBulkData SOGRecordBulkData;      // SplatCount * 20 bytes
++	FByteBulkData SOGPaletteBulkData;     // SOGPaletteCount * shCoeffs * 8 bytes (half4)
++
++#if WITH_EDITOR
++	/** Read the source file (PLY or SOG) into CPU splats; fills OutSOG for SOG sources. */
++	bool ReadSourceSplats(TArray<FGaussianSplatData>& OutSplats, sog::DecodedAsset& OutSOG, bool& bOutIsSOG, FString& OutError) const;
++#endif
++
+ private:
+ 	/** Compress and store position data */
+ 	void CompressPositions(const TArray<FGaussianSplatData>& InSplats);
+--- a/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs
++++ b/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs
+@@ -15,9 +15,18 @@
+ 
+ 		PrivateIncludePaths.AddRange(
+ 			new string[] {
++				// SOG import: vendored loader, libwebp decoder (editor-only), and the runtime module's codec headers
++				System.IO.Path.Combine(ModuleDirectory, "Private/SOG"),
++				System.IO.Path.Combine(ModuleDirectory, "Private/ThirdParty/libwebp"),
++				System.IO.Path.Combine(ModuleDirectory, "../NanoGS/Public/SOG"),
+ 			}
+ 		);
+ 
++		AddEngineThirdPartyPrivateStaticDependencies(Target, "zlib");
++
++		// libwebp's C files reuse file-local helper names; a unity build would merge them into one file.
++		bUseUnity = false;
++
+ 		PublicDependencyModuleNames.AddRange(
+ 			new string[]
+ 			{
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp
+@@ -3,9 +3,11 @@
+ #include "GaussianSplatAssetFactory.h"
+ #include "GaussianSplatAsset.h"
+ #include "PLYFileReader.h"
++#include "GaussianSplatSOG.h"
+ #include "EditorFramework/AssetImportData.h"
+ #include "Misc/FeedbackContext.h"
+ #include "Misc/ScopedSlowTask.h"
++#include "Misc/FileHelper.h"
+ 
+ UGaussianSplatAssetFactory::UGaussianSplatAssetFactory()
+ {
+@@ -16,11 +18,25 @@
+ 	SupportedClass = UGaussianSplatAsset::StaticClass();
+ 
+ 	Formats.Add(TEXT("ply;PLY Gaussian Splatting File"));
++	Formats.Add(TEXT("sog;SOG Gaussian Splatting File (PlayCanvas)"));
++	// Unbundled SOG folders import through their meta.json; FactoryCanImport rejects any other JSON.
++	Formats.Add(TEXT("json;SOG Gaussian Splatting meta.json (unbundled)"));
+ }
+ 
+ bool UGaussianSplatAssetFactory::FactoryCanImport(const FString& Filename)
+ {
+ 	const FString Extension = FPaths::GetExtension(Filename);
++	if (Extension.Equals(TEXT("sog"), ESearchCase::IgnoreCase))
++	{
++		return true;
++	}
++	if (Extension.Equals(TEXT("json"), ESearchCase::IgnoreCase))
++	{
++		FString Text;
++		return FPaths::GetCleanFilename(Filename).Equals(TEXT("meta.json"), ESearchCase::IgnoreCase)
++			&& FFileHelper::LoadFileToString(Text, *Filename)
++			&& Text.Contains(TEXT("\"means\"")) && Text.Contains(TEXT("\"quats\"")) && Text.Contains(TEXT("\"sh0\""));
++	}
+ 	return Extension.Equals(TEXT("ply"), ESearchCase::IgnoreCase) && FPLYFileReader::IsValidPLYFile(Filename);
+ }
+ 
+@@ -36,7 +52,7 @@
+ {
+ 	bOutOperationCanceled = false;
+ 
+-	UGaussianSplatAsset* NewAsset = ImportPLYFile(Filename, InParent, InName, Flags, nullptr);
++	UGaussianSplatAsset* NewAsset = ImportFile(Filename, InParent, InName, Flags, nullptr);
+ 
+ 	if (!NewAsset)
+ 	{
+@@ -100,7 +116,7 @@
+ 	// Use the original quality level
+ 	QualityLevel = Asset->ImportQuality;
+ 
+-	UGaussianSplatAsset* ReimportedAsset = ImportPLYFile(
++	UGaussianSplatAsset* ReimportedAsset = ImportFile(
+ 		Asset->SourceFilePath,
+ 		Asset->GetOuter(),
+ 		Asset->GetFName(),
+@@ -175,6 +191,7 @@
+ 	SlowTask.EnterProgressFrame(55.0f, FText::FromString(TEXT("Compressing splat data...")));
+ 
+ 	Asset->InitializeFromSplatData(SplatData, QualityLevel);
++	Asset->ClearSOGData();
+ 
+ 	// NO cluster hierarchy by default - user enables Nanite via Asset Actions > Nanite
+ 	Asset->ClusterHierarchy.Reset();
+@@ -187,3 +204,69 @@
+ 
+ 	return Asset;
+ }
++
++UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportFile(
++	const FString& FilePath,
++	UObject* InParent,
++	FName InName,
++	EObjectFlags Flags,
++	UGaussianSplatAsset* ExistingAsset)
++{
++	return GaussianSplatSOG::IsSOGPath(FilePath)
++		? ImportSOGFile(FilePath, InParent, InName, Flags, ExistingAsset)
++		: ImportPLYFile(FilePath, InParent, InName, Flags, ExistingAsset);
++}
++
++UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportSOGFile(
++	const FString& FilePath,
++	UObject* InParent,
++	FName InName,
++	EObjectFlags Flags,
++	UGaussianSplatAsset* ExistingAsset)
++{
++	FScopedSlowTask SlowTask(100.0f, FText::FromString(TEXT("Importing SOG Gaussian Splat...")));
++	SlowTask.MakeDialog(true);
++
++	SlowTask.EnterProgressFrame(30.0f, FText::FromString(TEXT("Reading SOG file...")));
++	sog::DecodedAsset Decoded;
++	FString ErrorMessage;
++	if (!GaussianSplatSOG::Read(FilePath, Decoded, ErrorMessage))
++	{
++		UE_LOG(LogTemp, Error, TEXT("Failed to read SOG file: %s"), *ErrorMessage);
++		return nullptr;
++	}
++
++	TArray<FGaussianSplatData> SplatData;
++	GaussianSplatSOG::ToSplatData(Decoded, SplatData);
++	UE_LOG(LogTemp, Log, TEXT("Read %d splats from SOG file (SH bands: %d, palette: %d)"),
++		SplatData.Num(), int32(Decoded.shBands), int32(Decoded.paletteCount));
++
++	SlowTask.EnterProgressFrame(10.0f, FText::FromString(TEXT("Creating asset...")));
++	UGaussianSplatAsset* Asset = ExistingAsset;
++	if (!Asset)
++	{
++		Asset = NewObject<UGaussianSplatAsset>(InParent, UGaussianSplatAsset::StaticClass(), InName, Flags);
++	}
++	if (!Asset)
++	{
++		UE_LOG(LogTemp, Error, TEXT("Failed to create Gaussian Splat asset"));
++		return nullptr;
++	}
++
++	Asset->SourceFilePath = FilePath;
++	Asset->SHBands = int32(Decoded.shBands);
++
++	// The legacy buffers keep the asset renderable by the current pipeline; the SOG records carry the
++	// same splats in the same order for the GPU decode path.
++	SlowTask.EnterProgressFrame(55.0f, FText::FromString(TEXT("Compressing splat data...")));
++	Asset->InitializeFromSplatData(SplatData, QualityLevel);
++	Asset->ClusterHierarchy.Reset();
++	Asset->SetSOGData(Decoded, TArray<sog::PackedSplat>(Decoded.splats.data(), int32(Decoded.splats.size())));
++
++	Asset->MarkPackageDirty();
++
++	UE_LOG(LogTemp, Log, TEXT("Successfully imported SOG Gaussian Splat asset: %d splats, %lld bytes (SOG records %lld, palette %lld)"),
++		Asset->GetSplatCount(), Asset->GetMemoryUsage(), Asset->GetSOGRecordDataSize(), Asset->GetSOGPaletteDataSize());
++
++	return Asset;
++}
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/NanoGSEditorModule.cpp
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/NanoGSEditorModule.cpp
+@@ -7,6 +7,8 @@
+ #include "AssetToolsModule.h"
+ #include "IAssetTools.h"
+ #include "ThumbnailRendering/ThumbnailManager.h"
++#include "GaussianSplatSOG.h"
++#include "SOG/GaussianSplatSOGReader.h"
+ 
+ #define LOCTEXT_NAMESPACE "FNanoGSEditorModule"
+ 
+@@ -25,11 +27,17 @@
+ 		UGaussianSplatAsset::StaticClass(),
+ 		UGaussianSplatThumbnailRenderer::StaticClass());
+ 
++	// SOG files are decoded here (libwebp + zlib live in this editor-only module); the runtime module's
++	// importer and Nanite build reach the reader through this hook.
++	GaussianSplatSOG::SetReader(&NanoGSReadSOG);
++
+ 	UE_LOG(LogTemp, Log, TEXT("GaussianSplattingEditor module started."));
+ }
+ 
+ void FNanoGSEditorModule::ShutdownModule()
+ {
++	GaussianSplatSOG::SetReader(nullptr);
++
+ 	// Unregister asset type actions
+ 	if (FModuleManager::Get().IsModuleLoaded("AssetTools"))
+ 	{
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h
+@@ -11,7 +11,7 @@
+ class UGaussianSplatAsset;
+ 
+ /**
+- * Factory for importing PLY files as Gaussian Splat assets
++ * Factory for importing PLY and SOG (PlayCanvas Spatially Ordered Gaussians) files as Gaussian Splat assets
+  */
+ UCLASS(hidecategories = Object)
+ class NANOGSEDITOR_API UGaussianSplatAssetFactory : public UFactory, public FReimportHandler
+@@ -64,4 +64,22 @@
+ 		EObjectFlags Flags,
+ 		UGaussianSplatAsset* ExistingAsset = nullptr
+ 	);
++
++	/** Import a .sog bundle (or an unbundled SOG folder's meta.json); same parameters as ImportPLYFile. */
++	UGaussianSplatAsset* ImportSOGFile(
++		const FString& FilePath,
++		UObject* InParent,
++		FName InName,
++		EObjectFlags Flags,
++		UGaussianSplatAsset* ExistingAsset = nullptr
++	);
++
++	/** Dispatch on the file type. */
++	UGaussianSplatAsset* ImportFile(
++		const FString& FilePath,
++		UObject* InParent,
++		FName InName,
++		EObjectFlags Flags,
++		UGaussianSplatAsset* ExistingAsset = nullptr
++	);
+ };
+--- /dev/null
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h
+@@ -0,0 +1,45 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "GaussianDataTypes.h"
++#include "SOG/SOGCodec.h"
++#include "SOG/SOGTypes.h"
++
++/**
++ * SOG (PlayCanvas "Spatially Ordered Gaussians") support shared by the runtime and editor modules.
++ * The file reader (zip, JSON, WebP) lives in NanoGSEditor and installs itself here, so the runtime
++ * module never links the WebP decoder.
++ */
++namespace GaussianSplatSOG
++{
++	using FReader = TFunction<bool(const FString& Path, sog::DecodedAsset& Out, FString& OutError)>;
++
++	/** Installed by NanoGSEditor at startup; cleared on shutdown. */
++	NANOGS_API void SetReader(FReader InReader);
++
++	/** True for .sog bundles and unbundled SOG folders addressed by their meta.json. */
++	NANOGS_API bool IsSOGPath(const FString& Path);
++
++	/** Read a SOG asset through the installed reader. Fails when NanoGSEditor isn't loaded. */
++	NANOGS_API bool Read(const FString& Path, sog::DecodedAsset& Out, FString& OutError);
++
++	/**
++	 * Decode every record to NanoGS's CPU splat format in Unreal local space, with the same
++	 * conversion as FPLYFileReader: centimetres, (x, y, z) -> (z, x, -y), quaternion
++	 * (w, x, y, z) -> (w, -z, -x, y), scale axes (z, x, y), linear scale and opacity.
++	 */
++	NANOGS_API void ToSplatData(const sog::DecodedAsset& Asset, TArray<FGaussianSplatData>& OutSplats);
++
++	/** Inverse of ToSplatData for one splat: Unreal local space back to the SOG file frame. */
++	NANOGS_API void FromSplatData(const FGaussianSplatData& In, sog::SplatFloat& Out);
++
++	/**
++	 * GPU records for a Nanite-built asset: the first NumBase records are the source records in the
++	 * cluster builder's order (Order[i] = source index of splat i), the rest are NanoGS's merged LOD
++	 * splats quantized with the source's ranges and codebooks and flagged as having no SH.
++	 */
++	NANOGS_API void BuildRecords(const sog::DecodedAsset& Asset, const TArray<int32>& Order,
++		const TArray<FGaussianSplatData>& Splats, int32 NumBase, TArray<sog::PackedSplat>& OutRecords);
++}
+--- /dev/null
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp
+@@ -0,0 +1,93 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#include "GaussianSplatSOG.h"
++#include "Async/ParallelFor.h"
++
++namespace GaussianSplatSOG
++{
++	namespace
++	{
++		FReader GReader;
++		constexpr float MetersToUE = 100.0f;
++	}
++
++	void SetReader(FReader InReader)
++	{
++		GReader = MoveTemp(InReader);
++	}
++
++	bool IsSOGPath(const FString& Path)
++	{
++		return FPaths::GetExtension(Path).Equals(TEXT("sog"), ESearchCase::IgnoreCase)
++			|| FPaths::GetCleanFilename(Path).Equals(TEXT("meta.json"), ESearchCase::IgnoreCase);
++	}
++
++	bool Read(const FString& Path, sog::DecodedAsset& Out, FString& OutError)
++	{
++		if (!GReader)
++		{
++			OutError = TEXT("SOG reader not available (the NanoGSEditor module isn't loaded)");
++			return false;
++		}
++		return GReader(Path, Out, OutError);
++	}
++
++	void ToSplatData(const sog::DecodedAsset& Asset, TArray<FGaussianSplatData>& OutSplats)
++	{
++		OutSplats.SetNum(int32(Asset.count));
++		ParallelFor(int32(Asset.count), [&Asset, &OutSplats](int32 Index)
++		{
++			sog::SplatFloat S;
++			sog::DecodeSplat(Asset, size_t(Index), S);
++			FGaussianSplatData& D = OutSplats[Index];
++			D.Position = FVector3f(S.position[2] * MetersToUE, S.position[0] * MetersToUE, -S.position[1] * MetersToUE);
++			D.Rotation = GaussianSplattingUtils::NormalizeQuat(FQuat4f(-S.rotation[3], -S.rotation[1], S.rotation[2], S.rotation[0]));
++			D.Scale = FVector3f(S.scale[2] * MetersToUE, S.scale[0] * MetersToUE, S.scale[1] * MetersToUE);
++			D.Opacity = S.opacity;
++			D.SH_DC = FVector3f(S.dc[0], S.dc[1], S.dc[2]);
++			for (int32 C = 0; C < 15; ++C)
++			{
++				D.SH[C] = C < int32(S.shCoeffs) ? FVector3f(S.sh[C][0], S.sh[C][1], S.sh[C][2]) : FVector3f::ZeroVector;
++			}
++		});
++	}
++
++	void FromSplatData(const FGaussianSplatData& In, sog::SplatFloat& Out)
++	{
++		Out.position[0] = In.Position.Y / MetersToUE;
++		Out.position[1] = -In.Position.Z / MetersToUE;
++		Out.position[2] = In.Position.X / MetersToUE;
++		Out.rotation[0] = In.Rotation.W;
++		Out.rotation[1] = -In.Rotation.Y;
++		Out.rotation[2] = In.Rotation.Z;
++		Out.rotation[3] = -In.Rotation.X;
++		Out.scale[0] = In.Scale.Y / MetersToUE;
++		Out.scale[1] = In.Scale.Z / MetersToUE;
++		Out.scale[2] = In.Scale.X / MetersToUE;
++		Out.opacity = In.Opacity;
++		Out.dc[0] = In.SH_DC.X;
++		Out.dc[1] = In.SH_DC.Y;
++		Out.dc[2] = In.SH_DC.Z;
++		Out.shCoeffs = 0;
++	}
++
++	void BuildRecords(const sog::DecodedAsset& Asset, const TArray<int32>& Order,
++		const TArray<FGaussianSplatData>& Splats, int32 NumBase, TArray<sog::PackedSplat>& OutRecords)
++	{
++		check(NumBase <= Splats.Num() && NumBase <= int32(Asset.splats.size()));
++		check(Order.IsEmpty() || Order.Num() == NumBase);
++		OutRecords.SetNumUninitialized(Splats.Num());
++		for (int32 Index = 0; Index < NumBase; ++Index)
++		{
++			OutRecords[Index] = Asset.splats[size_t(Order.IsEmpty() ? Index : Order[Index])];
++		}
++		const sog::Encoder Encoder(Asset);
++		ParallelFor(Splats.Num() - NumBase, [&](int32 Offset)
++		{
++			const int32 Index = NumBase + Offset;
++			sog::SplatFloat S;
++			FromSplatData(Splats[Index], S);
++			OutRecords[Index] = Encoder.Encode(S, 0, uint8(sog::kFlagNoSH));
++		});
++	}
++}
+--- /dev/null
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.h
+@@ -0,0 +1,9 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "SOG/SOGTypes.h"
++
++/** Load a bundled .sog or an unbundled SOG folder (via its meta.json) with Unreal's file APIs. */
++bool NanoGSReadSOG(const FString& Path, sog::DecodedAsset& Out, FString& OutError);
+--- /dev/null
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.cpp
+@@ -0,0 +1,75 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#include "GaussianSplatSOGReader.h"
++#include "SOGLoader.h"
++#include "Misc/FileHelper.h"
++#include "Misc/Paths.h"
++
++namespace
++{
++	FString ToFString(const std::string& Text)
++	{
++		return FString(UTF8_TO_TCHAR(Text.c_str()));
++	}
++
++	/** Unbundled SOG: sibling files of meta.json, read through Unreal's file system. */
++	class FFolderSource final : public sog::FileSource
++	{
++	public:
++		explicit FFolderSource(FString InDirectory) : Directory(MoveTemp(InDirectory)) {}
++
++		virtual bool Read(const std::string& Name, std::vector<uint8_t>& Out, std::string* Error) override
++		{
++			const FString Relative = ToFString(Name);
++			if (Relative.Contains(TEXT("..")) || !FPaths::IsRelative(Relative))
++			{
++				if (Error) { *Error = "refusing path " + Name; }
++				return false;
++			}
++			TArray<uint8> Bytes;
++			if (!FFileHelper::LoadFileToArray(Bytes, *FPaths::Combine(Directory, Relative)))
++			{
++				if (Error) { *Error = "missing " + Name; }
++				return false;
++			}
++			Out.assign(Bytes.GetData(), Bytes.GetData() + Bytes.Num());
++			return true;
++		}
++
++	private:
++		FString Directory;
++	};
++}
++
++bool NanoGSReadSOG(const FString& Path, sog::DecodedAsset& Out, FString& OutError)
++{
++	std::unique_ptr<sog::FileSource> Source;
++	std::string Error;
++	if (FPaths::GetCleanFilename(Path).Equals(TEXT("meta.json"), ESearchCase::IgnoreCase))
++	{
++		Source = std::make_unique<FFolderSource>(FPaths::GetPath(Path));
++	}
++	else
++	{
++		TArray<uint8> Bytes;
++		if (!FFileHelper::LoadFileToArray(Bytes, *Path))
++		{
++			OutError = FString::Printf(TEXT("Cannot read %s"), *Path);
++			return false;
++		}
++		Source = sog::MakeZipSource(std::vector<uint8_t>(Bytes.GetData(), Bytes.GetData() + Bytes.Num()), &Error);
++		if (!Source)
++		{
++			OutError = FString::Printf(TEXT("%s is not a valid .sog bundle: %s"), *Path, *ToFString(Error));
++			return false;
++		}
++	}
++
++	const sog::Error Result = sog::LoadSOG(*Source, Out, &Error);
++	if (Result != sog::Error::Ok)
++	{
++		OutError = FString::Printf(TEXT("%s: %s (%s)"), *Path, *ToFString(Error), *ToFString(sog::ErrorName(Result)));
++		return false;
++	}
++	return true;
++}
+--- /dev/null
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp
+@@ -0,0 +1,327 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++// SOG import tests. They need the nanogs-sog repository's Phase 0 data; set NANOGS_SOG_TESTDATA to its
++// data/ folder (scene_nosky.sog, scene_nosky_roundtrip.ply, blueprint_test/*.bin). Without it they skip.
++//   UnrealEditor SHUTourDemo.uproject -ExecCmds="Automation RunTests NanoGS.SOG" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -NoP4
++
++#include "CoreMinimal.h"
++#include "Misc/AutomationTest.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++#include "GaussianSplatAsset.h"
++#include "GaussianSplatAssetFactory.h"
++#include "GaussianSplatSOG.h"
++#include "PLYFileReader.h"
++#include "SOG/GaussianSplatSOGReader.h"
++#include "SOG/SOGCodec.h"
++#include "SOGJson.h"
++#include "HAL/FileManager.h"
++#include "HAL/PlatformMisc.h"
++#include "Misc/FileHelper.h"
++#include "Misc/PackageName.h"
++#include "UObject/Package.h"
++#include "UObject/SavePackage.h"
++#include "UObject/UObjectGlobals.h"
++
++namespace
++{
++	FString TestDataDir()
++	{
++		return FPlatformMisc::GetEnvironmentVariable(TEXT("NANOGS_SOG_TESTDATA"));
++	}
++
++	/** Local-space (cm) position of one record, same arithmetic as GaussianSplatSOG::ToSplatData. */
++	FVector3f DecodeLocalPosition(const sog::DecodedAsset& Ranges, const sog::PackedSplat& Record)
++	{
++		sog::DecodedAsset One;
++		for (int32 K = 0; K < 3; ++K)
++		{
++			One.meanMin[K] = Ranges.meanMin[K];
++			One.meanMax[K] = Ranges.meanMax[K];
++		}
++		One.count = 1;
++		One.splats.push_back(Record);
++		sog::SplatFloat S;
++		sog::DecodeSplat(One, 0, S);
++		return FVector3f(S.position[2] * 100.0f, S.position[0] * 100.0f, -S.position[1] * 100.0f);
++	}
++
++	bool LoadBytes(const FString& Path, TArray<uint8>& Out)
++	{
++		return FFileHelper::LoadFileToArray(Out, *Path);
++	}
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSSOGReaderMatchesPLYTest, "NanoGS.SOG.ReaderMatchesPLYImporter",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSSOGReaderMatchesPLYTest::RunTest(const FString& Parameters)
++{
++	const FString Dir = TestDataDir();
++	if (Dir.IsEmpty())
++	{
++		AddInfo(TEXT("NANOGS_SOG_TESTDATA not set; skipping"));
++		return true;
++	}
++
++	sog::DecodedAsset Decoded;
++	FString Error;
++	if (!TestTrue(TEXT("SOG reader loads scene_nosky.sog"), NanoGSReadSOG(Dir / TEXT("scene_nosky.sog"), Decoded, Error)))
++	{
++		AddError(Error);
++		return false;
++	}
++	TArray<FGaussianSplatData> FromSOG;
++	GaussianSplatSOG::ToSplatData(Decoded, FromSOG);
++
++	TArray<FGaussianSplatData> FromPLY;
++	if (!TestTrue(TEXT("PLY importer reads the round-trip PLY"),
++		FPLYFileReader::ReadPLYFile(Dir / TEXT("scene_nosky_roundtrip.ply"), FromPLY, Error)))
++	{
++		AddError(Error);
++		return false;
++	}
++	if (!TestEqual(TEXT("Splat counts"), FromSOG.Num(), FromPLY.Num()))
++	{
++		return false;
++	}
++
++	double Pos = 0, Rot = 0, Scale = 0, Opacity = 0, DC = 0, SH = 0;
++	for (int32 I = 0; I < FromSOG.Num(); ++I)
++	{
++		const FGaussianSplatData& A = FromSOG[I];
++		const FGaussianSplatData& B = FromPLY[I];
++		Pos = FMath::Max(Pos, double((A.Position - B.Position).GetAbsMax()));
++		Rot = FMath::Max(Rot, 1.0 - FMath::Abs(double(A.Rotation | B.Rotation)));
++		Scale = FMath::Max(Scale, double(((A.Scale - B.Scale) / B.Scale).GetAbsMax()));
++		Opacity = FMath::Max(Opacity, double(FMath::Abs(A.Opacity - B.Opacity)));
++		DC = FMath::Max(DC, double((A.SH_DC - B.SH_DC).GetAbsMax()));
++		for (int32 C = 0; C < 15; ++C)
++		{
++			SH = FMath::Max(SH, double((A.SH[C] - B.SH[C]).GetAbsMax()));
++		}
++	}
++	AddInfo(FString::Printf(TEXT("%d splats; max differences: position %.3g cm, rotation 1-|dot| %.3g, scale %.3g rel, opacity %.3g, DC %.3g, SH %.3g"),
++		FromSOG.Num(), Pos, Rot, Scale, Opacity, DC, SH));
++	TestTrue(TEXT("Positions match"), Pos <= 1e-3);
++	TestTrue(TEXT("Rotations match"), Rot <= 1e-6);
++	TestTrue(TEXT("Scales match"), Scale <= 1e-5);
++	TestTrue(TEXT("Opacities match"), Opacity <= 1e-6);
++	TestTrue(TEXT("DC colours match exactly"), DC == 0.0);
++	TestTrue(TEXT("SH coefficients match exactly"), SH == 0.0);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSSOGImportNaniteSaveTest, "NanoGS.SOG.ImportNaniteSaveReload",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSSOGImportNaniteSaveTest::RunTest(const FString& Parameters)
++{
++	const FString Dir = TestDataDir();
++	if (Dir.IsEmpty())
++	{
++		AddInfo(TEXT("NANOGS_SOG_TESTDATA not set; skipping"));
++		return true;
++	}
++	const FString SourcePath = Dir / TEXT("scene_nosky.sog");
++	const FString PackageName = TEXT("/Game/NanoGS_SOGTest_Temp/SOGTest");
++	const FString PackageFile = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
++
++	// Import
++	UPackage* Package = CreatePackage(*PackageName);
++	UGaussianSplatAssetFactory* Factory = NewObject<UGaussianSplatAssetFactory>();
++	bool bCanceled = false;
++	UGaussianSplatAsset* Asset = Cast<UGaussianSplatAsset>(Factory->FactoryCreateFile(UGaussianSplatAsset::StaticClass(),
++		Package, TEXT("SOGTest"), RF_Public | RF_Standalone, SourcePath, nullptr, GWarn, bCanceled));
++	if (!TestNotNull(TEXT("Factory imports the .sog"), Asset))
++	{
++		return false;
++	}
++	TestTrue(TEXT("Asset carries SOG data"), Asset->HasSOGData());
++	TestEqual(TEXT("SOG SH bands"), Asset->SOGSHBands, 3);
++	TestEqual(TEXT("SOG palette entries"), Asset->SOGPaletteCount, 65536);
++
++	TArray<uint8> Records, RefRecords, Palette, RefPalette;
++	Asset->GetSOGRecordData(Records);
++	Asset->GetSOGPaletteData(Palette);
++	TestTrue(TEXT("Records identical to the Phase 0 reference"),
++		LoadBytes(Dir / TEXT("blueprint_test/records.bin"), RefRecords) && Records == RefRecords);
++	TestTrue(TEXT("Half-float palette identical to the Phase 0 reference"),
++		LoadBytes(Dir / TEXT("blueprint_test/palette_half4.bin"), RefPalette) && Palette == RefPalette);
++	TestEqual(TEXT("Lookup tables"), Asset->GetSOGScaleLUT().Num() + Asset->GetSOGDCLUT().Num(), 512);
++
++	// Nanite build: records must stay aligned with the legacy buffers, splat for splat
++	if (!TestTrue(TEXT("Nanite build succeeds"), Asset->BuildNaniteClusterHierarchy()))
++	{
++		return false;
++	}
++	const int32 Total = Asset->GetSplatCount();
++	const int32 Base = Asset->GetOriginalSplatCount();
++	Asset->GetSOGRecordData(Records);
++	TestEqual(TEXT("One SOG record per splat after the Nanite build"), Records.Num(), Total * int32(sizeof(sog::PackedSplat)));
++	TestEqual(TEXT("SOG constants count"), int32(Asset->GetSOGConstants().count), Total);
++
++	sog::DecodedAsset Ranges;
++	FString Error;
++	NanoGSReadSOG(SourcePath, Ranges, Error);
++	const sog::PackedSplat* Packed = reinterpret_cast<const sog::PackedSplat*>(Records.GetData());
++	const TArray<FVector> Legacy = Asset->GetDecompressedPositions();
++	double BaseErr = 0.0, LodErr = 0.0;
++	int32 LodNoSH = 0;
++	for (int32 I = 0; I < Total && I < Legacy.Num(); ++I)
++	{
++		const double Err = (FVector(DecodeLocalPosition(Ranges, Packed[I])) - Legacy[I]).GetAbsMax();
++		if (I < Base)
++		{
++			BaseErr = FMath::Max(BaseErr, Err);
++		}
++		else
++		{
++			LodErr = FMath::Max(LodErr, Err);
++			LodNoSH += ((Packed[I].dc >> 24) & sog::kFlagNoSH) ? 1 : 0;
++		}
++	}
++	AddInfo(FString::Printf(TEXT("Nanite: %d base + %d LOD splats, %d clusters; position vs legacy buffer: base %.3g cm, LOD %.3g cm"),
++		Base, Total - Base, Asset->GetClusterCount(), BaseErr, LodErr));
++	TestTrue(TEXT("Base splats follow the builder's reordering exactly"), BaseErr <= 1e-3);
++	TestTrue(TEXT("LOD splats quantize within 0.1 cm"), LodErr <= 0.1);
++	TestEqual(TEXT("Every LOD splat is flagged as having no SH"), LodNoSH, Total - Base);
++
++	// Save (version 6) and reload from disk
++	FSavePackageArgs SaveArgs;
++	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
++	SaveArgs.SaveFlags = SAVE_NoError;
++	const bool bSaved = UPackage::SavePackage(Package, Asset, *PackageFile, SaveArgs);
++	TestTrue(TEXT("Package saves"), bSaved);
++
++	const TArray<uint8> RecordsBefore = Records;
++	const int32 ClustersBefore = Asset->GetClusterCount();
++	// Move the in-memory package aside so LoadPackage reads the saved file instead of returning it
++	Package->Rename(*FString::Printf(TEXT("/Temp/NanoGS_SOGTest_Old_%s"), *FGuid::NewGuid().ToString()),
++		nullptr, REN_DontCreateRedirectors | REN_NonTransactional);
++	UPackage* Reloaded = bSaved ? LoadPackage(nullptr, *PackageName, LOAD_None) : nullptr;
++	UGaussianSplatAsset* ReloadedAsset = Reloaded ? FindObject<UGaussianSplatAsset>(Reloaded, TEXT("SOGTest")) : nullptr;
++	if (TestNotNull(TEXT("Saved asset reloads"), ReloadedAsset))
++	{
++		TArray<uint8> ReloadedRecords, ReloadedPalette;
++		ReloadedAsset->GetSOGRecordData(ReloadedRecords);
++		ReloadedAsset->GetSOGPaletteData(ReloadedPalette);
++		TestTrue(TEXT("Reloaded asset keeps its SOG data"), ReloadedAsset->HasSOGData());
++		TestTrue(TEXT("Reloaded records identical"), ReloadedRecords == RecordsBefore);
++		TestTrue(TEXT("Reloaded palette identical"), ReloadedPalette == Palette);
++		TestEqual(TEXT("Reloaded splat count"), ReloadedAsset->GetSplatCount(), Total);
++		TestEqual(TEXT("Reloaded cluster count"), ReloadedAsset->GetClusterCount(), ClustersBefore);
++		TestTrue(TEXT("Reloaded constants identical"),
++			FMemory::Memcmp(&ReloadedAsset->GetSOGConstants(), &Asset->GetSOGConstants(), sizeof(sog::AssetConstants)) == 0);
++		ReloadedAsset->ClearFlags(RF_Public | RF_Standalone);
++		ReloadedAsset->MarkAsGarbage();
++		ResetLoaders(Reloaded);
++	}
++	Asset->ClearFlags(RF_Public | RF_Standalone);
++	Asset->MarkAsGarbage();
++
++	IFileManager::Get().Delete(*PackageFile, false, true, true);
++	IFileManager::Get().DeleteDirectory(*FPaths::GetPath(PackageFile), false, false);
++	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSSOGLegacyAssetLoadsTest, "NanoGS.SOG.LegacyAssetStillLoads",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSSOGLegacyAssetLoadsTest::RunTest(const FString& Parameters)
++{
++	const FString Legacy = TEXT("/Game/Gaussian/scene_nosky.scene_nosky");
++	if (!FPackageName::DoesPackageExist(FPackageName::ObjectPathToPackageName(Legacy)))
++	{
++		AddInfo(TEXT("scene_nosky not in this project; skipping"));
++		return true;
++	}
++	UGaussianSplatAsset* Asset = LoadObject<UGaussianSplatAsset>(nullptr, *Legacy);
++	if (!TestNotNull(TEXT("Version 5 asset loads"), Asset))
++	{
++		return false;
++	}
++	AddInfo(FString::Printf(TEXT("scene_nosky: %d splats, %d clusters"), Asset->GetSplatCount(), Asset->GetClusterCount()));
++	TestTrue(TEXT("Legacy asset has splats"), Asset->GetSplatCount() > 0);
++	TestFalse(TEXT("Legacy asset has no SOG data"), Asset->HasSOGData());
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSSOGFixturesTest, "NanoGS.SOG.Fixtures",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSSOGFixturesTest::RunTest(const FString& Parameters)
++{
++	// Fixtures from tools/phase1/make_fixtures.py: valid bundles/folders and one file per error path.
++	const FString Dir = TestDataDir() / TEXT("fixtures");
++	FString ManifestText;
++	if (TestDataDir().IsEmpty() || !FFileHelper::LoadFileToString(ManifestText, *(Dir / TEXT("fixtures.json"))))
++	{
++		AddInfo(TEXT("fixtures not available; skipping"));
++		return true;
++	}
++	const FTCHARToUTF8 Utf8(*ManifestText);
++	sog::json::Value Manifest;
++	std::string ParseError;
++	if (!TestTrue(TEXT("fixtures.json parses"), sog::json::Parse(Utf8.Get(), size_t(Utf8.Length()), Manifest, &ParseError)))
++	{
++		return false;
++	}
++
++	int32 Checked = 0;
++	for (const auto& Item : Manifest.object)
++	{
++		const FString Name = UTF8_TO_TCHAR(Item.first.c_str());
++		const FString Expected = UTF8_TO_TCHAR(Item.second.Find("error")->string.c_str());
++		FString Path = Dir / FString(UTF8_TO_TCHAR(Item.second.Find("path")->string.c_str()));
++		if (FPaths::DirectoryExists(Path))
++		{
++			Path = Path / TEXT("meta.json");
++		}
++		sog::DecodedAsset Decoded;
++		FString Error;
++		const bool bLoaded = NanoGSReadSOG(Path, Decoded, Error);
++		if (Expected == TEXT("Ok"))
++		{
++			const sog::json::Value* Records = Item.second.Find("records");
++			bool bSame = bLoaded && Records && Records->array.size() == Decoded.splats.size();
++			for (size_t I = 0; bSame && I < Decoded.splats.size(); ++I)
++			{
++				const uint32* Got = &Decoded.splats[I].meanXY;
++				for (size_t K = 0; K < 5; ++K)
++				{
++					bSame = bSame && uint32(Records->array[I].array[K].number) == Got[K];
++				}
++			}
++			TestTrue(FString::Printf(TEXT("%s loads with the expected records"), *Name), bSame);
++		}
++		else
++		{
++			const bool bRightError = !bLoaded && (Error.Contains(FString::Printf(TEXT("(%s)"), *Expected))
++				|| (Expected == TEXT("NotZipOrFolder") && Error.Contains(TEXT("not a valid .sog bundle"))));
++			TestTrue(FString::Printf(TEXT("%s fails with %s (%s)"), *Name, *Expected, *Error), bRightError);
++		}
++		++Checked;
++	}
++	AddInfo(FString::Printf(TEXT("%d fixtures checked"), Checked));
++
++	// The factory also imports an unbundled folder through its meta.json
++	UGaussianSplatAssetFactory* Factory = NewObject<UGaussianSplatAssetFactory>();
++	const FString MetaPath = Dir / TEXT("valid_folder/meta.json");
++	TestTrue(TEXT("Factory accepts a SOG meta.json"), Factory->FactoryCanImport(MetaPath));
++	TestFalse(TEXT("Factory rejects other JSON"), Factory->FactoryCanImport(Dir / TEXT("fixtures.json")));
++	bool bCanceled = false;
++	UGaussianSplatAsset* Asset = Cast<UGaussianSplatAsset>(Factory->FactoryCreateFile(UGaussianSplatAsset::StaticClass(),
++		GetTransientPackage(), TEXT("SOGFolderTest"), RF_Transient, MetaPath, nullptr, GWarn, bCanceled));
++	if (TestNotNull(TEXT("Folder imports"), Asset))
++	{
++		TestEqual(TEXT("Folder asset splat count"), Asset->GetSplatCount(), 100);
++		TestTrue(TEXT("Folder asset carries SOG data"), Asset->HasSOGData());
++		Asset->MarkAsGarbage();
++	}
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS

@@ -1,4 +1,4 @@
-// Runs every function in blueprint/SOGDecode.metal over all splats; run_metal_test.swift compares
+// Runs every function in shaders/SOGDecode.metal over all splats; run_metal_test.swift compares
 // the output with the float64 Python reference (export_test_data.py).
 #include "SOGDecode.metal"
 

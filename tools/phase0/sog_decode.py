@@ -3,8 +3,8 @@
 Spec: https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/
 
 This is the golden implementation the C++ importer and the Metal/HLSL decode path are
-tested against. It also implements the 20-byte GPU record from blueprint/SOGTypes.h and a
-float32 decoder that mirrors blueprint/SOGDecode.metal line for line.
+tested against. It also implements the 20-byte GPU record from sog/SOGTypes.h and a
+float32 decoder that mirrors shaders/SOGDecode.metal line for line.
 """
 import io
 import json
@@ -129,7 +129,7 @@ def decode(path, with_sh=True):
     return out
 
 
-# ---- GPU layout (blueprint/SOGTypes.h) ------------------------------------------------------
+# ---- GPU layout (sog/SOGTypes.h) ------------------------------------------------------
 
 def pack_records(dec):
     """(count, 5) uint32 records, byte-identical to sog::PackSplat."""
@@ -156,7 +156,7 @@ def build_tables(meta):
 
 
 def gpu_decode(rec, meta, scale_lut, dc_lut):
-    """float32 decode mirroring blueprint/SOGDecode.metal (sog_mean, sog_quat_wxyz, sog_scale, ...)."""
+    """float32 decode mirroring shaders/SOGDecode.metal (sog_mean, sog_quat_wxyz, sog_scale, ...)."""
     f = np.float32
     q = np.stack([rec[:, 0] & 0xFFFF, rec[:, 0] >> 16, rec[:, 1] & 0xFFFF], 1).astype(f) * f(1.0 / 65535.0)
     mn = np.asarray(meta["means"]["mins"], f)

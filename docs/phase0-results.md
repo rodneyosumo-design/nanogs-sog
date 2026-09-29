@@ -31,7 +31,7 @@ Per-splat images are 1608×1604 RGBA (2,579,232 texels ≥ count); the SH palett
   doesn't reorient: the data stays in the 3DGS/COLMAP frame (x right, y down, z forward) even though the
   SOG spec describes y-up. SOG reorders splats (Morton order); 99.991% pair up by mutual nearest neighbour.
 - For NanoGS, the file→local transform is therefore its PLY importer mapping, local cm = 100·(z, x, −y),
-  stored as `kNanoGSFileToLocal` in `blueprint/SOGTypes.h`. It's a reflection (determinant −1).
+  stored as `kNanoGSFileToLocal` in `sog/SOGTypes.h`. It's a reflection (determinant −1).
 - Applying it to the covariance in the shader (the plan's approach) is **identical** to NanoGS's import-time
   quaternion conversion: max relative difference 3×10⁻¹⁶ over 200,000 real splats
   ([frame_check.json](../results/frame_check.json)). Quaternions can stay untouched.
@@ -47,7 +47,7 @@ Per-splat images are 1608×1604 RGBA (2,579,232 texels ≥ count); the SH palett
 |---|---|
 | Our Python SOG v2 decoder vs `splat-transform`'s own decode | Exact: SH, scale, DC 0 difference; position ≤ 4.8×10⁻⁷ m (float32 PLY rounding) |
 | 20-byte record + float32 decode (Python mirror of the Metal code) | Position ≤ 4.7 µm, quaternion ≤ 3.4×10⁻⁷, scale ≤ 5.6×10⁻⁸ relative |
-| `blueprint/SOGDecode.metal` compiled with `-Werror`, run on the M4 GPU over all 2,575,004 splats | All fields pass ([metal_test_result.json](../results/metal_test_result.json)); **5.6 ms** for the whole scene including SH3 colour and local covariance |
+| `shaders/SOGDecode.metal` compiled with `-Werror`, run on the M4 GPU over all 2,575,004 splats | All fields pass ([metal_test_result.json](../results/metal_test_result.json)); **5.6 ms** for the whole scene including SH3 colour and local covariance |
 | `sog::PackSplat` (C++17, `-Wall -Wextra -Werror`) vs reference records | 0 mismatches in 2,575,004; struct sizes 20 and 112 bytes ([pack_test_result.json](../results/pack_test_result.json)) |
 
 GPU worst-case errors: position 3.8 µm, quaternion 1.8×10⁻⁷, scale 9×10⁻⁸ relative, opacity 6×10⁻⁸,
@@ -122,8 +122,8 @@ The plan's "~144 bytes per splat, 494 MB" was the cooked bulk payload, not GPU r
 ## 7. Not done, and why
 
 **No Unreal asset was created from the round-trip PLY.**
-- The editor was closed, and NanoGS's Nanite (cluster) build is only reachable from the Asset Actions menu.
-  It isn't scriptable.
+- The editor was closed. (This write-up originally also said NanoGS's Nanite build was menu-only; that was
+  wrong: `BuildNaniteClusterHierarchy` is `BlueprintCallable`, so it can be scripted. See Phase 1.)
 - An import would also have put a ~430 MB unversioned asset into the Perforce workspace.
 - The round-trip PLY's header is identical to the original's (same 59 properties, same order), so NanoGS
   reads it unchanged.

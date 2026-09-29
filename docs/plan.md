@@ -62,10 +62,10 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
 
 **Phase 0: ground truth — done.** See [phase0-results.md](phase0-results.md).
 
-**Phase 1: ingestion and parser (NanoGSEditor).**
+**Phase 1: ingestion and parser (NanoGSEditor) — done** (decision A, 2026-09-29); see [phase1-results.md](phase1-results.md) for results and deviations.
 - Import factory for `.sog`, SOG folders and `lod-meta.json`; zips via Unreal's `FZipArchiveReader`.
 - Vendor the libwebp decoder (BSD) into the editor module only; Unreal 5.8's image decoder has no WebP.
-- Pack each splat into the 20-byte record (`blueprint/SOGTypes.h`), keeping Morton order; build the
+- Pack each splat into the 20-byte record (`sog/SOGTypes.h`), keeping Morton order; build the
   scale/DC tables and the half-float SH palette; store as bulk data under a new SOG storage mode, plus
   `fileToLocal` (default `kNanoGSFileToLocal`, with a y-up option).
 - NanoGS LOD splats: requantize positions, snap scale/DC to the nearest codebook entry, inherit the SH label
@@ -74,7 +74,7 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
 - Done when the SOG import matches the PLY import and matches `results/golden_scene_nosky.json`.
 
 **Phase 2: GPU decode and sorting.**
-- SOG shader variant in `CalcViewData` using `blueprint/SOGDecode.metal` (ported to .usf); it writes the
+- SOG shader variant in `CalcViewData` using `shaders/SOGDecode.metal` (ported to .usf); it writes the
   same per-splat view data, so nothing downstream changes.
 - Keep NanoGS's reduce-then-scan radix sort (safe on Apple GPUs, where Metal gives no cross-threadgroup
   forward-progress guarantee for Onesweep-style look-back). Add 16-bit keys on mobile: 2 passes instead of
@@ -95,13 +95,13 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
   profiles. The palette makes full SH3 nearly free in memory.
 - Streamed SOG: map `lod-meta.json` leaf runs onto NanoGS clusters (128-splat groups), use `errors` as the
   LOD metric, cook chunks as separately streamed bulk data, LRU residency budget, coarsest level pinned.
-- A native iOS viewer, if ever needed: fork MetalSplatter and reuse `blueprint/`.
+- A native iOS viewer, if ever needed: fork MetalSplatter and reuse `sog/` and `shaders/`.
 
 ## 4. Blueprint
 
-- `blueprint/SOGTypes.h` — 20-byte `PackedSplat`, 112-byte `AssetConstants`, `PackSplat`,
+- `sog/SOGTypes.h` — 20-byte `PackedSplat`, 112-byte `AssetConstants`, `PackSplat`,
   `kNanoGSFileToLocal`, Streamed SOG structs, loader declarations.
-- `blueprint/SOGDecode.metal` — `sog_mean`, `sog_quat_wxyz`, `sog_scale`, `sog_opacity`,
+- `shaders/SOGDecode.metal` — `sog_mean`, `sog_quat_wxyz`, `sog_scale`, `sog_opacity`,
   `sog_covariance_local`, `sog_antialias_compensation`, `sog_color` (SH0–SH3 with a runtime order cap).
 
 Both are compiled and tested against the reference decoder over the full scene

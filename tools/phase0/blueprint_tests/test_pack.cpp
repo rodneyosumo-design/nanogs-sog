@@ -1,5 +1,5 @@
 // Checks sog::PackSplat reproduces the reference records for every splat.
-// build: clang++ -std=c++17 -O2 -I ../../../blueprint test_pack.cpp -o test_pack
+// build: clang++ -std=c++17 -O2 -I ../../../sog test_pack.cpp -o test_pack
 // usage: ./test_pack <test_data_dir>
 #include "SOGTypes.h"
 

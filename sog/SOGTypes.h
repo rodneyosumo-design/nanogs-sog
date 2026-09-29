@@ -1,7 +1,7 @@
 // SOGTypes.h
 // CPU-side layout for SOG (PlayCanvas "Spatially Ordered Gaussians", spec v2) assets as they are
 // kept on the GPU: one 20-byte record per splat plus small tables. Shared by the NanoGS importer
-// and any native loader. Mirrors SOGDecode.metal byte for byte.
+// and any native loader. Mirrors shaders/SOGDecode.metal byte for byte.
 #pragma once
 
 #include <cstdint>
@@ -9,14 +9,24 @@
 #include <utility>
 #include <vector>
 
+// Export macro for shared-library builds (NanoGS defines SOG_API=NANOGS_API); empty for static use.
+#ifndef SOG_API
+#define SOG_API
+#endif
+
 namespace sog {
+
+inline constexpr float kSHC0 = 0.28209479177387814f;
+
+// Bits 24..31 of PackedSplat::dc.
+inline constexpr uint32_t kFlagNoSH = 1u;   // skip the AC palette (NanoGS merged LOD splats carry no SH)
 
 struct PackedSplat {
     uint32_t meanXY;        // qx | qy << 16
     uint32_t meanZ_label;   // qz | shN label << 16
     uint32_t quat;          // a | b << 8 | c << 16 | (quats.A - 252) << 24
     uint32_t scaleOpacity;  // sx | sy << 8 | sz << 16 | opacity << 24
-    uint32_t dc;            // r | g << 8 | b << 16
+    uint32_t dc;            // r | g << 8 | b << 16 | flags << 24
 };
 static_assert(sizeof(PackedSplat) == 20, "must match SOGSplat in SOGDecode.metal");
 
@@ -39,23 +49,36 @@ inline constexpr float kNanoGSFileToLocal[16] = {
     0.0f, 0.0f, 0.0f, 1.0f,
 };
 
-struct DecodedAsset {                        // what gets cooked; GPU upload is a straight memcpy
-    AssetConstants           constants{};
-    std::vector<PackedSplat> splats;         // Morton order preserved
-    float                    scaleLUT[256];  // exp(codebook)
-    float                    dcLUT[256];     // 0.5 + SH_C0 * codebook
-    std::vector<uint16_t>    paletteHalf4;   // paletteCount * shCoeffs * 4 halves (rgb + unused)
-    uint32_t                 paletteCount = 0;
-    uint32_t                 shBands = 0;
+struct DecodedAsset {
+    uint32_t count = 0;
+    double   meanMin[3] = {0, 0, 0};        // meta.means.mins (log-domain, written with 17 digits)
+    double   meanMax[3] = {0, 0, 0};        // meta.means.maxs
+    bool     antialias = false;
+    uint32_t shBands = 0;                   // 0..3
+    uint32_t shCoeffs = 0;                  // 0, 3, 8 or 15
+    uint32_t paletteCount = 0;
+
+    // Codebooks exactly as stored in meta.json.
+    float scaleCodebook[256] = {};          // log scale
+    float sh0Codebook[256] = {};            // SH DC coefficient
+    float shNCodebook[256] = {};            // SH AC coefficient
+
+    std::vector<PackedSplat> splats;        // Morton order preserved
+    std::vector<uint8_t>     paletteIndices;// paletteCount * shCoeffs * 3 shNCodebook indices (r, g, b)
+
+    // Derived GPU tables.
+    float scaleLUT[256] = {};               // exp(scaleCodebook)
+    float dcLUT[256] = {};                  // 0.5 + SH_C0 * sh0Codebook
+    std::vector<uint16_t> paletteHalf4;     // paletteCount * shCoeffs * 4 halves (rgb + unused)
 };
+
+SOG_API AssetConstants MakeConstants(const DecodedAsset& asset, const float fileToLocal[16]);
 
 enum class Error {
-    Ok, NotZipOrFolder, MissingMeta, BadVersion, MissingImage, LossyImage,
-    ImageSizeMismatch, BadQuatMode, LabelOutOfRange
+    Ok, NotZipOrFolder, UnsupportedZip, MissingMeta, BadMeta, BadVersion, MissingImage,
+    BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange
 };
-
-// Accepts a bundled .sog (zip), an unbundled folder, or the path to its meta.json. (Phase 1)
-Error LoadSOG(const std::string& path, DecodedAsset& out, std::string* message = nullptr);
+SOG_API const char* ErrorName(Error e);
 
 // Each pointer is this splat's RGBA8 texel, decoded with libwebp WebPDecodeRGBA (exact bytes; never
 // ImageIO/CoreGraphics, which premultiply alpha). The caller has checked q[3] is 252..255.
@@ -85,6 +108,5 @@ struct LodMeta {
     std::vector<std::string> filenames;                   // chunk meta.json paths
     std::vector<LodNode> nodes;                           // nodes[0] = root
 };
-Error LoadLodMeta(const std::string& lodMetaJsonPath, LodMeta& out, std::string* message = nullptr);
 
 } // namespace sog
