@@ -128,6 +128,12 @@ hidden and the sky excluded, so animation and clouds don't count. PSNR is agains
 | Quad, 300K | 20.7 dB | 29.8 dB |
 | Quad, Streamed SOG at 250K (same GPU time as NanoGS at 300K) | — | 28.4 dB |
 
+The NanoGS column is `scene_nosky_sog` as saved, with the LOD splats of the original merge. A moment-matched merge for
+NanoGS's own LOD was built alongside Phase 4 in a separate session (not in this patch). By that session's own
+measurement it raises NanoGS's LOD at 300K from 17.6 to 24.8 dB (splat-only, against the leaf level) but costs about
+50% more draw time (4.0–4.4 → 6.2–6.7 ms), because its merged splats now cover the surfaces. The asset needs a Nanite
+rebuild to pick it up. The Streamed SOG is still ahead in both image quality and cost.
+
 In the quad view at 300K, the level choice puts 26 leaves at the finest level, 15 at 50%, 22 at 25% and 97 at 10%
 (160 of 284 visible).
 
