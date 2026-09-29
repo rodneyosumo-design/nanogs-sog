@@ -1,0 +1,1361 @@
+# NanoGS changes for Phase 3 (rasterization, render budget), on top of Phase 2 (nanogs-phase2.patch). All
+# phases are in pending Perforce changelist 363 (not submitted), together with the SOG asset
+# Content/Gaussian/scene_nosky_sog.uasset, its source SourceData/scene_building_nosky.sog, and
+# Content/Levels/SHUCampusLevel.umap pointing its splat actor at it (binary files, not in this patch).
+
+diff -ruN a/Config/DefaultDeviceProfiles.ini b/Config/DefaultDeviceProfiles.ini
+--- a/Config/DefaultDeviceProfiles.ini	2026-09-29 15:31:17
++++ b/Config/DefaultDeviceProfiles.ini	2026-09-29 15:31:18
+@@ -6,6 +6,8 @@
+ +CVars=gs.OverrideLODErrorThreshold=0.08
+ ; NanoGS: 16-bit log-depth sort keys, 2 radix passes instead of 4
+ +CVars=gs.SortKeyBits=16
++; NanoGS: splats drawn at 70% resolution (FXAA views), depth-matched upsample
+++CVars=gs.ScreenPercentage=70
+ +TextureLODGroups=(Group=TEXTUREGROUP_World,				MaxLODSize=1024,	OptionalMaxLODSize=512,		OptionalLODBias=0, MaxLODSize_Smaller=1024,		MaxLODSize_Smallest=512,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldNormalMap,		MaxLODSize=512,		OptionalMaxLODSize=128,		OptionalLODBias=0, MaxLODSize_Smaller=512,		MaxLODSize_Smallest=256,    LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldSpecular,		MaxLODSize=256,		OptionalMaxLODSize=64,		OptionalLODBias=0, MaxLODSize_Smaller=256,		MaxLODSize_Smallest=128,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+@@ -26,6 +28,8 @@
+ +CVars=gs.OverrideLODErrorThreshold=0.08
+ ; NanoGS: 16-bit log-depth sort keys, 2 radix passes instead of 4
+ +CVars=gs.SortKeyBits=16
++; NanoGS: splats drawn at 70% resolution (FXAA views), depth-matched upsample
+++CVars=gs.ScreenPercentage=70
+ +CVars=r.MobileContentScaleFactor=2
+ ; --- 2026-09-03 mobile perf tuning (UDS + general) ---
+ +CVars=r.MaterialQualityLevel=0
+diff -ruN a/Plugins/NanoGS/Shaders/Private/CalcViewData.usf b/Plugins/NanoGS/Shaders/Private/CalcViewData.usf
+--- a/Plugins/NanoGS/Shaders/Private/CalcViewData.usf	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Shaders/Private/CalcViewData.usf	2026-09-29 14:55:48
+@@ -64,6 +64,7 @@
+ uint NumSHCoeffs;      // Coefficients to evaluate (based on SHOrder: 4, 9, or 16)
+ uint SHBufferCoeffs;   // Coefficients actually stored per splat in SHBuffer (based on asset SHBands)
+ uint UseSHRendering;   // 1 = use view-dependent SH evaluation, 0 = use pre-computed DC color
++uint Antialias;        // 1 = asset trained with antialiasing (SOG meta "antialias"): Mip-Splatting opacity compensation
+ float OpacityScale;
+ float SplatScale;
+ uint GlobalBaseOffset; // Offset into global ViewDataBuffer (for multi-proxy global accumulator, non-compaction path)
+@@ -161,6 +162,13 @@
+ 	float opacity = colorOpacity.a * OpacityScale;
+ #endif
+ 
++	// Below 1/255 no pixel survives the pixel shader's alpha test: drop the splat before the sort and the draw
++	if (opacity < 1.0 / 255.0)
++	{
++		WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
++		return;
++	}
++
+ 	// Transform to world space
+ 	float4 worldPos = mul(float4(localPos, 1.0), LocalToWorld);
+ 	float4 clipPos = mul(worldPos, WorldToClip);
+@@ -197,6 +205,20 @@
+ 	float3x3 cov3D_world = mul(transpose(localToWorldRot), mul(cov3D_local, localToWorldRot));
+ 	float3x3 viewMat = (float3x3)WorldToView;
+ 	float2x2 cov2D = CalcCovariance2D(cov3D_world, viewMat, viewPos.xyz, FocalLength);
++
++	if (Antialias != 0u)
++	{
++		// CalcCovariance2D dilates by 0.3 px. Antialiased assets expect the opacity scaled by
++		// sqrt(det(undilated) / det(dilated)), which fades sub-pixel splats instead of spreading them.
++		const float detDilated = cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[1][0];
++		const float detOriginal = (cov2D[0][0] - 0.3) * (cov2D[1][1] - 0.3) - cov2D[0][1] * cov2D[1][0];
++		opacity *= sqrt(max(detOriginal / max(detDilated, 1e-12), 0.0));
++		if (opacity < 1.0 / 255.0)
++		{
++			WriteInvalidSplat(outputIndex, selectedClusterID, selectedLODLevel);
++			return;
++		}
++	}
+ 
+ 	// Decompose to axes
+ 	float2 axis1, axis2;
+diff -ruN a/Plugins/NanoGS/Shaders/Private/GaussianSplatComposite.usf b/Plugins/NanoGS/Shaders/Private/GaussianSplatComposite.usf
+--- a/Plugins/NanoGS/Shaders/Private/GaussianSplatComposite.usf	2026-08-05 15:59:39
++++ b/Plugins/NanoGS/Shaders/Private/GaussianSplatComposite.usf	2026-09-29 15:03:36
+@@ -11,9 +11,22 @@
+ 
+ #include "/Engine/Public/Platform.ush"
+ 
++// 1: the splats were drawn at reduced resolution (gs.ScreenPercentage); upsample them with depth-matched taps
++#ifndef GS_UPSAMPLE
++#define GS_UPSAMPLE 0
++#endif
++
+ Texture2D IntermediateTexture;
+ SamplerState IntermediateSampler;
+ 
++// Reduced-resolution splats: the low-res depth they were tested against (nearest scene depth per low-res
++// pixel), full-resolution scene depth, and the mapping from view pixels to low-res pixels.
++Texture2D LowResDepthTexture;
++Texture2D SceneDepthTexture;
++float2 ViewRectMin;      // first pixel of the view in the full-resolution targets
++float2 FullToLowScale;   // low-res size / view size
++int2 LowResMax;          // last low-res pixel
++
+ // Attempt to invert UE's ACES filmic tone curve so that display-ready gaussian
+ // splat colors survive tone mapping unchanged.  Uses the Narkowicz ACES fit
+ // (same curve UE's default tone mapper approximates) and solves the quadratic
+@@ -51,12 +64,81 @@
+ 	return Output;
+ }
+ 
++// Reversed-Z device depths within 10% of each other: the same surface (relative view depth for a perspective view)
++bool SimilarDepth(float a, float b)
++{
++	return abs(a - b) <= 0.1 * max(max(a, b), 1e-7);
++}
++
++// Bilinear upsample of the low-res splat layer that ignores taps whose depth doesn't match this pixel's
++// scene depth. At an occluder's silhouette the low-res pixels touching the occluder were depth-tested against
++// the occluder (its depth is the nearest in their footprint), so background pixels skip them and occluder
++// pixels skip the background taps: no halo in either direction.
++float4 UpsampleSplats(int2 PixelPos)
++{
++	const float2 lowPos = (float2(PixelPos) + 0.5 - ViewRectMin) * FullToLowScale - 0.5;
++	const int2 base = int2(floor(lowPos));
++	const float2 f = lowPos - float2(base);
++	const float sceneDepth = SceneDepthTexture.Load(int3(PixelPos, 0)).r;
++
++	float4 sum = 0;
++	float weightSum = 0;
++	float4 nearest = 0;
++	float nearestError = 1e30;
++	[unroll]
++	for (int i = 0; i < 4; i++)
++	{
++		const int2 offset = int2(i & 1, i >> 1);
++		const int2 tap = clamp(base + offset, int2(0, 0), LowResMax);
++		const float tapDepth = LowResDepthTexture.Load(int3(tap, 0)).r;
++		const float4 tapColor = IntermediateTexture.Load(int3(tap, 0));
++		const float bilinear = (offset.x ? f.x : 1.0 - f.x) * (offset.y ? f.y : 1.0 - f.y);
++		const float error = abs(tapDepth - sceneDepth);
++		if (error < nearestError)
++		{
++			nearestError = error;
++			nearest = tapColor;
++		}
++		if (SimilarDepth(tapDepth, sceneDepth))
++		{
++			sum += bilinear * tapColor;
++			weightSum += bilinear;
++		}
++	}
++	// No tap on this pixel's surface (thin features): take the closest one in depth
++	return weightSum > 1e-4 ? sum / weightSum : nearest;
++}
++
++// Reduced-resolution depth for the splat pass: the nearest scene depth (reversed Z: the largest) over each
++// low-res pixel's footprint, so occluders hide splats wherever they cover part of a low-res pixel.
++float DownsampleDepthPS(FCompositeVSOutput Input) : SV_Depth
++{
++	const int2 lowPixel = int2(Input.Position.xy);
++	const float2 center = (float2(lowPixel) + 0.5) / FullToLowScale + ViewRectMin;   // footprint centre, full res
++	const float2 halfSize = 0.5 / FullToLowScale;
++	const int2 first = int2(floor(center - halfSize + 0.5));
++	const int2 last = int2(floor(center + halfSize - 0.5));
++	float nearest = 0;
++	for (int y = first.y; y <= last.y; y++)
++	{
++		for (int x = first.x; x <= last.x; x++)
++		{
++			nearest = max(nearest, SceneDepthTexture.Load(int3(x, y, 0)).r);
++		}
++	}
++	return nearest;
++}
++
+ float4 MainPS(FCompositeVSOutput Input) : SV_Target0
+ {
+ 	// Use SV_Position to load directly from intermediate RT (1:1 pixel mapping)
+ 	// This avoids UV scaling issues when ViewRect != full texture extent
+ 	int2 PixelPos = int2(Input.Position.xy);
++#if GS_UPSAMPLE
++	float4 srgbAccum = UpsampleSplats(PixelPos);
++#else
+ 	float4 srgbAccum = IntermediateTexture.Load(int3(PixelPos, 0));
++#endif
+ 
+ 	// Early out for fully transparent pixels (no splat contribution)
+ 	if (srgbAccum.a <= 0.0)
+diff -ruN a/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf b/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf
+--- a/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Shaders/Private/GaussianSplatRendering.usf	2026-09-29 14:55:21
+@@ -9,6 +9,22 @@
+ #include "/Engine/Public/Platform.ush"
+ #include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
+ 
++// 1: write splat-centre velocity to a second render target (temporal AA / motion blur). 0: colour only.
++#ifndef GS_WRITE_VELOCITY
++#define GS_WRITE_VELOCITY 1
++#endif
++
++// The pixel shader's falloff: alpha = opacity * (exp(-4 r^2) - e^-4) / (1 - e^-4), r = |LocalPos| (1 at the quad edge)
++#define SPLAT_EXP_NEG4 0.018315638888734
++
++// Quad size, as a fraction of the full 2*sqrt(2) sigma extent, beyond which the pixel shader's alpha is below
++// 1/255 for this opacity (and every pixel would be discarded): the smallest quad that draws the same pixels.
++float SplatQuadScale(float opacity)
++{
++	const float minWeight = SPLAT_EXP_NEG4 + (1.0 - SPLAT_EXP_NEG4) / (255.0 * max(opacity, 1e-6));
++	return sqrt(saturate(-0.25 * log(minWeight)));
++}
++
+ // Velocity encoding matching UE5's Common.ush EncodeVelocityToTexture
+ // Velocity is in NDC space [-2, 2] range, encoded to [0, 1] for texture
+ // Uses 0.499f to avoid using the full range so that (0,0) clear color is special
+@@ -91,7 +107,9 @@
+ 	float2 LocalPos : TEXCOORD0;
+ 	float4 Color : TEXCOORD1;
+ 	nointerpolation uint DebugFlag : TEXCOORD2;  // 0=normal, 1=debug mode (skip Gaussian)
++#if GS_WRITE_VELOCITY
+ 	nointerpolation float4 Velocity : TEXCOORD3; // Encoded velocity of the splat centre (same for the whole quad)
++#endif
+ };
+ 
+ void WriteDegenerate(inout FVertexOutput Output)
+@@ -99,14 +117,18 @@
+ 	Output.Position = float4(0, 0, 0, 1);
+ 	Output.LocalPos = float2(0, 0);
+ 	Output.Color = float4(0, 0, 0, 0);
++#if GS_WRITE_VELOCITY
+ 	Output.Velocity = float4(0, 0, 0, 0);
++#endif
+ }
+ 
+ // Pixel shader output with velocity for TAA/TSR
+ struct FPixelOutput
+ {
+ 	float4 Color : SV_Target0;
++#if GS_WRITE_VELOCITY
+ 	float4 Velocity : SV_Target1;
++#endif
+ };
+ 
+ // Vertex shader: generate quad from instance data
+@@ -182,20 +204,25 @@
+ 
+ 	Output.Color = color;
+ 
++	// Opacity-aware quad: shrink it to where the falloff can still reach 1/255 (same pixels, fewer fragments)
++	const float quadScale = (Output.DebugFlag == 0) ? SplatQuadScale(color.a) : 1.0;
++
+ 	// Final clip position
+ 	Output.Position = float4(
+-		(ndc + offset) * clipPos.w,
++		(ndc + offset * quadScale) * clipPos.w,
+ 		clipPos.z,
+ 		clipPos.w
+ 	);
+ 
+-	Output.LocalPos = corner;
++	Output.LocalPos = corner * quadScale;
+ 
++#if GS_WRITE_VELOCITY
+ 	// Velocity for TAA/TSR, from the splat centre: current NDC minus the previous frame's. Both matrices
+ 	// are un-jittered, so a static camera gives zero velocity.
+ 	float4 prevClipPos = mul(float4(viewData.TranslatedWorldPos + PrevTranslationDelta, 1.0), PrevTranslatedWorldToClip);
+ 	float3 velocity = float3(ndc - prevClipPos.xy / prevClipPos.w, clipPos.z / clipPos.w - prevClipPos.z / prevClipPos.w);
+ 	Output.Velocity = EncodeVelocityToTexture(velocity);
++#endif
+ 
+ 	return Output;
+ }
+@@ -206,8 +233,10 @@
+ 	FPixelOutput Output;
+ 	float4 color = Input.Color;
+ 
++#if GS_WRITE_VELOCITY
+ 	// Velocity was computed per splat in the vertex shader
+ 	Output.Velocity = Input.Velocity;
++#endif
+ 
+ 	// Debug mode: solid opaque colors without Gaussian falloff (Nanite-style)
+ 	if (Input.DebugFlag != 0)
+@@ -234,7 +263,8 @@
+ 		discard;
+ 	}
+ 
+-	static const float EXP4 = exp(-4.0);           // ≈ 0.0183
++	// Keep in sync with SplatQuadScale, which sizes the quad to where this weight times opacity reaches 1/255
++	static const float EXP4 = SPLAT_EXP_NEG4;          // exp(-4)
+ 	static const float INV_EXP4 = 1.0 / (1.0 - EXP4); // normalization factor
+ 	float gaussianWeight = (exp(-4.0 * distSq) - EXP4) * INV_EXP4;
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-09-29 14:55:48
+@@ -93,6 +93,7 @@
+ 		SOGMeanMin = FVector3f(Constants.meanMin[0], Constants.meanMin[1], Constants.meanMin[2]);
+ 		SOGMeanMax = FVector3f(Constants.meanMax[0], Constants.meanMax[1], Constants.meanMax[2]);
+ 		SHBands = Asset->SOGSHBands;
++		bSOGAntialias = Constants.antialias != 0;
+ 		bHasSOG = true;
+ 	}
+ 	else
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-09-29 15:05:07
+@@ -93,6 +93,51 @@
+ 	return Value;
+ }
+ 
++// Pipeline state for the splat draw. RT0 is the sRGB intermediate (premultiplied alpha, CW_RGBA so the
++// composite knows the accumulated alpha). With velocity: RT1 takes the splat-centre velocity (replace) and
++// the stencil gets STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA trusts history less on
++// splat pixels. Depth: DepthNearOrEqual test against the scene, with splat-centre writes (TSR disocclusion,
++// translucency occlusion) or read-only.
++static void SetSplatPipelineState(FRHICommandList& RHICmdList, const FGaussianSplatRasterMode& Mode,
++	FRHIVertexShader* VertexShaderRHI, FRHIPixelShader* PixelShaderRHI)
++{
++	FGraphicsPipelineStateInitializer GraphicsPSOInit;
++	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
++
++	if (!Mode.bHasDepth)
++	{
++		GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<false, CF_Always>::GetRHI();
++	}
++	else if (Mode.bWriteVelocity)
++	{
++		GraphicsPSOInit.DepthStencilState = Mode.bWriteDepth
++			? TStaticDepthStencilState<true, CF_DepthNearOrEqual,
++				true, CF_Always, SO_Keep, SO_Keep, SO_Replace, false, CF_Always, SO_Keep, SO_Keep, SO_Keep, 0x08, 0x08>::GetRHI()
++			: TStaticDepthStencilState<false, CF_DepthNearOrEqual,
++				true, CF_Always, SO_Keep, SO_Keep, SO_Replace, false, CF_Always, SO_Keep, SO_Keep, SO_Keep, 0x08, 0x08>::GetRHI();
++	}
++	else
++	{
++		GraphicsPSOInit.DepthStencilState = Mode.bWriteDepth
++			? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
++			: TStaticDepthStencilState<false, CF_DepthNearOrEqual>::GetRHI();
++	}
++
++	GraphicsPSOInit.BlendState = Mode.bWriteVelocity
++		? TStaticBlendState<
++			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,  // RT0: premultiplied over
++			CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero>::GetRHI()                     // RT1: velocity, replace
++		: TStaticBlendState<
++			CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha>::GetRHI();
++	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
++	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
++	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShaderRHI;
++	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShaderRHI;
++
++	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, Mode.bWriteVelocity ? 0x08 : 0);
++}
++
+ // CalcViewData reads either SOG records (GS_SOG) or NanoGS's packed splats + SH buffer; each permutation
+ // declares only its own buffers, so only those are bound.
+ static FGaussianSplatCalcViewDataCS::FPermutationDomain GetCalcViewDataPermutation(const FGaussianSplatGPUResources* GPUResources)
+@@ -114,11 +159,13 @@
+ 		Parameters.SOGFileToLocalRow2 = GPUResources->SOGFileToLocalRows[2];
+ 		Parameters.SOGMeanMin         = GPUResources->SOGMeanMin;
+ 		Parameters.SOGMeanMax         = GPUResources->SOGMeanMax;
++		Parameters.Antialias          = GPUResources->bSOGAntialias ? 1 : 0;
+ 	}
+ 	else
+ 	{
+ 		Parameters.PackedSplatBuffer = GPUResources->PackedSplatBufferSRV;
+ 		Parameters.SHBuffer          = GPUResources->SHBufferSRV;
++		Parameters.Antialias         = 0;
+ 	}
+ }
+ 
+@@ -547,8 +594,12 @@
+ 		return;
+ 	}
+ 
+-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	FGaussianSplatVS::FPermutationDomain VSPermutation;
++	VSPermutation.Set<FGaussianSplatWriteVelocityDim>(true);
++	FGaussianSplatPS::FPermutationDomain PSPermutation;
++	PSPermutation.Set<FGaussianSplatWriteVelocityDim>(true);
++	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
++	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
+ 
+ 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+ 	{
+@@ -879,7 +930,8 @@
+ 	bool bUseLODRendering,
+ 	uint32 GlobalBaseOffset,
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+-	const FGaussianSortKeyParams& SortKeys)
++	const FGaussianSortKeyParams& SortKeys,
++	FVector2f ResolutionScale)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataGlobal);
+ 
+@@ -947,13 +999,15 @@
+ 	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetWorldToView());
+ 	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
+ 
++	// Project for the splat target: the view rect, or the low-res target when drawing at reduced resolution
+ 	FIntRect ViewRect = ViewInfo.ViewRect;
+-	Parameters.ScreenSize = FVector2f(ViewRect.Width(), ViewRect.Height());
++	const FVector2f TargetSize = FVector2f(ViewRect.Width(), ViewRect.Height()) * ResolutionScale;
++	Parameters.ScreenSize = TargetSize;
+ 
+ 	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+ 	Parameters.FocalLength = FVector2f(
+-		ProjMatrix.M[0][0] * ViewRect.Width() * 0.5f,
+-		ProjMatrix.M[1][1] * ViewRect.Height() * 0.5f
++		ProjMatrix.M[0][0] * TargetSize.X * 0.5f,
++		ProjMatrix.M[1][1] * TargetSize.Y * 0.5f
+ 	);
+ 
+ 	Parameters.SplatCount = SplatCount;
+@@ -1133,7 +1187,8 @@
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+ 	FBufferRHIRef IndexBuffer,
+ 	int32 TotalSplatCount,
+-	int32 DebugMode)
++	int32 DebugMode,
++	const FGaussianSplatRasterMode& RasterMode)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobal);
+ 
+@@ -1142,8 +1197,12 @@
+ 		return;
+ 	}
+ 
+-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	FGaussianSplatVS::FPermutationDomain VSPermutation;
++	VSPermutation.Set<FGaussianSplatWriteVelocityDim>(RasterMode.bWriteVelocity);
++	FGaussianSplatPS::FPermutationDomain PSPermutation;
++	PSPermutation.Set<FGaussianSplatWriteVelocityDim>(RasterMode.bWriteVelocity);
++	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
++	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
+ 
+ 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+ 	{
+@@ -1153,37 +1212,10 @@
+ 	// GlobalViewDataBuffer was transitioned to SRVGraphics by the prepare pass
+ 	// (transitions cannot be issued inside a Metal render pass).
+ 
+-	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+-	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++	SetSplatPipelineState(RHICmdList, RasterMode, VertexShader.GetVertexShader(), PixelShader.GetPixelShader());
+ 
+-	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+-	// Enable depth writes for TSR/TAA - splats write depth at their center position
+-	// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
+-	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
+-	// reduces temporal history weight for splat pixels, preventing ghost trails
+-	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+-		true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
+-		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
+-		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
+-		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
+-	>::GetRHI();
+-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
+-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
+-	GraphicsPSOInit.BlendState = TStaticBlendState<
+-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
+-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+-	>::GetRHI();
+-	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+-	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+-	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+-	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
+-
+-	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+-
+ 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+-	FIntRect ViewRect = ViewInfo.ViewRect;
++	const FIntRect ViewRect = RasterMode.Viewport.IsEmpty() ? ViewInfo.ViewRect : RasterMode.Viewport;
+ 	RHICmdList.SetViewport(
+ 		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+ 		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
+@@ -1318,7 +1350,8 @@
+ 	int32 ProxyIndex,
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+ 	uint32 MaxRenderBudget,
+-	const FGaussianSortKeyParams& SortKeys)
++	const FGaussianSortKeyParams& SortKeys,
++	FVector2f ResolutionScale)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatCalcViewDataCompactedGlobal);
+ 
+@@ -1386,13 +1419,15 @@
+ 	Parameters.WorldToView     = FMatrix44f(View.ViewMatrices.GetWorldToView());
+ 	Parameters.CameraPosition  = FVector3f(View.ViewMatrices.GetViewOrigin());
+ 
++	// Project for the splat target: the view rect, or the low-res target when drawing at reduced resolution
+ 	FIntRect ViewRect = ViewInfo.ViewRect;
+-	Parameters.ScreenSize = FVector2f(ViewRect.Width(), ViewRect.Height());
++	const FVector2f TargetSize = FVector2f(ViewRect.Width(), ViewRect.Height()) * ResolutionScale;
++	Parameters.ScreenSize = TargetSize;
+ 
+ 	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
+ 	Parameters.FocalLength = FVector2f(
+-		ProjMatrix.M[0][0] * ViewRect.Width() * 0.5f,
+-		ProjMatrix.M[1][1] * ViewRect.Height() * 0.5f
++		ProjMatrix.M[0][0] * TargetSize.X * 0.5f,
++		ProjMatrix.M[1][1] * TargetSize.Y * 0.5f
+ 	);
+ 
+ 	Parameters.SplatCount    = SplatCount;
+@@ -1558,7 +1593,8 @@
+ 	const FSceneView& View,
+ 	FGaussianGlobalAccumulator* GlobalAccumulator,
+ 	FBufferRHIRef IndexBuffer,
+-	int32 DebugMode)
++	int32 DebugMode,
++	const FGaussianSplatRasterMode& RasterMode)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDrawGlobalIndirect);
+ 
+@@ -1567,8 +1603,12 @@
+ 		return;
+ 	}
+ 
+-	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	FGaussianSplatVS::FPermutationDomain VSPermutation;
++	VSPermutation.Set<FGaussianSplatWriteVelocityDim>(RasterMode.bWriteVelocity);
++	FGaussianSplatPS::FPermutationDomain PSPermutation;
++	PSPermutation.Set<FGaussianSplatWriteVelocityDim>(RasterMode.bWriteVelocity);
++	TShaderMapRef<FGaussianSplatVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), VSPermutation);
++	TShaderMapRef<FGaussianSplatPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
+ 
+ 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+ 	{
+@@ -1578,37 +1618,10 @@
+ 	// GlobalViewDataBuffer was transitioned to SRVGraphics by the prepare pass
+ 	// (transitions cannot be issued inside a Metal render pass).
+ 
+-	FGraphicsPipelineStateInitializer GraphicsPSOInit;
+-	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++	SetSplatPipelineState(RHICmdList, RasterMode, VertexShader.GetVertexShader(), PixelShader.GetPixelShader());
+ 
+-	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
+-	// Enable depth writes for TSR/TAA - splats write depth at their center position
+-	// Using DepthNearOrEqual allows splats at similar depths to all blend correctly
+-	// Stencil: write STENCIL_TEMPORAL_RESPONSIVE_AA_MASK (bit 3 = 0x08) so TSR/TAA
+-	// reduces temporal history weight for splat pixels, preventing ghost trails
+-	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<
+-		true, CF_DepthNearOrEqual,                       // Depth: write + near/equal test
+-		true, CF_Always, SO_Keep, SO_Keep, SO_Replace,   // Front stencil: replace on pass
+-		false, CF_Always, SO_Keep, SO_Keep, SO_Keep,     // Back stencil: no-op
+-		0x08, 0x08                                       // Read mask, Write mask = bit 3 only
+-	>::GetRHI();
+-	// Blend mode for MRT: RT0 (sRGB intermediate) with premultiplied alpha, RT1 (Velocity) with replacement
+-	// CW_RGBA on RT0 so accumulated alpha is tracked for the composite pass
+-	GraphicsPSOInit.BlendState = TStaticBlendState<
+-		// RT0: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+-		CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_One, BF_InverseSourceAlpha,
+-		// RT1: ColorWriteMask, ColorBlendOp, ColorSrcBlend, ColorDestBlend, AlphaBlendOp, AlphaSrcBlend, AlphaDestBlend
+-		CW_RGBA, BO_Add, BF_One, BF_Zero, BO_Add, BF_One, BF_Zero
+-	>::GetRHI();
+-	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
+-	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
+-	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
+-	GraphicsPSOInit.BoundShaderState.PixelShaderRHI  = PixelShader.GetPixelShader();
+-
+-	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0x08);
+-
+ 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
+-	FIntRect ViewRect = ViewInfo.ViewRect;
++	const FIntRect ViewRect = RasterMode.Viewport.IsEmpty() ? ViewInfo.ViewRect : RasterMode.Viewport;
+ 	RHICmdList.SetViewport(
+ 		ViewRect.Min.X, ViewRect.Min.Y, 0.0f,
+ 		ViewRect.Max.X, ViewRect.Max.Y, 1.0f
+@@ -1868,12 +1881,18 @@
+ void FGaussianSplatRenderer::CompositeToSceneColor(
+ 	FRHICommandListImmediate& RHICmdList,
+ 	const FSceneView& View,
+-	FTextureRHIRef IntermediateTexture)
++	FTextureRHIRef IntermediateTexture,
++	const FGaussianSplatLowRes& LowRes,
++	FRHITexture* LowResDepthTexture,
++	FRHITexture* SceneDepthTexture)
+ {
+ 	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatComposite);
+ 
+ 	TShaderMapRef<FGaussianSplatCompositeVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	const bool bUpsample = LowRes.bEnabled && LowResDepthTexture && SceneDepthTexture;
++	FGaussianSplatCompositePS::FPermutationDomain PSPermutation;
++	PSPermutation.Set<FGaussianSplatCompositePS::FUpsampleDim>(bUpsample);
++	TShaderMapRef<FGaussianSplatCompositePS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), PSPermutation);
+ 
+ 	if (!VertexShader.IsValid() || !PixelShader.IsValid())
+ 	{
+@@ -1909,9 +1928,56 @@
+ 	FGaussianSplatCompositePS::FParameters PSParameters;
+ 	PSParameters.IntermediateTexture = IntermediateTexture;
+ 	PSParameters.IntermediateSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++	if (bUpsample)
++	{
++		PSParameters.LowResDepthTexture = LowResDepthTexture;
++		PSParameters.SceneDepthTexture = SceneDepthTexture;
++		PSParameters.ViewRectMin = FVector2f(ViewRect.Min);
++		PSParameters.FullToLowScale = LowRes.FullToLowScale;
++		PSParameters.LowResMax = LowRes.Extent - FIntPoint(1, 1);
++	}
+ 	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
+ 
+ 	// Draw full-screen triangle (3 vertices, no index buffer)
++	RHICmdList.SetStreamSource(0, nullptr, 0);
++	RHICmdList.DrawPrimitive(0, 1, 1);
++}
++
++void FGaussianSplatRenderer::DownsampleDepth(
++	FRHICommandListImmediate& RHICmdList,
++	const FSceneView& View,
++	FRHITexture* SceneDepthTexture,
++	const FGaussianSplatLowRes& LowRes)
++{
++	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatDownsampleDepth);
++
++	TShaderMapRef<FGaussianSplatCompositeVS> VertexShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FGaussianSplatDownsampleDepthPS> PixelShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	if (!VertexShader.IsValid() || !PixelShader.IsValid() || !SceneDepthTexture)
++	{
++		return;
++	}
++
++	FGraphicsPipelineStateInitializer GraphicsPSOInit;
++	RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
++	GraphicsPSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
++	GraphicsPSOInit.DepthStencilState = TStaticDepthStencilState<true, CF_Always>::GetRHI();
++	GraphicsPSOInit.BlendState = TStaticBlendState<>::GetRHI();
++	GraphicsPSOInit.PrimitiveType = PT_TriangleList;
++	GraphicsPSOInit.BoundShaderState.VertexDeclarationRHI = GEmptyVertexDeclaration.VertexDeclarationRHI;
++	GraphicsPSOInit.BoundShaderState.VertexShaderRHI = VertexShader.GetVertexShader();
++	GraphicsPSOInit.BoundShaderState.PixelShaderRHI = PixelShader.GetPixelShader();
++	SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, 0);
++
++	RHICmdList.SetViewport(0.0f, 0.0f, 0.0f, float(LowRes.Extent.X), float(LowRes.Extent.Y), 1.0f);
++
++	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
++	FGaussianSplatDownsampleDepthPS::FParameters PSParameters;
++	PSParameters.SceneDepthTexture = SceneDepthTexture;
++	PSParameters.ViewRectMin = FVector2f(ViewInfo.ViewRect.Min);
++	PSParameters.FullToLowScale = LowRes.FullToLowScale;
++	SetShaderParameters(RHICmdList, PixelShader, PixelShader.GetPixelShader(), PSParameters);
++
+ 	RHICmdList.SetStreamSource(0, nullptr, 0);
+ 	RHICmdList.DrawPrimitive(0, 1, 1);
+ }
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-29 14:55:48
+@@ -52,6 +52,7 @@
+ 	LODSplatCount = SharedData->LODSplatCount;
+ 	bHasLODSplats = SharedData->bHasLODSplats;
+ 	bHasSOG = SharedData->bHasSOG;
++	bSOGAntialias = SharedData->bSOGAntialias;
+ 	for (int32 Row = 0; Row < 3; ++Row)
+ 	{
+ 		SOGFileToLocalRows[Row] = SharedData->SOGFileToLocalRows[Row];
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-09-29 15:04:13
+@@ -10,6 +10,7 @@
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatPS, "/Plugin/NanoGS/Private/GaussianSplatRendering.usf", "MainPS", SF_Pixel);
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositeVS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "MainVS", SF_Vertex);
+ IMPLEMENT_GLOBAL_SHADER(FGaussianSplatCompositePS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "MainPS", SF_Pixel);
++IMPLEMENT_GLOBAL_SHADER(FGaussianSplatDownsampleDepthPS, "/Plugin/NanoGS/Private/GaussianSplatComposite.usf", "DownsampleDepthPS", SF_Pixel);
+ IMPLEMENT_GLOBAL_SHADER(FRadixSortCountCS, "/Plugin/NanoGS/Private/RadixSort.usf", "CountCS", SF_Compute);
+ IMPLEMENT_GLOBAL_SHADER(FRadixSortPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort.usf", "PrefixSumCS", SF_Compute);
+ IMPLEMENT_GLOBAL_SHADER(FRadixSortDigitPrefixSumCS, "/Plugin/NanoGS/Private/RadixSort.usf", "DigitPrefixSumCS", SF_Compute);
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-09-29 15:20:25
+@@ -15,6 +15,8 @@
+ #include "RenderGraphUtils.h"
+ #include "RHIGPUReadback.h"
+ #include "SceneView.h"
++#include "SceneUtils.h"
++#include "SceneRendering.h"  // FViewInfo::ViewRect (the render resolution, after dynamic resolution)
+ #include "ScreenPass.h"
+ 
+ #define LOCTEXT_NAMESPACE "FNanoGSModule"
+@@ -30,9 +32,17 @@
+ // so that RDG inserts the proper RTV→SRV barrier between Pass 1 (write) and Pass 2 (read).
+ BEGIN_SHADER_PARAMETER_STRUCT(FGaussianCompositePassParameters, )
+ 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, IntermediateTexture)
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, LowResDepthTexture)   // reduced resolution only
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)    // reduced resolution only
+ 	RENDER_TARGET_BINDING_SLOTS()
+ END_SHADER_PARAMETER_STRUCT()
+ 
++// Reduced resolution: scene depth is read to build the low-res depth the splats test against
++BEGIN_SHADER_PARAMETER_STRUCT(FGaussianDownsampleDepthPassParameters, )
++	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
++	RENDER_TARGET_BINDING_SLOTS()
++END_SHADER_PARAMETER_STRUCT()
++
+ //----------------------------------------------------------------------
+ // Console Variables for Gaussian Splatting
+ //----------------------------------------------------------------------
+@@ -215,6 +225,129 @@
+ 	}
+ }
+ 
++/** Splat velocity: only temporal AA (TAA/TSR) and motion blur read it. */
++TAutoConsoleVariable<int32> CVarGSSplatVelocity(
++	TEXT("gs.SplatVelocity"),
++	-1,
++	TEXT("Gaussian splat velocity output (second render target + TSR/TAA responsive-AA stencil bit).\n")
++	TEXT(" -1: Auto - only when the view uses temporal AA or motion blur (default)\n")
++	TEXT("  0: Off\n")
++	TEXT("  1: On"),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
++/** Splat-centre depth writes: TSR disocclusion and translucency drawn after the splats test against them. */
++TAutoConsoleVariable<int32> CVarGSSplatDepthWrite(
++	TEXT("gs.SplatDepthWrite"),
++	1,
++	TEXT("Gaussian splat depth writes (splat-centre depth).\n")
++	TEXT(" -1: Auto - write depth only when splat velocity is written\n")
++	TEXT("  0: Off - read-only depth test against scene depth (translucency is no longer hidden by splats)\n")
++	TEXT("  1: On (default)"),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
++/** Splat render target resolution. Phones trade a little sharpness for far fewer blended fragments. */
++TAutoConsoleVariable<float> CVarGSScreenPercentage(
++	TEXT("gs.ScreenPercentage"),
++	100.0f,
++	TEXT("Resolution of the Gaussian splat render target, in percent of the view (25-100, default 100).\n")
++	TEXT("Below 100 the splats are drawn at reduced resolution, depth-tested against the nearest scene depth\n")
++	TEXT("per low-res pixel and upsampled with depth-matched taps, without depth writes. Applies only when\n")
++	TEXT("the splats write no velocity (gs.SplatVelocity; non-temporal anti-aliasing such as mobile FXAA)."),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
++static FGaussianSplatLowRes GetLowRes(const FSceneView& View, const FRDGTexture* DepthTexture, bool bWriteVelocity)
++{
++	// Temporal AA needs the full-resolution velocity target, so reduced resolution only applies without it
++	FGaussianSplatLowRes LowRes;
++	const float Percent = FMath::Clamp(CVarGSScreenPercentage.GetValueOnRenderThread(), 25.0f, 100.0f);
++	if (Percent >= 100.0f || bWriteVelocity || !DepthTexture || DepthTexture->Desc.NumSamples > 1)
++	{
++		return LowRes;
++	}
++	const FIntPoint ViewSize = static_cast<const FViewInfo&>(View).ViewRect.Size();
++	LowRes.Extent = FIntPoint(
++		FMath::Max(1, FMath::CeilToInt(ViewSize.X * Percent / 100.0f)),
++		FMath::Max(1, FMath::CeilToInt(ViewSize.Y * Percent / 100.0f)));
++	LowRes.FullToLowScale = FVector2f(float(LowRes.Extent.X) / ViewSize.X, float(LowRes.Extent.Y) / ViewSize.Y);
++	LowRes.bEnabled = true;
++	return LowRes;
++}
++
++static FGaussianSplatRasterMode GetRasterMode(const FSceneView& View, bool bHasVelocityTarget, bool bHasDepthTarget)
++{
++	static IConsoleVariable* CVarMotionBlurQuality = IConsoleManager::Get().FindConsoleVariable(TEXT("r.MotionBlurQuality"));
++	const bool bTemporalAA = IsTemporalAccumulationBasedMethod(View.AntiAliasingMethod);
++	const bool bMotionBlur = View.Family && View.Family->EngineShowFlags.MotionBlur
++		&& View.FinalPostProcessSettings.MotionBlurAmount > 0.0f
++		&& (!CVarMotionBlurQuality || CVarMotionBlurQuality->GetInt() > 0);
++
++	FGaussianSplatRasterMode Mode;
++	const int32 Velocity = CVarGSSplatVelocity.GetValueOnRenderThread();
++	Mode.bWriteVelocity = bHasVelocityTarget && (Velocity < 0 ? (bTemporalAA || bMotionBlur) : Velocity != 0);
++	const int32 DepthWrite = CVarGSSplatDepthWrite.GetValueOnRenderThread();
++	Mode.bHasDepth = bHasDepthTarget;
++	Mode.bWriteDepth = bHasDepthTarget && (DepthWrite < 0 ? Mode.bWriteVelocity : DepthWrite != 0);
++	return Mode;
++}
++
++/**
++ * Render budget: poll the visible-count readback and scale the LOD error threshold so the visible splats
++ * fit the budget. The splat count falls roughly with the square of the threshold, hence the square roots.
++ * Coarsens above 95% of the budget toward 90%, relaxes only below 70%, so it doesn't oscillate.
++ */
++static void UpdateBudgetLODScale(FGaussianGlobalAccumulator& Accumulator, uint32 Budget)
++{
++	if (Budget == 0)
++	{
++		Accumulator.BudgetLODScale = 1.0f;
++		return;
++	}
++	if (!Accumulator.bVisibleCountReadbackPending || !Accumulator.VisibleCountReadback->IsReady())
++	{
++		return;
++	}
++	const uint32 NumProxies = Accumulator.VisibleCountReadbackProxies;
++	const uint32* Counts = static_cast<const uint32*>(Accumulator.VisibleCountReadback->Lock(NumProxies * sizeof(uint32)));
++	uint64 Visible = 0;
++	for (uint32 Index = 0; Index < NumProxies; ++Index)
++	{
++		Visible += Counts[Index];
++	}
++	Accumulator.VisibleCountReadback->Unlock();
++	Accumulator.bVisibleCountReadbackPending = false;
++
++	const double Target = 0.9 * Budget;
++	double Scale = Accumulator.BudgetLODScale;
++	if (Visible > 0.95 * Budget)   // keep 5% headroom for camera motion
++	{
++		Scale *= FMath::Clamp(FMath::Sqrt(double(Visible) / Target), 1.05, 2.0);
++	}
++	else if (Visible < 0.7 * Budget && Scale > 1.0)
++	{
++		Scale *= FMath::Clamp(FMath::Sqrt(double(Visible) / Target), 0.8, 0.98);
++	}
++	Accumulator.BudgetLODScale = float(FMath::Clamp(Scale, 1.0, 64.0));
++}
++
++/** After the visible-count prefix sum: copy the per-proxy (uncapped) counts for UpdateBudgetLODScale. */
++static void EnqueueVisibleCountReadback(FRHICommandListImmediate& RHICmdList, FGaussianGlobalAccumulator* Accumulator, uint32 NumProxies)
++{
++	if (Accumulator->bVisibleCountReadbackPending || NumProxies == 0 || !Accumulator->GlobalVisibleCountArrayBuffer.IsValid())
++	{
++		return;
++	}
++	if (!Accumulator->VisibleCountReadback.IsValid())
++	{
++		Accumulator->VisibleCountReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("NanoGSVisibleCounts"));
++	}
++	// DispatchPrefixSumVisibleCounts leaves the counts in SRVCompute
++	RHICmdList.Transition(FRHITransitionInfo(Accumulator->GlobalVisibleCountArrayBuffer, ERHIAccess::SRVCompute, ERHIAccess::CopySrc));
++	Accumulator->VisibleCountReadback->EnqueueCopy(RHICmdList, Accumulator->GlobalVisibleCountArrayBuffer, NumProxies * sizeof(uint32));
++	RHICmdList.Transition(FRHITransitionInfo(Accumulator->GlobalVisibleCountArrayBuffer, ERHIAccess::CopySrc, ERHIAccess::SRVCompute));
++	Accumulator->VisibleCountReadbackProxies = NumProxies;
++	Accumulator->bVisibleCountReadbackPending = true;
++}
++
+ static FGaussianSortKeyParams GetSortKeyParams(const FSceneView& View)
+ {
+ 	FGaussianSortKeyParams SortKeys;
+@@ -323,34 +456,78 @@
+ 
+ 	int32 DebugMode = CVarShowClusterBounds.GetValueOnRenderThread();
+ 
++	// Velocity, stencil and depth outputs for this view (gs.SplatVelocity, gs.SplatDepthWrite), and the
++	// reduced-resolution splat target (gs.ScreenPercentage), which only applies without velocity
++	FGaussianSplatRasterMode RasterMode = GetRasterMode(*SceneView, VelocityTexture != nullptr, DepthTexture != nullptr);
++	const FGaussianSplatLowRes LowRes = GetLowRes(*SceneView, DepthTexture, RasterMode.bWriteVelocity);
++
+ 	// Create intermediate render target for sRGB-space alpha blending.
+ 	// Gaussian splatting trains in sRGB space, so blending must happen in sRGB space
+ 	// to produce correct colors. After compositing, we convert sRGB→linear for SceneColor.
+ 	FRDGTextureDesc IntermediateDesc = FRDGTextureDesc::Create2D(
+-		ColorTexture->Desc.Extent,
++		LowRes.bEnabled ? LowRes.Extent : ColorTexture->Desc.Extent,
+ 		PF_FloatRGBA,  // Need alpha channel for accumulation tracking
+ 		FClearValueBinding(FLinearColor::Transparent),
+ 		TexCreate_RenderTargetable | TexCreate_ShaderResource);
+ 	FRDGTexture* IntermediateTexture = GraphBuilder.CreateTexture(IntermediateDesc, TEXT("GaussianSplatIntermediateRT"));
+ 
+ 	// Pass 1: Render splats to intermediate RT (sRGB blending)
++
+ 	FRenderTargetParameters* Pass1Parameters = GraphBuilder.AllocParameters<FRenderTargetParameters>();
+ 	Pass1Parameters->RenderTargets[0] = FRenderTargetBinding(IntermediateTexture, ERenderTargetLoadAction::EClear);
+-	// Bind velocity texture for TAA/TSR motion vector output
+-	if (VelocityTexture)
++	FRDGTexture* LowResDepthTexture = nullptr;
++	if (LowRes.bEnabled)
+ 	{
+-		Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
++		// The splats test against the nearest scene depth per low-res pixel; the full-resolution velocity
++		// and depth targets can't be bound next to the low-res colour target.
++		const FRDGTextureDesc LowResDepthDesc = FRDGTextureDesc::Create2D(
++			LowRes.Extent, PF_DepthStencil, FClearValueBinding::DepthFar,
++			TexCreate_DepthStencilTargetable | TexCreate_ShaderResource);
++		LowResDepthTexture = GraphBuilder.CreateTexture(LowResDepthDesc, TEXT("GaussianSplatLowResDepth"));
++
++		FGaussianDownsampleDepthPassParameters* DownsampleParameters = GraphBuilder.AllocParameters<FGaussianDownsampleDepthPassParameters>();
++		DownsampleParameters->SceneDepthTexture = DepthTexture;
++		DownsampleParameters->RenderTargets.DepthStencil = FDepthStencilBinding(
++			LowResDepthTexture, ERenderTargetLoadAction::ENoAction, ERenderTargetLoadAction::ENoAction,
++			FExclusiveDepthStencil::DepthWrite_StencilNop);
++		{
++			RDG_EVENT_SCOPE_STAT(GraphBuilder, NanoGSDraw, "NanoGSDraw");
++			GraphBuilder.AddPass(
++				RDG_EVENT_NAME("GaussianSplat_DownsampleDepth"),
++				DownsampleParameters,
++				ERDGPassFlags::Raster,
++				[SceneView, DepthTexture, LowRes](FRHICommandListImmediate& RHICmdList)
++				{
++					FGaussianSplatRenderer::DownsampleDepth(RHICmdList, *SceneView, DepthTexture->GetRHI(), LowRes);
++				});
++		}
++
++		RasterMode.bWriteVelocity = false;
++		RasterMode.bWriteDepth = false;
++		RasterMode.bHasDepth = true;
++		RasterMode.Viewport = FIntRect(FIntPoint::ZeroValue, LowRes.Extent);
++		Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
++			LowResDepthTexture, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ENoAction,
++			FExclusiveDepthStencil::DepthRead_StencilNop);
+ 	}
+-	if (DepthTexture)
++	else
+ 	{
+-		// Enable depth writes so TSR/TAA can properly detect disocclusion
+-		// Splats will write their center depth for each rendered pixel
+-		Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
+-			DepthTexture,
+-			ERenderTargetLoadAction::ELoad,
+-			ERenderTargetLoadAction::ELoad,
+-			FExclusiveDepthStencil::DepthWrite_StencilWrite
+-		);
++		// Velocity texture for TAA/TSR motion vector output
++		if (RasterMode.bWriteVelocity)
++		{
++			Pass1Parameters->RenderTargets[1] = FRenderTargetBinding(VelocityTexture, ERenderTargetLoadAction::ELoad);
++		}
++		if (DepthTexture)
++		{
++			// Depth test against the scene; with depth writes, splats write their centre depth for every pixel
++			// (TSR/TAA disocclusion, and translucency drawn later is hidden behind them)
++			Pass1Parameters->RenderTargets.DepthStencil = FDepthStencilBinding(
++				DepthTexture,
++				ERenderTargetLoadAction::ELoad,
++				ERenderTargetLoadAction::ELoad,
++				RasterMode.DepthStencilAccess()
++			);
++		}
+ 	}
+ 
+ 	if (!GlobalAccumulator.IsValid())
+@@ -422,16 +599,35 @@
+ 		int32 CurrentDebugMode = DebugMode;
+ 		int32 CurrentDebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();
+ 
++		// Resolution the view data is projected for (reduced resolution changes the splat footprints)
++		const FVector2f ResolutionScale = LowRes.FullToLowScale;
++
++		// Read render budget for global accumulator buffer cap.
++		// Disable budget when forcing LOD level — the debug command needs to show
++		// all assets regardless of splat count (user expects to see quality vs performance).
++		int32 BudgetVal = CVarMaxRenderBudget.GetValueOnRenderThread();
++		uint32 MaxRenderBudget = (BudgetVal > 0) ? (uint32)BudgetVal : 0;
++		if (CurrentDebugForceLODLevel >= 0)
++		{
++			MaxRenderBudget = 0;  // Unlimited — debug mode overrides budget
++		}
++
++		// Budget: coarsen every proxy's LOD until the visible splats fit (the cap below only catches transients)
++		UpdateBudgetLODScale(*GlobalAccumulator, MaxRenderBudget);
++		const float BudgetLODScale = GlobalAccumulator->BudgetLODScale;
++
+ 		bool bCanSkip = GlobalAccumulator->bHasCachedSortData &&
+ 			GlobalAccumulator->CachedTotalSplatCount == TotalSplatCount &&
+-			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f);
++			GlobalAccumulator->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f) &&
++			GlobalAccumulator->CachedResolutionScale == ResolutionScale &&
++			GlobalAccumulator->CachedMaxRenderBudget == MaxRenderBudget;
+ 
+ 		if (bCanSkip)
+ 		{
+ 			for (const FProxyRenderInfo& Info : VisibleProxies)
+ 			{
+ 				FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+-				float ProxyErrorThreshold = FMath::Max(0.1f, Info.Proxy->GetLODErrorThreshold());
++				const float ProxyErrorThreshold = Info.Proxy->GetLODErrorThreshold() * BudgetLODScale;
+ 				if (!GPUResources->bHasCachedSortData ||
+ 					!GPUResources->CachedViewProjectionMatrix.Equals(CurrentVP, 0.0f) ||
+ 					!GPUResources->CachedLocalToWorld.Equals(Info.LocalToWorld, 0.0f) ||
+@@ -460,16 +656,6 @@
+ 		// Depth-sort key encoding for this view (gs.SortKeyBits)
+ 		const FGaussianSortKeyParams SortKeys = GetSortKeyParams(*SceneView);
+ 
+-		// Read render budget for global accumulator buffer cap.
+-		// Disable budget when forcing LOD level — the debug command needs to show
+-		// all assets regardless of splat count (user expects to see quality vs performance).
+-		int32 BudgetVal = CVarMaxRenderBudget.GetValueOnRenderThread();
+-		uint32 MaxRenderBudget = (BudgetVal > 0) ? (uint32)BudgetVal : 0;
+-		if (CurrentDebugForceLODLevel >= 0)
+-		{
+-			MaxRenderBudget = 0;  // Unlimited — debug mode overrides budget
+-		}
+-
+ 		// State shared between the prepare (compute) and draw (raster) passes below.
+ 		// Proxy validation happens at pass-execution time (proxies can be destroyed
+ 		// between RDG setup and execution), and both passes must agree on the result.
+@@ -492,7 +678,7 @@
+ 			ERDGPassFlags::None,
+ 			[SceneView, VisibleProxies, TotalSplatCount, bCanSkip, RawAccumulator,
+ 			 CurrentVP, CurrentDebugMode,
+-			 CurrentDebugForceLODLevel, MaxRenderBudget, SortKeys, PassState](FRHICommandListImmediate& RHICmdList)
++			 CurrentDebugForceLODLevel, MaxRenderBudget, BudgetLODScale, SortKeys, ResolutionScale, PassState](FRHICommandListImmediate& RHICmdList)
+ 			{
+ 				if (!SceneView) return;
+ 				SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatPrepare_Global);
+@@ -605,7 +791,7 @@
+ 								// Cluster culling → fills ClusterVisibilityBitmap
+ 								FGaussianSplatRenderer::DispatchClusterCulling(
+ 									RHICmdList, *SceneView, GPUResources,
+-									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
++									Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold() * BudgetLODScale, Info.bUseLODRendering);
+ 
+ 								// Compact → fills CompactedSplatIndices + VisibleSplatCountBuffer
+ 								FGaussianSplatRenderer::DispatchCompactSplats(
+@@ -634,6 +820,10 @@
+ 							// Single 1-thread dispatch: computes prefix sums + writes all indirect args
+ 							FGaussianSplatRenderer::DispatchPrefixSumVisibleCounts(
+ 								RHICmdList, RawAccumulator, NumProcessedProxies, MaxRenderBudget);
++							if (MaxRenderBudget > 0)
++							{
++								EnqueueVisibleCountReadback(RHICmdList, RawAccumulator, uint32(NumProcessedProxies));
++							}
+ 
+ 							// --------------------------------------------------
+ 							// Phase 2: Per-proxy CalcViewData → global buffer
+@@ -659,7 +849,8 @@
+ 									i,
+ 									RawAccumulator,
+ 									MaxRenderBudget,
+-									SortKeys);
++									SortKeys,
++									ResolutionScale);
+ 							}
+ 						}
+ 
+@@ -680,6 +871,8 @@
+ 						RawAccumulator->bHasCachedSortData = true;
+ 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
+ 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
++						RawAccumulator->CachedResolutionScale = ResolutionScale;
++						RawAccumulator->CachedMaxRenderBudget = MaxRenderBudget;
+ 
+ 						for (int32 i = 0; i < ValidProxies.Num(); i++)
+ 						{
+@@ -693,7 +886,7 @@
+ 								GPUResources->CachedLocalToWorld = Info.LocalToWorld;
+ 								GPUResources->CachedOpacityScale = Info.Proxy->GetOpacityScale();
+ 								GPUResources->CachedSplatScale = Info.Proxy->GetSplatScale();
+-								GPUResources->CachedErrorThreshold = FMath::Max(0.1f, Info.Proxy->GetLODErrorThreshold());
++								GPUResources->CachedErrorThreshold = Info.Proxy->GetLODErrorThreshold() * BudgetLODScale;
+ 								GPUResources->CachedDebugMode = CurrentDebugMode;
+ 								GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
+ 								GPUResources->bHasCachedSortData = true;
+@@ -748,7 +941,7 @@
+ 								{
+ 									FGaussianSplatRenderer::DispatchClusterCulling(
+ 										RHICmdList, *SceneView, GPUResources,
+-										Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold(), Info.bUseLODRendering);
++										Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold() * BudgetLODScale, Info.bUseLODRendering);
+ 								}
+ 
+ 								// CalcViewData → writes to GlobalViewDataBuffer at GlobalBaseOffset.
+@@ -771,7 +964,8 @@
+ 									Info.bUseLODRendering,
+ 									Info.GlobalBaseOffset,
+ 									RawAccumulator,
+-									SortKeys);
++									SortKeys,
++									ResolutionScale);
+ 							}
+ 						}
+ 
+@@ -791,6 +985,8 @@
+ 						RawAccumulator->bHasCachedSortData = true;
+ 						RawAccumulator->CachedTotalSplatCount = NewTotalSplatCount;
+ 						RawAccumulator->CachedViewProjectionMatrix = CurrentVP;
++						RawAccumulator->CachedResolutionScale = ResolutionScale;
++						RawAccumulator->CachedMaxRenderBudget = MaxRenderBudget;
+ 
+ 						for (const auto& Info : ValidProxies)
+ 						{
+@@ -801,7 +997,7 @@
+ 							GPUResources->CachedOpacityScale = Info.Proxy->GetOpacityScale();
+ 							GPUResources->CachedSplatScale = Info.Proxy->GetSplatScale();
+ 
+-							GPUResources->CachedErrorThreshold = FMath::Max(0.1f, Info.Proxy->GetLODErrorThreshold());
++							GPUResources->CachedErrorThreshold = Info.Proxy->GetLODErrorThreshold() * BudgetLODScale;
+ 							GPUResources->CachedDebugMode = CurrentDebugMode;
+ 							GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
+ 							GPUResources->bHasCachedSortData = true;
+@@ -827,7 +1023,7 @@
+ 				RDG_EVENT_NAME("GaussianSplat_RenderToIntermediate"),
+ 				Pass1Parameters,
+ 				ERDGPassFlags::Raster,
+-				[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, PassState](FRHICommandListImmediate& RHICmdList)
++				[SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, RasterMode, PassState](FRHICommandListImmediate& RHICmdList)
+ 				{
+ 					if (!SceneView) return;
+ 					if (PassState->ValidProxies.Num() == 0 || PassState->NewTotalSplatCount == 0)
+@@ -840,14 +1036,14 @@
+ 					{
+ 						// Single draw call — instance count from GlobalDrawIndirectArgsBuffer
+ 						FGaussianSplatRenderer::DrawSplatsGlobalIndirect(
+-							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode);
++							RHICmdList, *SceneView, RawAccumulator, SharedIndexBuffer, DebugMode, RasterMode);
+ 					}
+ 					else
+ 					{
+ 						// Single draw call for ALL proxies (capped to render budget)
+ 						FGaussianSplatRenderer::DrawSplatsGlobal(
+ 							RHICmdList, *SceneView, RawAccumulator,
+-							SharedIndexBuffer, (int32)PassState->DrawSplatCount, DebugMode);
++							SharedIndexBuffer, (int32)PassState->DrawSplatCount, DebugMode, RasterMode);
+ 					}
+ 				}
+ 			);
+@@ -862,6 +1058,11 @@
+ 		ERenderTargetLoadAction CompositeColorLoadAction = (DebugMode > 0) ? ERenderTargetLoadAction::EClear : ERenderTargetLoadAction::ELoad;
+ 		FGaussianCompositePassParameters* Pass2Parameters = GraphBuilder.AllocParameters<FGaussianCompositePassParameters>();
+ 		Pass2Parameters->IntermediateTexture = IntermediateTexture;
++		if (LowRes.bEnabled)
++		{
++			Pass2Parameters->LowResDepthTexture = LowResDepthTexture;
++			Pass2Parameters->SceneDepthTexture = DepthTexture;
++		}
+ 		Pass2Parameters->RenderTargets[0] = FRenderTargetBinding(ColorTexture, CompositeColorLoadAction);
+ 
+ 		{
+@@ -870,7 +1071,7 @@
+ 				RDG_EVENT_NAME("GaussianSplat_CompositeToSceneColor"),
+ 				Pass2Parameters,
+ 				ERDGPassFlags::Raster,
+-				[SceneView, IntermediateTexture](FRHICommandListImmediate& RHICmdList)
++				[SceneView, IntermediateTexture, LowRes, LowResDepthTexture, DepthTexture](FRHICommandListImmediate& RHICmdList)
+ 				{
+ 					if (!SceneView) return;
+ 
+@@ -878,7 +1079,9 @@
+ 					if (!IntermediateRHI) return;
+ 
+ 					FGaussianSplatRenderer::CompositeToSceneColor(
+-						RHICmdList, *SceneView, IntermediateRHI);
++						RHICmdList, *SceneView, IntermediateRHI, LowRes,
++						LowResDepthTexture ? LowResDepthTexture->GetRHI() : nullptr,
++						LowRes.bEnabled && DepthTexture ? DepthTexture->GetRHI() : nullptr);
+ 				}
+ 			);
+ 		}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-09-29 15:20:25
+@@ -5,6 +5,7 @@
+ #include "CoreMinimal.h"
+ #include "RHI.h"
+ #include "RHIResources.h"
++#include "RHIGPUReadback.h"
+ 
+ /**
+  * Global GPU buffer accumulator for one-draw-call Gaussian splatting.
+@@ -101,6 +102,18 @@
+ 	bool bHasCachedSortData = false;
+ 	uint32 CachedTotalSplatCount = 0;
+ 	FMatrix CachedViewProjectionMatrix = FMatrix::Identity;
++	FVector2f CachedResolutionScale = FVector2f(1.0f, 1.0f);  ///< splat target / view size the view data was computed for
++	uint32 CachedMaxRenderBudget = 0;                         ///< gs.MaxRenderBudget the sort was computed with
++
++	//----------------------------------------------------------------------
++	// Render budget (gs.MaxRenderBudget): instead of truncating the compacted splat list, which drops whole
++	// regions in cluster order, the LOD error threshold is scaled until the visible count fits the budget.
++	//----------------------------------------------------------------------
++
++	float BudgetLODScale = 1.0f;                                  ///< multiplies every proxy's LOD error threshold
++	TUniquePtr<FRHIGPUBufferReadback> VisibleCountReadback;         ///< per-proxy visible counts (before the budget cap)
++	uint32 VisibleCountReadbackProxies = 0;
++	bool bVisibleCountReadbackPending = false;
+ 
+ 	//----------------------------------------------------------------------
+ 	// Previous frame data for velocity calculation (per-view)
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-09-29 14:55:48
+@@ -79,6 +79,8 @@
+ 
+ 	/** True when the asset renders from its SOG payload (GPU decode in CalcViewData). */
+ 	bool bHasSOG = false;
++	/** SOG asset trained with antialiasing (meta.json "antialias"): CalcViewData compensates opacity. */
++	bool bSOGAntialias = false;
+ 	/** SOG file -> local transform as three rows (xyz = 3x3, w = translation), and the log-domain position range. */
+ 	FVector4f SOGFileToLocalRows[3] = { FVector4f::Zero(), FVector4f::Zero(), FVector4f::Zero() };
+ 	FVector3f SOGMeanMin = FVector3f::ZeroVector;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-09-29 15:04:43
+@@ -25,6 +25,37 @@
+ };
+ 
+ /**
++ * Reduced-resolution splat target (gs.ScreenPercentage < 100): splats are drawn into Extent, depth-tested
++ * against the nearest scene depth per low-res pixel, and upsampled in the composite with depth-matched taps.
++ */
++struct FGaussianSplatLowRes
++{
++	bool bEnabled = false;
++	FIntPoint Extent = FIntPoint::ZeroValue;           // low-res target size
++	FVector2f FullToLowScale = FVector2f(1.0f, 1.0f);   // Extent / view size, per axis
++};
++
++/**
++ * Outputs of the splat draw for one view (gs.SplatVelocity, gs.SplatDepthWrite). Velocity and the TSR/TAA
++ * responsive-AA stencil bit only matter to temporal AA and motion blur; without them the draw blends into
++ * one render target, which matters most on tile-based GPUs.
++ */
++struct FGaussianSplatRasterMode
++{
++	bool bWriteVelocity = true;  // second render target (velocity) + responsive-AA stencil bit
++	bool bWriteDepth = true;     // splat-centre depth writes; false = read-only depth test against the scene
++	bool bHasDepth = true;       // a scene depth target is bound
++	FIntRect Viewport;           // where to draw; empty = the view rect (reduced resolution: the low-res target)
++
++	FExclusiveDepthStencil DepthStencilAccess() const
++	{
++		return bWriteDepth
++			? (bWriteVelocity ? FExclusiveDepthStencil::DepthWrite_StencilWrite : FExclusiveDepthStencil::DepthWrite_StencilNop)
++			: (bWriteVelocity ? FExclusiveDepthStencil::DepthRead_StencilWrite : FExclusiveDepthStencil::DepthRead_StencilNop);
++	}
++};
++
++/**
+  * Handles the rendering of Gaussian Splats
+  * Orchestrates compute passes for view calculation, sorting, and final rendering
+  */
+@@ -160,7 +191,8 @@
+ 		bool bUseLODRendering,
+ 		uint32 GlobalBaseOffset,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+-		const FGaussianSortKeyParams& SortKeys
++		const FGaussianSortKeyParams& SortKeys,
++		FVector2f ResolutionScale = FVector2f(1.0f, 1.0f)  // splat target size / view size
+ 	);
+ 
+ 	/**
+@@ -183,7 +215,8 @@
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+ 		FBufferRHIRef IndexBuffer,
+ 		int32 TotalSplatCount,
+-		int32 DebugMode
++		int32 DebugMode,
++		const FGaussianSplatRasterMode& RasterMode
+ 	);
+ 
+ 	//----------------------------------------------------------------------
+@@ -235,7 +268,8 @@
+ 		int32 ProxyIndex,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+ 		uint32 MaxRenderBudget,
+-		const FGaussianSortKeyParams& SortKeys
++		const FGaussianSortKeyParams& SortKeys,
++		FVector2f ResolutionScale = FVector2f(1.0f, 1.0f)  // splat target size / view size
+ 	);
+ 
+ 	/**
+@@ -257,7 +291,8 @@
+ 		const FSceneView& View,
+ 		FGaussianGlobalAccumulator* GlobalAccumulator,
+ 		FBufferRHIRef IndexBuffer,
+-		int32 DebugMode
++		int32 DebugMode,
++		const FGaussianSplatRasterMode& RasterMode
+ 	);
+ 
+ 	/**
+@@ -269,7 +304,18 @@
+ 	static void CompositeToSceneColor(
+ 		FRHICommandListImmediate& RHICmdList,
+ 		const FSceneView& View,
+-		FTextureRHIRef IntermediateTexture
++		FTextureRHIRef IntermediateTexture,
++		const FGaussianSplatLowRes& LowRes = FGaussianSplatLowRes(),
++		FRHITexture* LowResDepthTexture = nullptr,
++		FRHITexture* SceneDepthTexture = nullptr
++	);
++
++	/** Reduced resolution: write the nearest scene depth per low-res pixel into the bound depth target */
++	static void DownsampleDepth(
++		FRHICommandListImmediate& RHICmdList,
++		const FSceneView& View,
++		FRHITexture* SceneDepthTexture,
++		const FGaussianSplatLowRes& LowRes
+ 	);
+ 
+ private:
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-09-29 14:55:48
+@@ -73,6 +73,8 @@
+ 
+ 	/** True when CalcViewData decodes SOG records for this asset */
+ 	bool bHasSOG = false;
++	/** SOG asset trained with antialiasing: Mip-Splatting opacity compensation */
++	bool bSOGAntialias = false;
+ 	/** SOG file -> local transform rows (xyz = 3x3, w = translation) and log-domain position range */
+ 	FVector4f SOGFileToLocalRows[3] = { FVector4f::Zero(), FVector4f::Zero(), FVector4f::Zero() };
+ 	FVector3f SOGMeanMin = FVector3f::ZeroVector;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-09-29 15:31:17
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-09-29 15:04:13
+@@ -76,6 +76,7 @@
+ 		SHADER_PARAMETER(uint32, NumSHCoeffs)      // Coefficients to evaluate (based on SHOrder: 4, 9, or 16)
+ 		SHADER_PARAMETER(uint32, SHBufferCoeffs)   // Coefficients actually stored per splat in SHBuffer (based on asset SHBands)
+ 		SHADER_PARAMETER(uint32, UseSHRendering)   // 1 = use view-dependent SH evaluation
++		SHADER_PARAMETER(uint32, Antialias)        // 1 = Mip-Splatting opacity compensation (SOG "antialias" assets)
+ 		SHADER_PARAMETER(float, OpacityScale)
+ 		SHADER_PARAMETER(float, SplatScale)
+ 		SHADER_PARAMETER(uint32, GlobalBaseOffset)  // Offset into global ViewDataBuffer (non-compaction global path)
+@@ -172,6 +173,9 @@
+ 	}
+ };
+ 
++/** Splat draw writes the splat-centre velocity to a second render target (temporal AA, motion blur). */
++class FGaussianSplatWriteVelocityDim : SHADER_PERMUTATION_BOOL("GS_WRITE_VELOCITY");
++
+ /**
+  * Vertex shader for rendering Gaussian splats as quads
+  */
+@@ -180,6 +184,8 @@
+ 	DECLARE_GLOBAL_SHADER(FGaussianSplatVS);
+ 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatVS, FGlobalShader);
+ 
++	using FPermutationDomain = TShaderPermutationDomain<FGaussianSplatWriteVelocityDim>;
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianSplatViewData>, ViewDataBuffer)
+ 		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, SortKeysBuffer)
+@@ -207,6 +213,8 @@
+ 	DECLARE_GLOBAL_SHADER(FGaussianSplatPS);
+ 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatPS, FGlobalShader);
+ 
++	using FPermutationDomain = TShaderPermutationDomain<FGaussianSplatWriteVelocityDim>;
++
+ 	// Velocity is computed per splat in the vertex shader
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 	END_SHADER_PARAMETER_STRUCT()
+@@ -244,9 +252,40 @@
+ 	DECLARE_GLOBAL_SHADER(FGaussianSplatCompositePS);
+ 	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatCompositePS, FGlobalShader);
+ 
++	/** Splats were drawn at reduced resolution (gs.ScreenPercentage): depth-matched upsample */
++	class FUpsampleDim : SHADER_PERMUTATION_BOOL("GS_UPSAMPLE");
++	using FPermutationDomain = TShaderPermutationDomain<FUpsampleDim>;
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_TEXTURE(Texture2D, IntermediateTexture)
+ 		SHADER_PARAMETER_SAMPLER(SamplerState, IntermediateSampler)
++		// Upsample permutation
++		SHADER_PARAMETER_TEXTURE(Texture2D, LowResDepthTexture)
++		SHADER_PARAMETER_TEXTURE(Texture2D, SceneDepthTexture)
++		SHADER_PARAMETER(FVector2f, ViewRectMin)
++		SHADER_PARAMETER(FVector2f, FullToLowScale)
++		SHADER_PARAMETER(FIntPoint, LowResMax)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
++	}
++};
++
++/**
++ * Reduced-resolution splats: nearest scene depth over each low-res pixel, written as the depth the splat
++ * pass tests against (GaussianSplatComposite.usf, DownsampleDepthPS; full-screen triangle from the composite VS)
++ */
++class FGaussianSplatDownsampleDepthPS : public FGlobalShader
++{
++	DECLARE_GLOBAL_SHADER(FGaussianSplatDownsampleDepthPS);
++	SHADER_USE_PARAMETER_STRUCT(FGaussianSplatDownsampleDepthPS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_TEXTURE(Texture2D, SceneDepthTexture)
++		SHADER_PARAMETER(FVector2f, ViewRectMin)
++		SHADER_PARAMETER(FVector2f, FullToLowScale)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)

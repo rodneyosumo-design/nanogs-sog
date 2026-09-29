@@ -36,6 +36,8 @@ execution (everything else). Nothing is saved except the temporary assets under
 
    `profile` sways the camera (NanoGS skips view data and sort while the camera is still), runs
    `ProfileGPU` N times (default 7) and prints median inclusive times of the `NanoGS*` GPU stats.
+   In a real level, pass `-` as the actor and set `SWAY_AT="x,y,z,pitch,yaw"`; the `SHUCampusLevel` quad view
+   is `2541,-2611,872,-4,132` (open the editor on `/Game/Levels/SHUCampusLevel`).
    On Metal the whole prepare pass is one compute encoder, so its time lands on `NanoGSViewData`
    (culling, compaction, view data and sort) and `NanoGSSort` reads 0.
 

@@ -7,7 +7,9 @@
   ab.py profile LABEL ACTOR [cvar=value ...]          median NanoGS GPU times over N ProfileGPU frames (camera sways)
 
 Needs the editor's MCP server (ModelContextProtocol.StartServer) and Python remote execution (see README.md).
-Env: LOG = editor log file (profile), N = frames to profile (default 7)."""
+Env: LOG = editor log file (profile), N = frames to profile (default 7), SWAY_AT = "x,y,z,pitch,yaw" camera the
+profile sways around (default: the Phase 2 test-actor view; the SHUCampusLevel quad view is 2541,-2611,872,-4,132).
+With ACTOR = "-" the profile leaves actor visibility alone (a real level)."""
 import base64, json, os, re, statistics, subprocess, sys, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -81,7 +83,7 @@ if %(on)s:
         st["t"] += dt
         s = math.sin(st["t"] * 2.0)
         unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).set_level_viewport_camera_info(
-            unreal.Vector(-250 + 20 * s, -150 + 20 * s, 40), unreal.Rotator(roll=0, pitch=-4, yaw=42 + 2 * s))
+            unreal.Vector(%(x)f + %(r)f * s, %(y)f + %(r)f * s, %(z)f), unreal.Rotator(roll=0, pitch=%(pitch)f, yaw=%(yaw)f + 2 * s))
     state.sway = unreal.register_slate_post_tick_callback(_tick)
 """
 
@@ -89,8 +91,11 @@ def profile(label, actor, cvars):
     log = os.environ.get("LOG") or max((os.path.join(d, f) for d in [os.path.expanduser("~/Library/Logs/Unreal Engine/SHUTourDemoEditor")]
                                         for f in os.listdir(d) if f.endswith(".log")), key=os.path.getmtime)
     n = int(os.environ.get("N", "7"))
-    show(actor)
-    uepy.run(SWAY % {"on": True})          # NanoGS skips view data and sort while the camera is still
+    x, y, z, pitch, yaw = [float(v) for v in os.environ.get("SWAY_AT", "-250,-150,40,-4,42").split(",")]
+    sway = {"on": True, "x": x, "y": y, "z": z, "pitch": pitch, "yaw": yaw, "r": max(20.0, abs(z) * 0.07)}
+    if actor != "-":
+        show(actor)
+    uepy.run(SWAY % sway)                  # NanoGS skips view data and sort while the camera is still
     if cvars:
         console(*[c.replace("=", " ") for c in cvars])
     time.sleep(3)
@@ -99,16 +104,17 @@ def profile(label, actor, cvars):
         console("ProfileGPU")
         time.sleep(1.5)
     time.sleep(2)
-    uepy.run(SWAY % {"on": False})
+    uepy.run(SWAY % dict(sway, on=False))
     text = open(log, "rb").read()[start:].decode("utf-8", "replace")
     stats = ("NanoGSViewData", "NanoGSSort", "NanoGSDraw", "NanoGSComposite")
     res = {k: [] for k in stats}
     for frame in text.split("GPU Profile for Frame")[1:]:
         for k in stats:
-            m = re.search(r"^.*┃\s+%s\s.*$" % k, frame, re.M)   # the whole table row
-            t = re.findall(r"([\d.]+) ms", m.group(0)) if m else []
-            if len(t) >= 2:
-                res[k].append(float(t[1]))     # inclusive time
+            # whole table rows; a stat can appear in several sibling scopes, so sum their inclusive times
+            rows = re.findall(r"^.*┃\s+%s\s.*$" % k, frame, re.M)
+            times = [float(re.findall(r"([\d.]+) ms", r)[1]) for r in rows if len(re.findall(r"([\d.]+) ms", r)) >= 2]
+            if times:
+                res[k].append(sum(times))
     med = {k: statistics.median(v) if v else float("nan") for k, v in res.items()}
     print("%-34s prepare %6.2f  sort %5.2f  draw %6.2f  composite %5.2f  total %6.2f ms  (n=%d)" % (
         label, med["NanoGSViewData"], med["NanoGSSort"], med["NanoGSDraw"], med["NanoGSComposite"], sum(med.values()), len(res["NanoGSDraw"])))
