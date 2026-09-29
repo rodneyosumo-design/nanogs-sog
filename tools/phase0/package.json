@@ -1,0 +1,9 @@
+{
+  "name": "nanogs-sog-phase0",
+  "version": "1.0.0",
+  "description": "Pinned PlayCanvas splat-transform for Phase 0",
+  "dependencies": {
+    "@playcanvas/splat-transform": "3.7.0"
+  },
+  "private": true
+}

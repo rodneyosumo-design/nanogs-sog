@@ -1,0 +1,23 @@
+{
+  "lawn_eye_level_a": {
+    "psnr_all_db": 40.6,
+    "psnr_foreground_db": 39.88,
+    "foreground_fraction": 0.847,
+    "pixels_diff_gt_8_levels_pct": 1.797,
+    "pixels_diff_gt_16_levels_pct": 0.091
+  },
+  "lawn_eye_level_b": {
+    "psnr_all_db": 43.11,
+    "psnr_foreground_db": 41.08,
+    "foreground_fraction": 0.624,
+    "pixels_diff_gt_8_levels_pct": 0.633,
+    "pixels_diff_gt_16_levels_pct": 0.036
+  },
+  "overview": {
+    "psnr_all_db": 40.54,
+    "psnr_foreground_db": 39.2,
+    "foreground_fraction": 0.733,
+    "pixels_diff_gt_8_levels_pct": 2.116,
+    "pixels_diff_gt_16_levels_pct": 0.102
+  }
+}

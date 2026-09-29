@@ -1,11 +1,8 @@
 # Engineering plan: SOG for NanoGS on iOS
 
-*As proposed on 2026-09-28, before Phase 0.*
-
 **Recommendation:** extend the NanoGS fork. Treat `.sog` as the import format: decode it once in the
-editor, then keep SOG's quantized layout on the GPU at about 20 bytes per splat instead of today's ~144.
-For the 3.43M-splat scene that frees roughly 420 MB on the iPhone 13 Pro. Forking LCC isn't viable, and a
-from-scratch Metal renderer only makes sense outside Unreal.
+editor, then keep SOG's quantized layout on the GPU at 20 bytes per splat plus an SH palette. Forking
+XGRIDS' LCC plugin isn't viable, and a from-scratch Metal renderer only makes sense outside Unreal.
 
 Corrections to the original brief:
 
@@ -40,8 +37,8 @@ Gotchas:
 - Decode WebP with libwebp (`WebPDecodeRGBA`), never ImageIO/CoreGraphics: CoreGraphics premultiplies
   8-bit alpha, which corrupts the quaternion mode byte and opacity. Reject lossy files.
 - Validate `count ≤ W·H`, `quats.A` in 252–255, labels below `shN.count`.
-- The spec says right-handed, y-up, −z forward; NanoGS's PLY reader assumes y-down. Don't guess the
-  conversion; derive it from a round-trip of the project's own PLY (Phase 0).
+- The spec declares y-up, but **files written by splat-transform keep the source PLY's axes** (Phase 0).
+  Other tools may differ, so the importer needs a frame option.
 - `antialias: true` needs the Mip-Splatting opacity compensation; NanoGS doesn't implement it yet.
 
 ## 2. Fork vs. build
@@ -54,111 +51,61 @@ Gotchas:
 | Maintenance | Vendor releases plus Pro licensing | Existing fork, plus an importer, a storage mode and a shader variant | A second renderer indefinitely |
 | **Verdict** | Not viable | **Recommended** | Only for a standalone non-Unreal viewer (fork MetalSplatter) |
 
-NanoGS already declares compressed tiers (`EGaussianQualityLevel`, 16/11/6-bit positions, a 64k-entry
-clustered SH format), but the importer hard-codes Float32 positions, Float16 colour and Float16 SH
-(`GaussianSplatAsset.cpp:148-150`), and the shaders only decode 16-bit positions. SOG's layout is
-effectively the compressed tier NanoGS never finished. The 3.43M splats currently cost about 495 MB
-(330 MB of it full SH3), even though phones only evaluate band 1.
+**Memory today (corrected in Phase 0).** NanoGS already packs the core attributes to 16 bytes per splat on
+the GPU (sRGB8 colour, float16 positions, octahedral quaternion, 8-bit log scales) but keeps all three SH
+bands as Float16: 96 bytes per splat, 86% of its splat memory, even though phones only evaluate band 1.
+For `scene_nosky` (3.43M splats including NanoGS's LOD splats) that is ~384 MB on the GPU, plus a 494 MB
+cooked bulk payload read at load. The asset's quality-level and "Cluster" SH enums exist but aren't wired
+up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage would be ~77 MB on the GPU.
 
 ## 3. Execution plan
 
-**Phase 0: ground truth (no code).** Convert `SourceData/scene_building_nosky.ply` to `.sog` with
-PlayCanvas's `splat-transform`, and convert it back to `.ply`. That gives SOG-authored content in Unreal
-through the existing PLY importer, and a matched pair to derive the file-to-Unreal matrix and validate
-Phase 1.
+**Phase 0: ground truth — done.** See [phase0-results.md](phase0-results.md).
 
 **Phase 1: ingestion and parser (NanoGSEditor).**
 - Import factory for `.sog`, SOG folders and `lod-meta.json`; zips via Unreal's `FZipArchiveReader`.
 - Vendor the libwebp decoder (BSD) into the editor module only; Unreal 5.8's image decoder has no WebP.
-- Pack each splat into the 20-byte record (section 4), keeping Morton order; pre-apply the tables and
-  decode the SH palette to half floats; store as bulk data under a new SOG storage mode, plus the
-  `fileToLocal` matrix from Phase 0.
+- Pack each splat into the 20-byte record (`blueprint/SOGTypes.h`), keeping Morton order; build the
+  scale/DC tables and the half-float SH palette; store as bulk data under a new SOG storage mode, plus
+  `fileToLocal` (default `kNanoGSFileToLocal`, with a y-up option).
 - NanoGS LOD splats: requantize positions, snap scale/DC to the nearest codebook entry, inherit the SH label
-  from the highest-weight child.
-- Done when the SOG import matches the PLY import (bounds within 1 cm, overlaid screenshots) and splat
-  memory is about 20 bytes per splat.
+  from the highest-weight child (a brute-force palette search would take trillions of operations).
+- Decision to make first (see Phase 0 §6): full 20-byte record vs. NanoGS's 16-byte core + SOG SH label.
+- Done when the SOG import matches the PLY import and matches `results/golden_scene_nosky.json`.
 
 **Phase 2: GPU decode and sorting.**
-- SOG shader variant in `CalcViewData`; it writes the same per-splat view data, so nothing downstream changes.
-- Keep NanoGS's reduce-then-scan radix sort (safe on Apple GPUs); add 16-bit keys on mobile: 2 passes
-  instead of 4 (`GaussianSplatRenderer.cpp:306`).
+- SOG shader variant in `CalcViewData` using `blueprint/SOGDecode.metal` (ported to .usf); it writes the
+  same per-splat view data, so nothing downstream changes.
+- Keep NanoGS's reduce-then-scan radix sort (safe on Apple GPUs, where Metal gives no cross-threadgroup
+  forward-progress guarantee for Onesweep-style look-back). Add 16-bit keys on mobile: 2 passes instead of
+  4 (`GaussianSplatRenderer.cpp:306`).
 - Shrink the 64-byte per-splat view data to 32 bytes on mobile.
-- Done when a 13 Pro capture shows the splat pass under the 18.3 ms baseline.
+- Done when a 13 Pro capture shows the splat pass under the 18.3 ms baseline (2026-09-03 profile).
 
 **Phase 3: rasterization for tile-based GPUs.**
-- Opacity-aware quad radius (σ·√(2·ln(255α))); cull < 1/255 and sub-pixel splats before sorting.
+- Opacity-aware quad radius (σ·√(2·ln(255α))) instead of a fixed extent; cull < 1/255 and sub-pixel
+  splats before sorting.
 - Reduced-resolution splat target (`gs.ScreenPercentage` ≈ 0.7 on phones), upscaled in the composite.
 - Premultiplied blending, read-only depth test against scene depth, no depth writes.
 - Antialias compensation for `antialias: true` assets.
 - Done when the Quad view with the crowd holds 30 fps on the 13 Pro.
 
 **Phase 4: API, streaming, memory.**
-- Keep the component plus console-variable API; add `gs.SortKeyBits` and `gs.ScreenPercentage`.
-- Streamed SOG: map `lod-meta.json` leaf runs onto NanoGS clusters, use `errors` as the LOD metric, cook
-  chunks as separately streamed bulk data, LRU residency budget, coarsest level pinned.
-- A native iOS viewer, if ever needed: fork MetalSplatter and reuse the same packed format and decode.
+- Keep the component plus console-variable API; add `gs.SortKeyBits` and `gs.ScreenPercentage` to device
+  profiles. The palette makes full SH3 nearly free in memory.
+- Streamed SOG: map `lod-meta.json` leaf runs onto NanoGS clusters (128-splat groups), use `errors` as the
+  LOD metric, cook chunks as separately streamed bulk data, LRU residency budget, coarsest level pinned.
+- A native iOS viewer, if ever needed: fork MetalSplatter and reuse `blueprint/`.
 
 ## 4. Blueprint
 
-```metal
-struct SOGSplat {
-    uint meanXY;        // qx | qy << 16            (16-bit, log-domain)
-    uint meanZ_label;   // qz | shN label << 16
-    uint quat;          // a | b << 8 | c << 16 | mode << 24   (mode = quats.A - 252)
-    uint scaleOpacity;  // sx | sy << 8 | sz << 16 | opacity << 24
-    uint dc;            // r | g << 8 | b << 16     (sh0 codebook indices)
-};
+- `blueprint/SOGTypes.h` — 20-byte `PackedSplat`, 112-byte `AssetConstants`, `PackSplat`,
+  `kNanoGSFileToLocal`, Streamed SOG structs, loader declarations.
+- `blueprint/SOGDecode.metal` — `sog_mean`, `sog_quat_wxyz`, `sog_scale`, `sog_opacity`,
+  `sog_covariance_local`, `sog_antialias_compensation`, `sog_color` (SH0–SH3 with a runtime order cap).
 
-struct SOGAssetConstants {
-    float4x4      fileToLocal;               // SOG frame -> engine local (may reflect)
-    packed_float3 meanMin;  uint count;      // log-domain
-    packed_float3 meanMax;  uint shCoeffs;   // 0, 3, 8 or 15
-    uint antialias; uint pad0, pad1, pad2;
-};
-
-inline float3 sog_mean(SOGSplat s, constant SOGAssetConstants& k) {
-    float3 q = float3(uint3(s.meanXY & 0xFFFFu, s.meanXY >> 16, s.meanZ_label & 0xFFFFu)) * (1.0f / 65535.0f);
-    float3 n = mix(float3(k.meanMin), float3(k.meanMax), q);
-    return sign(n) * (exp(abs(n)) - 1.0f);
-}
-
-inline float4 sog_quat_wxyz(uint p) {
-    float3 abc = (float3(uint3(p & 0xFFu, (p >> 8) & 0xFFu, (p >> 16) & 0xFFu)) * (1.0f / 255.0f) - 0.5f) * M_SQRT2_F;
-    float d = sqrt(max(0.0f, 1.0f - dot(abc, abc)));
-    switch (p >> 24) {
-        case 0:  return float4(d, abc);
-        case 1:  return float4(abc.x, d, abc.yz);
-        case 2:  return float4(abc.xy, d, abc.z);
-        default: return float4(abc, d);
-    }
-}
-```
-
-```cpp
-namespace sog {
-struct PackedSplat { uint32_t meanXY, meanZ_label, quat, scaleOpacity, dc; };
-static_assert(sizeof(PackedSplat) == 20, "must match SOGSplat");
-
-struct AssetConstants {
-    float    fileToLocal[16];
-    float    meanMin[3]; uint32_t count;
-    float    meanMax[3]; uint32_t shCoeffs;
-    uint32_t antialias;  uint32_t pad[3];
-};
-static_assert(sizeof(AssetConstants) == 112, "must match SOGAssetConstants");
-}
-```
-
-```swift
-// Only for a standalone (non-Unreal) viewer built on MetalSplatter.
-public final class SOGSplatView: MTKView {
-    public var splatBudget = 500_000          // mirrors gs.MaxRenderBudget
-    public var maxSHBands = 1                 // mirrors gs.OverrideSHOrder
-    public var lodErrorThreshold: Float = 0.08
-    public func load(_ url: URL) async throws { /* .sog, SOG folder, or lod-meta.json */ }
-    public func purgeCaches() { /* call from didReceiveMemoryWarning */ }
-}
-```
+Both are compiled and tested against the reference decoder over the full scene
+(`tools/phase0/blueprint_tests`).
 
 Sources: [SOG spec](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/),
 [Streamed SOG spec](https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/streamed-sog/),
