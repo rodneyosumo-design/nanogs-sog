@@ -81,6 +81,9 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
   4 (`GaussianSplatRenderer.cpp:306`).
 - Shrink the 64-byte per-splat view data to 32 bytes on mobile.
 - Done when a 13 Pro capture shows the splat pass under the 18.3 ms baseline (2026-09-03 profile).
+- Status (2026-09-29): implemented, see [phase2-results.md](phase2-results.md). The view data went to
+  32 bytes on all platforms, the sort keys moved into `CalcViewData`, and the radix scatter's ranking was
+  rewritten. The 13 Pro capture is still to do.
 
 **Phase 3: rasterization for tile-based GPUs.**
 - Opacity-aware quad radius (σ·√(2·ln(255α))) instead of a fixed extent; cull < 1/255 and sub-pixel

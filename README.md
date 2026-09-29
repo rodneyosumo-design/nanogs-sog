@@ -12,7 +12,7 @@ current ~112 bytes per splat, most of which is Float16 spherical harmonics.
 |---|---|---|
 | 0 | Ground truth: encode the real scene, validate the format, frame, fidelity and GPU layout | **Done** — [results](docs/phase0-results.md) |
 | 1 | Editor importer: `.sog` / SOG `meta.json` → cooked 20-byte records + tables (decision A) | **Done** — [results](docs/phase1-results.md); NanoGS side in pending Perforce changelist 363 |
-| 2 | GPU decode path in NanoGS's compute pass, 16-bit sort keys on mobile | Not started |
+| 2 | GPU decode path in NanoGS's compute pass, 16-bit sort keys on mobile | **Implemented** — [results](docs/phase2-results.md); same changelist 363; iPhone 13 Pro capture still to do |
 | 3 | Mobile rasterization tuning (quad extents, reduced-resolution splat target) | Not started |
 | 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | Not started |
 
@@ -24,17 +24,19 @@ Full plan: [docs/plan.md](docs/plan.md).
 |---|---|
 | `docs/` | Engineering plan, phase write-ups, comparison images |
 | `sog/` | Engine-independent C++17 SOG library: types, CPU decode/encode, loader (zip, JSON, libwebp) |
-| `shaders/SOGDecode.metal` | GPU decode: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
+| `shaders/SOGDecode.metal` | GPU decode for Metal: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
+| `shaders/SOGDecode.ush` | The same decode in HLSL, as used by NanoGS's `CalcViewData` (synced into the plugin) |
 | `third_party/libwebp` | libwebp v1.6.0 decoder only (BSD-3) |
 | `tests/` | Library tests: `tests/run_tests.sh` (codec, 14 fixtures, full scene) |
-| `integration/` | Review snapshot of the NanoGS (Perforce) changes |
-| `tools/sync_nanogs.sh` | Copies `sog/` and libwebp into the NanoGS plugin, or `--check`s the copies |
+| `integration/` | Review snapshots of the NanoGS (Perforce) changes, one patch per phase |
+| `tools/sync_nanogs.sh` | Copies `sog/`, `shaders/SOGDecode.ush` and libwebp into the NanoGS plugin, or `--check`s the copies |
 | `tools/phase0/`, `tools/phase1/` | Reference SOG v2 decoder (Python), analysis, render comparison, blueprint tests, fixture generator |
+| `tools/phase2/` | Editor A/B renders and GPU timing over the editor's MCP server and Python remote execution |
 | `results/` | Phase 0 measurements (JSON), golden test vectors, the real asset's `meta.json` |
 | `data/` | Large generated files (SOG, PLYs, renders, test binaries). Git-ignored; recreate with the script below |
 
-The Unreal integration itself (importer, shader permutation) will land in the NanoGS plugin in the
-SHUTourDemo Perforce depot. This repo holds the format library, reference tools, tests and docs.
+The Unreal integration itself (importer, GPU decode permutation, sorting changes) lives in the NanoGS plugin
+in the SHUTourDemo Perforce depot. This repo holds the format library, shaders, reference tools, tests and docs.
 
 ## Reproduce Phase 0
 

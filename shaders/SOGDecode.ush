@@ -1,0 +1,158 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// GPU decode of SOG's 20-byte splat record (PlayCanvas "Spatially Ordered Gaussians" v2).
+// HLSL port of nanogs-sog/shaders/SOGDecode.metal. CPU mirror: Public/SOG/SOGTypes.h and SOGCodec.cpp.
+// Record layout (little-endian uint32 words):
+//   MeanXY       qx | qy << 16                       16-bit log-domain position
+//   MeanZLabel   qz | SH palette label << 16
+//   Quat         a | b << 8 | c << 16 | mode << 24   smallest-three, mode = index of the dropped component
+//   ScaleOpacity sx | sy << 8 | sz << 16 | opacity << 24
+//   DC           r | g << 8 | b << 16 | flags << 24  flags bit 0 = no view-dependent SH (NanoGS LOD splats)
+
+#pragma once
+
+#include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
+#include "/Plugin/NanoGS/Private/SphericalHarmonics.ush"
+
+#define SOG_RECORD_STRIDE 20
+#define SOG_FLAG_NO_SH 1u
+// Table buffer layout (float32): scale LUT exp(codebook) in [0, 256), DC LUT 0.5 + SH_C0 * codebook in [256, 512)
+#define SOG_TABLE_DC_OFFSET 256u
+// Palette entries are half4 (rgb + unused), SOGPaletteStride entries per label
+#define SOG_PALETTE_ENTRY_BYTES 8u
+
+struct FSOGRecord
+{
+	uint MeanXY;
+	uint MeanZLabel;
+	uint Quat;
+	uint ScaleOpacity;
+	uint DC;
+};
+
+FSOGRecord SOGLoadRecord(ByteAddressBuffer Records, uint SplatIndex)
+{
+	const uint Offset = SplatIndex * SOG_RECORD_STRIDE;
+	const uint4 Words = Records.Load4(Offset);
+	FSOGRecord Record;
+	Record.MeanXY = Words.x;
+	Record.MeanZLabel = Words.y;
+	Record.Quat = Words.z;
+	Record.ScaleOpacity = Words.w;
+	Record.DC = Records.Load(Offset + 16);
+	return Record;
+}
+
+float SOGTable(ByteAddressBuffer Tables, uint Index)
+{
+	return asfloat(Tables.Load(Index * 4));
+}
+
+// Position in the SOG file frame: dequantize, then undo the symmetric log.
+float3 SOGMean(FSOGRecord Record, float3 MeanMin, float3 MeanMax)
+{
+	const float3 Q = float3(Record.MeanXY & 0xFFFFu, Record.MeanXY >> 16, Record.MeanZLabel & 0xFFFFu) * (1.0 / 65535.0);
+	const float3 N = lerp(MeanMin, MeanMax, Q);
+	return sign(N) * (exp(abs(N)) - 1.0);
+}
+
+// Smallest-three quaternion, returned in NanoGS's (x, y, z, w) order.
+float4 SOGQuat(uint Packed)
+{
+	const float3 ABC = (float3(Packed & 0xFFu, (Packed >> 8) & 0xFFu, (Packed >> 16) & 0xFFu) * (1.0 / 255.0) - 0.5) * 1.41421356237;
+	const float D = sqrt(max(0.0, 1.0 - dot(ABC, ABC)));
+	const uint Mode = Packed >> 24;
+	float4 WXYZ;
+	if (Mode == 0u)
+	{
+		WXYZ = float4(D, ABC);
+	}
+	else if (Mode == 1u)
+	{
+		WXYZ = float4(ABC.x, D, ABC.yz);
+	}
+	else if (Mode == 2u)
+	{
+		WXYZ = float4(ABC.xy, D, ABC.z);
+	}
+	else
+	{
+		WXYZ = float4(ABC, D);
+	}
+	return normalize(WXYZ).yzwx;
+}
+
+float3 SOGScale(ByteAddressBuffer Tables, uint Packed)
+{
+	return float3(SOGTable(Tables, Packed & 0xFFu), SOGTable(Tables, (Packed >> 8) & 0xFFu), SOGTable(Tables, (Packed >> 16) & 0xFFu));
+}
+
+float SOGOpacity(uint Packed)
+{
+	return float(Packed >> 24) * (1.0 / 255.0);
+}
+
+// Covariance in the engine's local frame: M R diag(s^2) R^T M^T, with M (rows) the file -> local 3x3.
+// Valid when M is a rotation or reflection times a uniform scale (NanoGS: 100 * (z, x, -y), det < 0),
+// which leaves the quaternion itself untouched.
+float3x3 SOGCovarianceLocal(float4 QuatXYZW, float3 Scale, float3x3 FileToLocal)
+{
+	const float3x3 MR = mul(FileToLocal, QuatToMatrix(QuatXYZW));
+	float3x3 MRS;
+	MRS[0] = MR[0] * Scale;
+	MRS[1] = MR[1] * Scale;
+	MRS[2] = MR[2] * Scale;
+	return mul(MRS, transpose(MRS));
+}
+
+float3 SOGPaletteCoeff(ByteAddressBuffer Palette, uint BaseByte, uint Coeff)
+{
+	const uint2 Half4 = Palette.Load2(BaseByte + Coeff * SOG_PALETTE_ENTRY_BYTES);
+	return float3(f16tof32(Half4.x & 0xFFFFu), f16tof32(Half4.x >> 16), f16tof32(Half4.y & 0xFFFFu));
+}
+
+// Colour in the space NanoGS blends in (the 3DGS training space): DC from the table plus view-dependent SH
+// read from the palette band by band, using the same basis and signs as EvaluateSH. Dir is the
+// camera -> splat direction in the SOG file frame; Bands (0-3) caps the evaluated order.
+float3 SOGColor(ByteAddressBuffer Tables, ByteAddressBuffer Palette, FSOGRecord Record, float3 Dir, uint Bands, uint PaletteStride)
+{
+	float3 Color = float3(
+		SOGTable(Tables, SOG_TABLE_DC_OFFSET + (Record.DC & 0xFFu)),
+		SOGTable(Tables, SOG_TABLE_DC_OFFSET + ((Record.DC >> 8) & 0xFFu)),
+		SOGTable(Tables, SOG_TABLE_DC_OFFSET + ((Record.DC >> 16) & 0xFFu)));
+	if (Bands == 0u || ((Record.DC >> 24) & SOG_FLAG_NO_SH) != 0u)
+	{
+		return max(Color, 0.0);
+	}
+
+	const uint Base = (Record.MeanZLabel >> 16) * PaletteStride * SOG_PALETTE_ENTRY_BYTES;
+	const float x = Dir.x;
+	const float y = Dir.y;
+	const float z = Dir.z;
+	Color += SH_C1 * (-y * SOGPaletteCoeff(Palette, Base, 0) + z * SOGPaletteCoeff(Palette, Base, 1) - x * SOGPaletteCoeff(Palette, Base, 2));
+	if (Bands >= 2u)
+	{
+		const float xx = x * x;
+		const float yy = y * y;
+		const float zz = z * z;
+		const float xy = x * y;
+		const float yz = y * z;
+		const float xz = x * z;
+		Color += SH_C2_0 * xy * SOGPaletteCoeff(Palette, Base, 3)
+			+ SH_C2_1 * yz * SOGPaletteCoeff(Palette, Base, 4)
+			+ SH_C2_2 * (2.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 5)
+			+ SH_C2_3 * xz * SOGPaletteCoeff(Palette, Base, 6)
+			+ SH_C2_4 * (xx - yy) * SOGPaletteCoeff(Palette, Base, 7);
+		if (Bands >= 3u)
+		{
+			Color += SH_C3_0 * y * (3.0 * xx - yy) * SOGPaletteCoeff(Palette, Base, 8)
+				+ SH_C3_1 * xy * z * SOGPaletteCoeff(Palette, Base, 9)
+				+ SH_C3_2 * y * (4.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 10)
+				+ SH_C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * SOGPaletteCoeff(Palette, Base, 11)
+				+ SH_C3_4 * x * (4.0 * zz - xx - yy) * SOGPaletteCoeff(Palette, Base, 12)
+				+ SH_C3_5 * z * (xx - yy) * SOGPaletteCoeff(Palette, Base, 13)
+				+ SH_C3_6 * x * (xx - 3.0 * yy) * SOGPaletteCoeff(Palette, Base, 14);
+		}
+	}
+	return max(Color, 0.0);
+}

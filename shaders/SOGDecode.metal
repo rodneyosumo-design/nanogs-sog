@@ -13,9 +13,12 @@ struct SOGSplat {
     uint meanZ_label;   // qz | shN palette label << 16
     uint quat;          // a | b << 8 | c << 16 | mode << 24        smallest-three, mode = quats.A - 252
     uint scaleOpacity;  // sx | sy << 8 | sz << 16 | opacity << 24  scale codebook indices, opacity 0..255
-    uint dc;            // r | g << 8 | b << 16                      sh0 codebook indices
+    uint dc;            // r | g << 8 | b << 16 | flags << 24        sh0 codebook indices, flags (bit 0: no SH)
 };
 static_assert(sizeof(SOGSplat) == 20, "SOGSplat must be 20 bytes");
+
+// Flags in the dc word's top byte (SOGTypes.h kFlagNoSH): NanoGS's merged LOD splats have no SH.
+constant uint kSOGFlagNoSH = 1u;
 
 struct SOGAssetConstants {
     float4x4      fileToLocal;               // column-major; SOG file frame -> engine local (may reflect)
@@ -85,12 +88,13 @@ inline float sog_antialias_compensation(float3 cov2d, float dilation)
 // View-dependent colour, 3DGS convention: dir = normalize(mean - cameraPos), both in the SOG file
 // frame (the frame the coefficients were trained in). Evaluate once per splat in compute.
 // maxCoeffs caps the order at runtime: 0 = DC only, 3 = band 1, 8 = band 2, 15 = band 3.
+// Records flagged kSOGFlagNoSH (NanoGS LOD splats) are DC only.
 inline float3 sog_color(SOGSplat s, float3 dir, constant float* dcLUT,
                         device const half4* palette, uint shCoeffs, uint maxCoeffs)
 {
     float3 c = float3(dcLUT[s.dc & 0xFFu], dcLUT[(s.dc >> 8) & 0xFFu], dcLUT[(s.dc >> 16) & 0xFFu]);
     const uint n = min(shCoeffs, maxCoeffs);
-    if (n < 3) {
+    if (n < 3 || ((s.dc >> 24) & kSOGFlagNoSH) != 0u) {
         return max(c, 0.0f);
     }
     device const half4* sh = palette + sog_label(s) * shCoeffs;
