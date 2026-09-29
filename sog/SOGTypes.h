@@ -6,7 +6,6 @@
 
 #include <cstdint>
 #include <string>
-#include <utility>
 #include <vector>
 
 // Export macro for shared-library builds (NanoGS defines SOG_API=NANOGS_API); empty for static use.
@@ -76,7 +75,8 @@ SOG_API AssetConstants MakeConstants(const DecodedAsset& asset, const float file
 
 enum class Error {
     Ok, NotZipOrFolder, UnsupportedZip, MissingMeta, BadMeta, BadVersion, MissingImage,
-    BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange
+    BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange,
+    BadLodMeta, BadChunk                    // Streamed SOG: malformed lod-meta.json; a chunk that fails or mismatches it
 };
 SOG_API const char* ErrorName(Error e);
 
@@ -93,20 +93,5 @@ inline PackedSplat PackSplat(const uint8_t* ml, const uint8_t* mu, const uint8_t
              uint32_t(s[0] | (s[1] << 8) | (s[2] << 16)) | (uint32_t(c[3]) << 24),
              uint32_t(c[0] | (c[1] << 8) | (c[2] << 16)) };
 }
-
-// Streamed SOG (lod-meta.json)
-struct LodRun  { uint32_t file, offset, count; };
-struct LodNode {
-    float boundMin[3], boundMax[3];
-    int32_t child[2] = {-1, -1};                          // interior nodes have exactly two children
-    std::vector<std::pair<uint32_t, LodRun>> lods;        // leaf: level -> run
-    std::vector<float> errors;                            // optional, non-decreasing per level
-};
-struct LodMeta {
-    uint32_t lodLevels = 0;
-    std::vector<uint32_t> counts;
-    std::vector<std::string> filenames;                   // chunk meta.json paths
-    std::vector<LodNode> nodes;                           // nodes[0] = root
-};
 
 } // namespace sog

@@ -14,7 +14,7 @@ current ~112 bytes per splat, most of which is Float16 spherical harmonics.
 | 1 | Editor importer: `.sog` / SOG `meta.json` → cooked 20-byte records + tables (decision A) | **Done** — [results](docs/phase1-results.md); NanoGS side in pending Perforce changelist 363 |
 | 2 | GPU decode path in NanoGS's compute pass, 16-bit sort keys on mobile | **Implemented** — [results](docs/phase2-results.md); same changelist 363; iPhone 13 Pro capture still to do |
 | 3 | Mobile rasterization tuning (quad extents, reduced-resolution splat target) | **Implemented** — [results](docs/phase3-results.md); campus level on the SOG asset; also fixes the render budget; 13 Pro check still to do |
-| 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | Not started |
+| 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | **Implemented** — [results](docs/phase4-results.md); same changelist 363; campus level now on the Streamed SOG asset; at the 300K budget 29.8 vs 20.7 dB for NanoGS's LOD; 13 Pro check still to do |
 
 Full plan: [docs/plan.md](docs/plan.md).
 
@@ -23,15 +23,16 @@ Full plan: [docs/plan.md](docs/plan.md).
 | Path | Contents |
 |---|---|
 | `docs/` | Engineering plan, phase write-ups, comparison images |
-| `sog/` | Engine-independent C++17 SOG library: types, CPU decode/encode, loader (zip, JSON, libwebp) |
+| `sog/` | Engine-independent C++17 SOG library: types, CPU decode/encode, loader (zip, JSON, libwebp), Streamed SOG (`lod-meta.json`) parser and merge |
 | `shaders/SOGDecode.metal` | GPU decode for Metal: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
 | `shaders/SOGDecode.ush` | The same decode in HLSL, as used by NanoGS's `CalcViewData` (synced into the plugin) |
 | `third_party/libwebp` | libwebp v1.6.0 decoder only (BSD-3) |
-| `tests/` | Library tests: `tests/run_tests.sh` (codec, 14 fixtures, full scene) |
+| `tests/` | Library tests: `tests/run_tests.sh` (codec, 14 fixtures, full scene, `lod-meta.json` parsing and the full streamed merge) |
 | `integration/` | Review snapshots of the NanoGS (Perforce) changes, one patch per phase |
 | `tools/sync_nanogs.sh` | Copies `sog/`, `shaders/SOGDecode.ush` and libwebp into the NanoGS plugin, or `--check`s the copies |
 | `tools/phase0/`, `tools/phase1/` | Reference SOG v2 decoder (Python), analysis, render comparison, blueprint tests, fixture generator |
 | `tools/phase2/` | Editor A/B renders and GPU timing over the editor's MCP server and Python remote execution |
+| `tools/phase4/` | `make_streamed.sh`: builds the Streamed SOG test data from the scene PLY with splat-transform |
 | `results/` | Phase 0 measurements (JSON), golden test vectors, the real asset's `meta.json` |
 | `data/` | Large generated files (SOG, PLYs, renders, test binaries). Git-ignored; recreate with the script below |
 

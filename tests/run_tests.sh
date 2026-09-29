@@ -24,7 +24,7 @@ for src in "$ROOT"/sog/*.cpp; do
     objs+=("$obj")
 done
 
-for t in test_codec test_fixtures test_scene; do
+for t in test_codec test_fixtures test_scene test_streamed; do
     c++ "${CXXFLAGS[@]}" "$ROOT/tests/$t.cpp" "${objs[@]}" "$BUILD"/webp/*.o -lz -o "$BUILD/$t"
 done
 
@@ -34,3 +34,9 @@ if [ ! -f "$ROOT/data/fixtures/fixtures.json" ]; then
 fi
 echo "== fixtures"; "$BUILD/test_fixtures" "$ROOT/data/fixtures"
 echo "== scene";    "$BUILD/test_scene" "$ROOT/data"
+# Streamed SOG: the merge check needs Phase 4's campus data (tools/phase4/make_streamed.sh)
+if [ -f "$ROOT/data/streamed/scene/lod-meta.json" ]; then
+    "$BUILD/test_streamed" "$ROOT/data/streamed/scene"
+else
+    "$BUILD/test_streamed"
+fi

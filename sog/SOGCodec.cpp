@@ -47,6 +47,8 @@ const char* ErrorName(Error e)
         case Error::ImageSizeMismatch: return "ImageSizeMismatch";
         case Error::BadQuatMode:       return "BadQuatMode";
         case Error::LabelOutOfRange:   return "LabelOutOfRange";
+        case Error::BadLodMeta:        return "BadLodMeta";
+        case Error::BadChunk:          return "BadChunk";
     }
     return "Unknown";
 }
