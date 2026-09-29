@@ -102,6 +102,11 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
 - Streamed SOG: map `lod-meta.json` leaf runs onto NanoGS clusters (128-splat groups), use `errors` as the
   LOD metric, cook chunks as separately streamed bulk data, LRU residency budget, coarsest level pinned.
 - A native iOS viewer, if ever needed: fork MetalSplatter and reuse `sog/` and `shaders/`.
+- Status (2026-09-29): implemented, see [phase4-results.md](phase4-results.md). splat-transform's streamed chunks
+  each carry their own SH palette (about one entry per splat), so the importer merges every chunk into one asset with
+  one 65,536-entry palette. Levels are chosen per `lod-meta.json` leaf on the CPU, and with a budget they fill it
+  (PlayCanvas's approach). Streaming (`gs.StreamingPoolSplats`) keeps the coarsest level resident and pages finer
+  levels through a fixed pool. The 13 Pro check is still to do.
 
 ## 4. Blueprint
 

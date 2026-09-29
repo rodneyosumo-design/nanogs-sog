@@ -1,0 +1,4091 @@
+# NanoGS changes for Phase 4 (Streamed SOG import, per-leaf LOD, streaming pool), on top of Phase 3
+# (nanogs-phase3.patch). All phases are in pending Perforce changelist 363 (not submitted). Not in this patch:
+# the LOD-merge work done alongside it (GaussianClusterBuilder, GaussianSplatSOG BuildRecords, the LOD checks of
+# NanoGS.SOG.ImportNaniteSaveReload, Tests/ClusterLODMergeTests.cpp in CL 364), and the binary asset
+# Content/Gaussian/scene_nosky_streamed.uasset (not in Perforce).
+
+diff -ruN a/Config/DefaultDeviceProfiles.ini b/Config/DefaultDeviceProfiles.ini
+--- a/Config/DefaultDeviceProfiles.ini	2026-09-29 19:11:57
++++ b/Config/DefaultDeviceProfiles.ini	2026-09-29 19:11:57
+@@ -8,6 +8,8 @@
+ +CVars=gs.SortKeyBits=16
+ ; NanoGS: splats drawn at 70% resolution (FXAA views), depth-matched upsample
+ +CVars=gs.ScreenPercentage=70
++; NanoGS: Streamed SOG assets keep their coarsest LOD level plus up to 600K streamed splats resident (12 MB of records)
+++CVars=gs.StreamingPoolSplats=600000
+ +TextureLODGroups=(Group=TEXTUREGROUP_World,				MaxLODSize=1024,	OptionalMaxLODSize=512,		OptionalLODBias=0, MaxLODSize_Smaller=1024,		MaxLODSize_Smallest=512,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldNormalMap,		MaxLODSize=512,		OptionalMaxLODSize=128,		OptionalLODBias=0, MaxLODSize_Smaller=512,		MaxLODSize_Smallest=256,    LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+ +TextureLODGroups=(Group=TEXTUREGROUP_WorldSpecular,		MaxLODSize=256,		OptionalMaxLODSize=64,		OptionalLODBias=0, MaxLODSize_Smaller=256,		MaxLODSize_Smallest=128,	LODBias=0,	LODBias_Smaller=0,	LODBias_Smallest=1,	MinMagFilter=aniso,		MipFilter=point)
+@@ -30,6 +32,8 @@
+ +CVars=gs.SortKeyBits=16
+ ; NanoGS: splats drawn at 70% resolution (FXAA views), depth-matched upsample
+ +CVars=gs.ScreenPercentage=70
++; NanoGS: Streamed SOG assets keep their coarsest LOD level plus up to 600K streamed splats resident (12 MB of records)
+++CVars=gs.StreamingPoolSplats=600000
+ +CVars=r.MobileContentScaleFactor=2
+ ; --- 2026-09-03 mobile perf tuning (UDS + general) ---
+ +CVars=r.MaterialQualityLevel=0
+diff -ruN a/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf b/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf
+--- a/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf	2026-09-29 19:11:57
+@@ -44,6 +44,16 @@
+ // Debug: Force specific LOD level (-1 = auto, 0 = leaf only, 1+ = specific level)
+ int DebugForceLODLevel;
+ 
++#ifndef CLUSTER_CULLING_STREAMED
++#define CLUSTER_CULLING_STREAMED 0
++#endif
++
++#if CLUSTER_CULLING_STREAMED
++// Streamed SOG assets: every cluster belongs to one lod-meta.json node and one LOD level. The CPU picks a level
++// per node for this view (NanoGS.cpp); only that level's clusters survive. 0xFFFFFFFF selects nothing.
++StructuredBuffer<uint> NodeLevelBuffer;
++#endif
++
+ // Uniforms
+ float4x4 LocalToWorld;
+ float4x4 WorldToClip;
+@@ -166,6 +176,14 @@
+ 		return;
+ 	}
+ 
++#if CLUSTER_CULLING_STREAMED
++	// One level per node: every other level's clusters are skipped before any other test
++	if (NodeLevelBuffer[cluster.StreamedNode] != cluster.LODLevel)
++	{
++		return;
++	}
++#endif
++
+ 	// Transform bounding sphere center to world space
+ 	float4 worldCenter = mul(float4(cluster.BoundingSphere.xyz, 1.0), LocalToWorld);
+ 
+@@ -191,6 +209,7 @@
+ 	bool useLOD = false;
+ 	uint selectedClusterID = clusterIndex;  // Default to leaf cluster
+ 
++#if !CLUSTER_CULLING_STREAMED   // streamed levels were chosen on the CPU; there is no parent chain to walk
+ 	// Calculate distance from camera to cluster center
+ 	float distanceToCamera = length(worldCenter.xyz - CameraPosition);
+ 
+@@ -274,6 +293,7 @@
+ 			}
+ 		}
+ 	}
++#endif
+ 
+ 	// Atomically append to visible cluster list with LOD info
+ 	uint visibleIndex;
+diff -ruN a/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush b/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush
+--- a/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Shaders/Private/GaussianDataTypes.ush	2026-09-29 19:11:57
+@@ -58,7 +58,8 @@
+ 	float MaxError;
+ 	uint LODSplatStartIndex;
+ 	uint LODSplatCount;
+-	uint Padding[3];
++	uint StreamedNode;     // Streamed SOG assets: the lod-meta.json node this cluster belongs to
++	uint Padding[2];
+ };
+ 
+ // NOTE: FGaussianGPULODSplat has been removed in the unified approach.
+diff -ruN a/Plugins/NanoGS/Shaders/Private/StreamedUpload.usf b/Plugins/NanoGS/Shaders/Private/StreamedUpload.usf
+--- a/Plugins/NanoGS/Shaders/Private/StreamedUpload.usf	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Shaders/Private/StreamedUpload.usf	2026-09-29 19:11:57
+@@ -0,0 +1,59 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++// Streamed SOG residency: move pages read from disk into the record pool and keep the cluster table in step
++// (FGaussianStreamedResidency::Update records the writes, FGaussianSplatRenderer::DispatchStreamedUploads runs them).
++
++#include "/Engine/Public/Platform.ush"
++#include "/Plugin/NanoGS/Private/GaussianDataTypes.ush"
++
++#define BLOCK_RECORDS 128
++#define RECORD_BYTES 20
++
++#if UPLOAD_BLOCKS
++
++// One group per block: x = first pool record, y = cluster (or DummyCluster to clear the block), z = records,
++// w = the block's index in UploadRecords
++ByteAddressBuffer UploadRecords;
++StructuredBuffer<uint4> UploadBlocks;
++RWByteAddressBuffer RecordPool;
++RWStructuredBuffer<uint> PoolClusterIndex;
++uint DummyCluster;
++
++[numthreads(BLOCK_RECORDS, 1, 1)]
++void UploadBlocksCS(uint3 GroupId : SV_GroupID, uint3 ThreadId : SV_GroupThreadID)
++{
++	const uint4 Block = UploadBlocks[GroupId.x];
++	const uint Index = ThreadId.x;
++	const uint Destination = Block.x + Index;
++	// Positions past the cluster's records (and cleared blocks) belong to no cluster
++	PoolClusterIndex[Destination] = Index < Block.z ? Block.y : DummyCluster;
++	if (Index < Block.z)
++	{
++		const uint Source = (Block.w * BLOCK_RECORDS + Index) * RECORD_BYTES;
++		RecordPool.Store4(Destination * RECORD_BYTES, UploadRecords.Load4(Source));
++		RecordPool.Store(Destination * RECORD_BYTES + 16, UploadRecords.Load(Source + 16));
++	}
++}
++
++#endif
++
++#if UPDATE_CLUSTERS
++
++// x = cluster, y = first pool record, z = records (0: not resident)
++StructuredBuffer<uint4> ClusterUpdates;
++RWStructuredBuffer<FGaussianGPUCluster> ClusterBufferRW;
++uint NumClusterUpdates;
++
++[numthreads(64, 1, 1)]
++void UpdateClustersCS(uint3 DispatchThreadId : SV_DispatchThreadID)
++{
++	if (DispatchThreadId.x >= NumClusterUpdates)
++	{
++		return;
++	}
++	const uint4 Update = ClusterUpdates[DispatchThreadId.x];
++	ClusterBufferRW[Update.x].SplatStartIndex = Update.y;
++	ClusterBufferRW[Update.x].SplatCount = Update.z;
++}
++
++#endif
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatAsset.cpp	2026-09-29 19:11:57
+@@ -7,6 +7,7 @@
+ #include "GaussianClusterBuilder.h"
+ #include "PLYFileReader.h"
+ #include "GaussianSplatSOG.h"
++#include "RenderingThread.h"
+ 
+ #if WITH_EDITOR
+ #include "Misc/ScopedSlowTask.h"
+@@ -36,7 +37,8 @@
+ 	Super::Serialize(Ar);
+ 
+ 	int32 Magic = GAUSSIAN_SPLAT_ASSET_MAGIC;
+-	int32 Version = bHasSOGData ? GAUSSIAN_SPLAT_ASSET_VERSION : GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY;
++	int32 Version = HasStreamedLOD() ? GAUSSIAN_SPLAT_ASSET_VERSION
++		: bHasSOGData ? GAUSSIAN_SPLAT_ASSET_VERSION_SOG : GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY;
+ 	Ar << Magic;
+ 	Ar << Version;
+ 
+@@ -70,7 +72,7 @@
+ 	Ar << ClusterHierarchy;
+ 
+ 	// SOG payload (Version 6+, only written when bHasSOGData)
+-	if (Version >= GAUSSIAN_SPLAT_ASSET_VERSION)
++	if (Version >= GAUSSIAN_SPLAT_ASSET_VERSION_SOG)
+ 	{
+ 		for (float& Value : SOGConstants.fileToLocal) { Ar << Value; }
+ 		for (float& Value : SOGConstants.meanMin) { Ar << Value; }
+@@ -83,6 +85,17 @@
+ 		SOGRecordBulkData.Serialize(Ar, this);
+ 		SOGPaletteBulkData.Serialize(Ar, this);
+ 	}
++
++	// Streamed SOG LOD table (Version 7+, only written for streamed assets)
++	if (Version >= GAUSSIAN_SPLAT_ASSET_VERSION)
++	{
++		Ar << StreamedLOD;
++	}
++	else if (Ar.IsLoading())
++	{
++		StreamedLOD.Reset();
++		bHasStreamedLOD = false;
++	}
+ }
+ 
+ void UGaussianSplatAsset::PostLoad()
+@@ -114,6 +127,62 @@
+ #endif
+ }
+ 
++void UGaussianSplatAsset::BeginDestroy()
++{
++	Super::BeginDestroy();
++	DetachRenderDataStreaming(false);
++}
++
++bool UGaussianSplatAsset::IsReadyForFinishDestroy()
++{
++	// Streaming reads of SOGRecordBulkData must have stopped before it's freed
++	return Super::IsReadyForFinishDestroy() && StreamingDetachFence.IsFenceComplete();
++}
++
++void UGaussianSplatAsset::DetachRenderDataStreaming(bool bWait)
++{
++	if (RenderData.IsValid() && RenderData->Residency.IsValid())
++	{
++		TSharedPtr<FGaussianSplatRenderData> Data = RenderData;
++		ENQUEUE_RENDER_COMMAND(NanoGSDetachStreaming)([Data](FRHICommandListImmediate&)
++		{
++			Data->DetachStreaming();
++		});
++		StreamingDetachFence.BeginFence();
++		if (bWait)
++		{
++			StreamingDetachFence.Wait();
++		}
++	}
++}
++
++bool UGaussianSplatAsset::ReadSOGRecords(uint32 First, uint32 Count, TArray<uint8>& OutData) const
++{
++	const uint64 Offset = uint64(First) * sizeof(sog::PackedSplat);
++	const uint64 Bytes = uint64(Count) * sizeof(sog::PackedSplat);
++	if (Offset + Bytes > uint64(SOGRecordBulkData.GetBulkDataSize()))
++	{
++		return false;
++	}
++	OutData.SetNumUninitialized(int64(Bytes));
++	if (Bytes == 0)
++	{
++		return true;
++	}
++	if (SOGRecordBulkData.IsBulkDataLoaded())
++	{
++		const uint8* Data = static_cast<const uint8*>(SOGRecordBulkData.LockReadOnly());
++		FMemory::Memcpy(OutData.GetData(), Data + Offset, Bytes);
++		SOGRecordBulkData.Unlock();
++		return true;
++	}
++	FIoBuffer Buffer(FIoBuffer::Wrap, OutData.GetData(), Bytes);
++	FBulkDataBatchRequest Request;
++	FBulkDataBatchRequest::NewBatch(1).Read(SOGRecordBulkData, Offset, Bytes, AIOP_CriticalPath, Buffer).Issue(Request);
++	Request.Wait();
++	return Request.IsOk();
++}
++
+ #if WITH_EDITOR
+ void UGaussianSplatAsset::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+ {
+@@ -721,6 +790,7 @@
+ void UGaussianSplatAsset::SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records)
+ {
+ 	check(Records.Num() == SplatCount);
++	DetachRenderDataStreaming(true);
+ 	SOGConstants = sog::MakeConstants(Source, sog::kNanoGSFileToLocal);
+ 	SOGConstants.count = uint32(Records.Num());
+ 	SOGScaleLUT = TArray<float>(Source.scaleLUT, 256);
+@@ -732,8 +802,61 @@
+ 	SOGPaletteCount = int32(Source.paletteCount);
+ }
+ 
++void UGaussianSplatAsset::InitializeFromStreamedSOG(const TArray<FGaussianSplatData>& PreviewSplats,
++	const sog::DecodedAsset& Source, const TArray<FStreamedClusterDesc>& Clusters, FGaussianStreamedLOD&& LOD,
++	EGaussianQualityLevel InQuality)
++{
++	check(Source.splats.size() == Source.count && Clusters.Num() > 0 && LOD.IsValid());
++	SplatCount = int32(Source.count);
++	OriginalSplatCount = SplatCount;          // no NanoGS LOD splats: every record belongs to a streamed level
++	ImportQuality = InQuality;
++	SHBands = int32(Source.shBands);
++
++	// Every cluster is a leaf of its (node, level) run; the level goes in LODLevel, the node in the LOD table
++	FGaussianClusterHierarchy Hierarchy;
++	Hierarchy.Clusters.SetNum(Clusters.Num());
++	BoundingBox.Init();
++	for (int32 Index = 0; Index < Clusters.Num(); ++Index)
++	{
++		const FStreamedClusterDesc& Desc = Clusters[Index];
++		FGaussianCluster& Cluster = Hierarchy.Clusters[Index];
++		Cluster.ClusterID = uint32(Index);
++		Cluster.LODLevel = Desc.Level;
++		Cluster.BoundsMin = Desc.BoundsMin;
++		Cluster.BoundsMax = Desc.BoundsMax;
++		Cluster.ComputeBoundingSphereFromAABB();
++		Cluster.SplatStartIndex = Desc.SplatStart;
++		Cluster.SplatCount = Desc.SplatCount;
++		BoundingBox += FBox(FVector(Desc.BoundsMin), FVector(Desc.BoundsMax));
++	}
++	Hierarchy.NumLODLevels = uint32(LOD.NumLevels);
++	Hierarchy.SplatsPerCluster = GaussianClusterConstants::DefaultSplatsPerCluster;
++	Hierarchy.RootClusterIndex = 0;
++	Hierarchy.NumLeafClusters = uint32(Clusters.Num());
++	Hierarchy.TotalSplatCount = uint32(SplatCount);
++	ClusterHierarchy = MoveTemp(Hierarchy);
++
++	ClearNanoGSSplatData();
++	SetSOGData(Source, TArray<sog::PackedSplat>(Source.splats.data(), int32(Source.splats.size())));
++	StreamedLOD = MoveTemp(LOD);
++	bHasStreamedLOD = true;
++	StreamedLODLevels = StreamedLOD.NumLevels;
++	StreamedLODNodes = StreamedLOD.Nodes.Num();
++	bEnableNanite = true;                     // the renderer's cluster culling + compaction path
++	GenerateThumbnail(PreviewSplats);
++	RenderData.Reset();
++
++	UE_LOG(LogTemp, Log, TEXT("GaussianSplatAsset: Initialized Streamed SOG: %d splats in %d levels, %d nodes, %d clusters (records %lld bytes, palette %lld bytes)"),
++		SplatCount, StreamedLODLevels, StreamedLODNodes, ClusterHierarchy.Clusters.Num(), GetSOGRecordDataSize(), GetSOGPaletteDataSize());
++}
++
+ void UGaussianSplatAsset::ClearSOGData()
+ {
++	DetachRenderDataStreaming(true);
++	StreamedLOD.Reset();
++	bHasStreamedLOD = false;
++	StreamedLODLevels = 0;
++	StreamedLODNodes = 0;
+ 	bHasSOGData = false;
+ 	SOGSHBands = 0;
+ 	SOGPaletteCount = 0;
+@@ -762,6 +885,12 @@
+ 
+ bool UGaussianSplatAsset::BuildNaniteClusterHierarchy()
+ {
++	if (HasStreamedLOD())
++	{
++		UE_LOG(LogTemp, Warning, TEXT("BuildNaniteClusterHierarchy: '%s' is a Streamed SOG asset; its LOD levels come from lod-meta.json (reimport to rebuild them)"), *GetName());
++		return false;
++	}
++
+ 	// Check if source file exists
+ 	if (SourceFilePath.IsEmpty())
+ 	{
+@@ -883,6 +1012,12 @@
+ 
+ void UGaussianSplatAsset::ClearNaniteClusterHierarchy()
+ {
++	if (HasStreamedLOD())
++	{
++		UE_LOG(LogTemp, Warning, TEXT("ClearNaniteClusterHierarchy: '%s' is a Streamed SOG asset; its clusters hold the LOD levels and can't be cleared"), *GetName());
++		return;
++	}
++
+ 	if (!bEnableNanite && !ClusterHierarchy.IsValid())
+ 	{
+ 		UE_LOG(LogTemp, Warning, TEXT("ClearNaniteClusterHierarchy: Nanite is not enabled"));
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderData.cpp	2026-09-29 19:11:57
+@@ -2,20 +2,31 @@
+ 
+ #include "GaussianSplatRenderData.h"
+ #include "GaussianSplatAsset.h"
++#include "HAL/IConsoleManager.h"
+ #include "RHICommandList.h"
+ 
++static TAutoConsoleVariable<int32> CVarGSStreamingPoolSplats(
++	TEXT("gs.StreamingPoolSplats"),
++	0,
++	TEXT("Streamed SOG assets: splats kept resident beyond each asset's coarsest LOD level, which is always resident.\n")
++	TEXT("Finer levels load from disk on demand; the least recently used are evicted when the pool is full.\n")
++	TEXT(" 0: no streaming, every level resident (default)\n")
++	TEXT("Takes effect when an asset's render data is created, for assets whose records are on disk (not a fresh import)."),
++	ECVF_RenderThreadSafe | ECVF_Scalability);
++
+ namespace
+ {
+-	/** Static ByteAddressBuffer holding Data; a zeroed 16-byte dummy when Data is empty, so it can always be bound. */
++	/** Static ByteAddressBuffer holding Data; a zeroed 16-byte dummy when Data is empty, so it can always be bound.
++	 *  With OutUAV the buffer is also writable (the Streamed SOG record pool). */
+ 	void CreateRawBuffer(FRHICommandListBase& RHICmdList, const TCHAR* Name, const void* Data, uint32 NumBytes,
+-		FBufferRHIRef& OutBuffer, FShaderResourceViewRHIRef& OutSRV)
++		FBufferRHIRef& OutBuffer, FShaderResourceViewRHIRef& OutSRV, FUnorderedAccessViewRHIRef* OutUAV = nullptr)
+ 	{
+ 		const uint32 Size = FMath::Max(NumBytes, 16u);
+ 		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+ 			Name,
+ 			Size,
+ 			0,
+-			BUF_Static | BUF_ShaderResource | BUF_ByteAddressBuffer)
++			BUF_Static | BUF_ShaderResource | BUF_ByteAddressBuffer | (OutUAV ? BUF_UnorderedAccess : BUF_None))
+ 			.SetInitialState(ERHIAccess::SRVMask);
+ 		OutBuffer = RHICmdList.CreateBuffer(Desc);
+ 
+@@ -33,6 +44,12 @@
+ 		OutSRV = RHICmdList.CreateShaderResourceView(
+ 			OutBuffer, FRHIViewDesc::CreateBufferSRV()
+ 				.SetType(FRHIViewDesc::EBufferType::Raw));
++		if (OutUAV)
++		{
++			*OutUAV = RHICmdList.CreateUnorderedAccessView(
++				OutBuffer, FRHIViewDesc::CreateBufferUAV()
++					.SetType(FRHIViewDesc::EBufferType::Raw));
++		}
+ 	}
+ }
+ 
+@@ -63,16 +80,28 @@
+ 	SplatCount = Asset->GetSplatCount();
+ 	PositionFormat = Asset->PositionFormat;
+ 
++	// Streamed SOG with a residency pool: only the coarsest level (the record prefix) is read now, finer levels stream
++	uint32 StreamPoolSplats = 0;
+ 	if (Asset->HasSOGData())
+ 	{
+ 		// --- SOG payload: records, lookup tables and SH palette, decoded per frame by CalcViewData ---
+-		Asset->GetSOGRecordData(SOGRecordData);
++		const uint32 PoolSetting = uint32(FMath::Max(0, CVarGSStreamingPoolSplats.GetValueOnAnyThread()));
++		const uint64 Coarsest = Asset->HasStreamedLOD() ? Asset->GetStreamedLOD().LevelSplatCounts.Last() : 0;
++		if (Asset->HasStreamedLOD() && PoolSetting > 0 && uint64(SplatCount) - Coarsest > PoolSetting
++			&& !Asset->IsSOGRecordDataInMemory() && Asset->ReadSOGRecords(0, uint32(Coarsest), SOGRecordData))
++		{
++			StreamPoolSplats = PoolSetting;
++		}
++		else
++		{
++			Asset->GetSOGRecordData(SOGRecordData);
++		}
+ 		Asset->GetSOGPaletteData(SOGPaletteData);
+ 		SOGTableData.Reset(512);
+ 		SOGTableData.Append(Asset->GetSOGScaleLUT());
+ 		SOGTableData.Append(Asset->GetSOGDCLUT());
+ 
+-		const int64 ExpectedRecordBytes = int64(SplatCount) * int64(sizeof(sog::PackedSplat));
++		const int64 ExpectedRecordBytes = int64(StreamPoolSplats > 0 ? Coarsest : uint64(SplatCount)) * int64(sizeof(sog::PackedSplat));
+ 		if (SOGRecordData.Num() != ExpectedRecordBytes || SOGTableData.Num() != 512)
+ 		{
+ 			UE_LOG(LogTemp, Error, TEXT("GaussianSplatRenderData: '%s' has a corrupt SOG payload (%d record bytes for %d splats, %d table entries); not rendering it"),
+@@ -197,6 +226,42 @@
+ 			}
+ 		}
+ 
++		// Streamed SOG: each cluster carries its lod-meta.json node for the culling pass's level test
++		if (Asset->HasStreamedLOD())
++		{
++			StreamedLOD = Asset->GetStreamedLOD();
++			for (int32 NodeIdx = 0; NodeIdx < StreamedLOD.Nodes.Num(); ++NodeIdx)
++			{
++				const FGaussianStreamedLODNode& Node = StreamedLOD.Nodes[NodeIdx];
++				for (int32 Level = 0; Level < Node.FirstCluster.Num(); ++Level)
++				{
++					for (uint32 C = Node.FirstCluster[Level]; C < Node.FirstCluster[Level] + Node.ClusterCounts[Level]; ++C)
++					{
++						if (C < uint32(CachedClusterData.Num()))
++						{
++							CachedClusterData[C].StreamedNode = uint32(NodeIdx);
++						}
++					}
++				}
++			}
++			MaxSelectableSplats = StreamedLOD.GetMaxSelectableSplats();
++			bStreamedLOD = true;
++
++			// Residency pool: the cluster table and the pool position -> cluster map start with only the coarsest
++			// level resident, at the start of the pool where the asset has it
++			if (StreamPoolSplats > 0)
++			{
++				Residency = MakeUnique<FGaussianStreamedResidency>();
++				Residency->Initialize(StreamedLOD, CachedClusterData, StreamPoolSplats, &Asset->GetSOGRecordBulkData());
++				DummyCluster = uint32(CachedClusterData.Num());
++				Residency->MakeInitialGPUState(CachedClusterData, CachedSplatClusterIndices, DummyCluster);
++				PoolRecords = Residency->GetPoolRecords();
++				SOGRecordData.SetNumZeroed(int64(PoolRecords) * int64(sizeof(sog::PackedSplat)));
++				UE_LOG(LogTemp, Log, TEXT("GaussianSplatRenderData: '%s' streams its finer LOD levels: pool of %u records (%u always resident)"),
++					*AssetName, PoolRecords, Residency->GetPinnedRecords());
++			}
++		}
++
+ 		for (int32 ClusterIdx = 0; ClusterIdx < Hierarchy.Clusters.Num(); ++ClusterIdx)
+ 		{
+ 			const FGaussianCluster& Cluster = Hierarchy.Clusters[ClusterIdx];
+@@ -222,6 +287,12 @@
+ 		LODSplatCount = 0;
+ 	}
+ 
++	if (StreamPoolSplats > 0 && !Residency.IsValid())
++	{
++		Asset->GetSOGRecordData(SOGRecordData);       // no cluster table to stream with: every record resident
++	}
++	PoolRecords = Residency.IsValid() ? Residency->GetPoolRecords() : uint32(SplatCount);
++
+ 	bIsInitialized = true;
+ 
+ 	UE_LOG(LogTemp, Verbose, TEXT("GaussianSplatRenderData: Created shared CPU data for asset '%s' (%d splats)"),
+@@ -264,7 +335,7 @@
+ 	if (bHasSOG)
+ 	{
+ 		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGRecordBuffer"), SOGRecordData.GetData(), SOGRecordData.Num(),
+-			SOGRecordBuffer, SOGRecordBufferSRV);
++			SOGRecordBuffer, SOGRecordBufferSRV, Residency.IsValid() ? &SOGRecordBufferUAV : nullptr);
+ 		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGTableBuffer"), SOGTableData.GetData(), SOGTableData.Num() * sizeof(float),
+ 			SOGTableBuffer, SOGTableBufferSRV);
+ 		CreateRawBuffer(RHICmdList, TEXT("GaussianSOGPaletteBuffer"), SOGPaletteData.GetData(), SOGPaletteData.Num(),
+@@ -367,7 +438,7 @@
+ 			TEXT("GaussianClusterBuffer"),
+ 			BufferSize,
+ 			sizeof(FGaussianGPUCluster),
+-			BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer)
++			BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer | (Residency.IsValid() ? BUF_UnorderedAccess : BUF_None))
+ 			.SetInitialState(ERHIAccess::SRVMask);
+ 		ClusterBuffer = RHICmdList.CreateBuffer(Desc);
+ 
+@@ -379,6 +450,13 @@
+ 			ClusterBuffer, FRHIViewDesc::CreateBufferSRV()
+ 				.SetType(FRHIViewDesc::EBufferType::Structured)
+ 				.SetStride(sizeof(FGaussianGPUCluster)));
++		if (Residency.IsValid())
++		{
++			ClusterBufferUAV = RHICmdList.CreateUnorderedAccessView(
++				ClusterBuffer, FRHIViewDesc::CreateBufferUAV()
++					.SetType(FRHIViewDesc::EBufferType::Structured)
++					.SetStride(sizeof(FGaussianGPUCluster)));
++		}
+ 		SharedBufferCount++;
+ 	}
+ 
+@@ -392,7 +470,7 @@
+ 			TEXT("GaussianSplatClusterIndexBuffer"),
+ 			BufferSize,
+ 			sizeof(uint32),
+-			BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer)
++			BUF_Static | BUF_ShaderResource | BUF_StructuredBuffer | (Residency.IsValid() ? BUF_UnorderedAccess : BUF_None))
+ 			.SetInitialState(ERHIAccess::SRVMask);
+ 		SplatClusterIndexBuffer = RHICmdList.CreateBuffer(Desc);
+ 
+@@ -411,6 +489,13 @@
+ 			SplatClusterIndexBuffer, FRHIViewDesc::CreateBufferSRV()
+ 				.SetType(FRHIViewDesc::EBufferType::Structured)
+ 				.SetStride(sizeof(uint32)));
++		if (Residency.IsValid())
++		{
++			SplatClusterIndexBufferUAV = RHICmdList.CreateUnorderedAccessView(
++				SplatClusterIndexBuffer, FRHIViewDesc::CreateBufferUAV()
++					.SetType(FRHIViewDesc::EBufferType::Structured)
++					.SetStride(sizeof(uint32)));
++		}
+ 		SharedBufferCount++;
+ 	}
+ 
+@@ -449,5 +534,8 @@
+ 	SOGTableBufferSRV.SafeRelease();
+ 	SOGPaletteBuffer.SafeRelease();
+ 	SOGPaletteBufferSRV.SafeRelease();
++	SOGRecordBufferUAV.SafeRelease();
++	ClusterBufferUAV.SafeRelease();
++	SplatClusterIndexBufferUAV.SafeRelease();
+ 	bGPUBuffersCreated = false;
+ }
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-09-29 19:11:57
+@@ -5,6 +5,7 @@
+ #include "GaussianSplatSceneProxy.h"
+ #include "GaussianGlobalAccumulator.h"
+ #include "GaussianClusterTypes.h"
++#include "GaussianSplatRenderData.h"
+ #include "RHICommandList.h"
+ #include "RHIGPUReadback.h"
+ #include "RenderGraphBuilder.h"
+@@ -1737,8 +1738,12 @@
+ 		return 0;
+ 	}
+ 
++	// Streamed SOG assets keep the clusters of the level chosen per node (uploaded to NodeLevelBuffer beforehand)
++	const bool bStreamed = GPUResources->bStreamedLOD && GPUResources->NodeLevelBufferSRV.IsValid();
++	FClusterCullingCS::FPermutationDomain CullingPermutation;
++	CullingPermutation.Set<FClusterCullingCS::FStreamedDim>(bStreamed);
+ 	TShaderMapRef<FClusterCullingResetCS> ResetShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+-	TShaderMapRef<FClusterCullingCS> CullingShader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++	TShaderMapRef<FClusterCullingCS> CullingShader(GetGlobalShaderMap(GMaxRHIFeatureLevel), CullingPermutation);
+ 
+ 	if (!ResetShader.IsValid() || !CullingShader.IsValid())
+ 	{
+@@ -1747,7 +1752,8 @@
+ 	}
+ 
+ 	// Calculate visibility bitmap size
+-	uint32 VisibilityBitmapSize = FMath::DivideAndRoundUp(GPUResources->ClusterCount, 32);
++	// One bit past the last cluster: Streamed SOG pool positions no cluster owns point there and it's never set
++	uint32 VisibilityBitmapSize = FMath::DivideAndRoundUp(GPUResources->ClusterCount + 1, 32);
+ 	VisibilityBitmapSize = FMath::Max(VisibilityBitmapSize, 1u);
+ 
+ 	// Transition buffers for compute
+@@ -1839,6 +1845,10 @@
+ 		CullingParams.UseLODRendering = bUseLODRendering ? 1 : 0;
+ 		// Debug: Force specific LOD level (-1 = auto, 0 = leaf, 1+ = specific level)
+ 		CullingParams.DebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();
++		if (bStreamed)
++		{
++			CullingParams.NodeLevelBuffer = GPUResources->NodeLevelBufferSRV;
++		}
+ 
+ 		const uint32 ThreadGroupSize = 64;
+ 		const uint32 NumGroups = FMath::DivideAndRoundUp((uint32)GPUResources->LeafClusterCount, ThreadGroupSize);
+@@ -1876,6 +1886,80 @@
+ 	// Return leaf cluster count as placeholder (actual count would require GPU readback)
+ 	// In a real implementation, you'd use the VisibleClusterBuffer in subsequent passes
+ 	return GPUResources->LeafClusterCount;
++}
++
++namespace
++{
++	/** Static buffer holding Data (at least 16 bytes), with a raw (Stride 0) or structured SRV. */
++	FShaderResourceViewRHIRef MakeUploadBuffer(FRHICommandListImmediate& RHICmdList, const TCHAR* Name, const void* Data,
++		uint32 NumBytes, uint32 Stride, FBufferRHIRef& OutBuffer)
++	{
++		const uint32 Size = FMath::Max(NumBytes, 16u);
++		const EBufferUsageFlags Usage = BUF_Static | BUF_ShaderResource | (Stride == 0 ? BUF_ByteAddressBuffer : BUF_StructuredBuffer);
++		OutBuffer = RHICmdList.CreateBuffer(FRHIBufferCreateDesc::Create(Name, Size, Stride, Usage).SetInitialState(ERHIAccess::SRVMask));
++		void* Dest = RHICmdList.LockBuffer(OutBuffer, 0, Size, RLM_WriteOnly);
++		FMemory::Memzero(Dest, Size);
++		FMemory::Memcpy(Dest, Data, NumBytes);
++		RHICmdList.UnlockBuffer(OutBuffer);
++		return RHICmdList.CreateShaderResourceView(OutBuffer, Stride == 0
++			? FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Raw)
++			: FRHIViewDesc::CreateBufferSRV().SetType(FRHIViewDesc::EBufferType::Structured).SetStride(Stride));
++	}
++}
++
++void FGaussianSplatRenderer::DispatchStreamedUploads(FRHICommandListImmediate& RHICmdList, FGaussianSplatRenderData& Data)
++{
++	FGaussianStreamedResidency* Residency = Data.Residency.Get();
++	if (!Residency || Residency->GetUploads().IsEmpty() || !Data.SOGRecordBufferUAV.IsValid()
++		|| !Data.ClusterBufferUAV.IsValid() || !Data.SplatClusterIndexBufferUAV.IsValid())
++	{
++		return;
++	}
++	SCOPED_DRAW_EVENT(RHICmdList, GaussianSplatStreamedUploads);
++	FGaussianStreamedResidency::FUploads& Uploads = Residency->GetUploads();
++
++	RHICmdList.Transition({
++		FRHITransitionInfo(Data.SOGRecordBuffer, ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(Data.SplatClusterIndexBuffer, ERHIAccess::SRVMask, ERHIAccess::UAVCompute),
++		FRHITransitionInfo(Data.ClusterBuffer, ERHIAccess::SRVMask, ERHIAccess::UAVCompute) });
++
++	if (Uploads.Blocks.Num() > 0)
++	{
++		FBufferRHIRef RecordsBuffer, BlocksBuffer;
++		TShaderMapRef<FStreamedUploadBlocksCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++		FStreamedUploadBlocksCS::FParameters Parameters;
++		Parameters.UploadRecords = MakeUploadBuffer(RHICmdList, TEXT("GaussianStreamedUploadRecords"), Uploads.Records.GetData(),
++			uint32(Uploads.Records.Num()), 0, RecordsBuffer);
++		Parameters.UploadBlocks = MakeUploadBuffer(RHICmdList, TEXT("GaussianStreamedUploadBlocks"), Uploads.Blocks.GetData(),
++			uint32(Uploads.Blocks.Num()) * sizeof(FUintVector4), sizeof(FUintVector4), BlocksBuffer);
++		Parameters.RecordPool = Data.SOGRecordBufferUAV;
++		Parameters.PoolClusterIndex = Data.SplatClusterIndexBufferUAV;
++		Parameters.DummyCluster = Data.DummyCluster;
++		SetComputePipelineState(RHICmdList, Shader.GetComputeShader());
++		SetShaderParameters(RHICmdList, Shader, Shader.GetComputeShader(), Parameters);
++		RHICmdList.DispatchComputeShader(uint32(Uploads.Blocks.Num()), 1, 1);
++		UnsetShaderUAVs(RHICmdList, Shader, Shader.GetComputeShader());
++	}
++	if (Uploads.Clusters.Num() > 0)
++	{
++		FBufferRHIRef UpdatesBuffer;
++		TShaderMapRef<FStreamedUpdateClustersCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
++		FStreamedUpdateClustersCS::FParameters Parameters;
++		Parameters.ClusterUpdates = MakeUploadBuffer(RHICmdList, TEXT("GaussianStreamedClusterUpdates"), Uploads.Clusters.GetData(),
++			uint32(Uploads.Clusters.Num()) * sizeof(FUintVector4), sizeof(FUintVector4), UpdatesBuffer);
++		Parameters.ClusterBufferRW = Data.ClusterBufferUAV;
++		Parameters.NumClusterUpdates = uint32(Uploads.Clusters.Num());
++		SetComputePipelineState(RHICmdList, Shader.GetComputeShader());
++		SetShaderParameters(RHICmdList, Shader, Shader.GetComputeShader(), Parameters);
++		RHICmdList.DispatchComputeShader(FMath::DivideAndRoundUp(uint32(Uploads.Clusters.Num()), 64u), 1, 1);
++		UnsetShaderUAVs(RHICmdList, Shader, Shader.GetComputeShader());
++	}
++
++	RHICmdList.Transition({
++		FRHITransitionInfo(Data.SOGRecordBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
++		FRHITransitionInfo(Data.SplatClusterIndexBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVMask),
++		FRHITransitionInfo(Data.ClusterBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVMask) });
++	Uploads.Reset();
+ }
+ 
+ void FGaussianSplatRenderer::CompositeToSceneColor(
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-09-29 19:11:57
+@@ -59,6 +59,7 @@
+ 	}
+ 	SOGMeanMin = SharedData->SOGMeanMin;
+ 	SOGMeanMax = SharedData->SOGMeanMax;
++	bStreamedLOD = SharedData->bStreamedLOD;
+ 
+ 	// Initialize render resource
+ 	if (!bInitialized)
+@@ -97,8 +98,9 @@
+ 	SplatClusterIndexBuffer = SharedData->SplatClusterIndexBuffer;
+ 	SplatClusterIndexBufferSRV = SharedData->SplatClusterIndexBufferSRV;
+ 
+-	// TotalSplatCount is needed by per-instance buffer sizing
+-	TotalSplatCount = SplatCount;
++	// TotalSplatCount is needed by per-instance buffer sizing. A streamed asset holds every LOD level but a
++	// view selects one level per node, so compaction never outputs more than MaxSelectableSplats.
++	TotalSplatCount = bStreamedLOD ? int32(FMath::Min<uint32>(SharedData->MaxSelectableSplats, uint32(SplatCount))) : SplatCount;
+ 
+ 	// Create dummy white texture (tiny, per-proxy is fine)
+ 	CreateDummyWhiteTexture(RHICmdList);
+@@ -222,6 +224,8 @@
+ 	VisibleSplatCountBufferSRV.SafeRelease();
+ 	IndirectDispatchArgsBuffer.SafeRelease();
+ 	IndirectDispatchArgsBufferUAV.SafeRelease();
++	NodeLevelBuffer.SafeRelease();
++	NodeLevelBufferSRV.SafeRelease();
+ 
+ 	// Release shared data reference
+ 	SharedData.Reset();
+@@ -449,7 +453,7 @@
+ 	// Create cluster visibility bitmap buffer
+ 	// One bit per cluster, rounded up to uint32 boundary
+ 	{
+-		uint32 BitmapSize = FMath::DivideAndRoundUp(ClusterCount, 32) * sizeof(uint32);
++		uint32 BitmapSize = FMath::DivideAndRoundUp(ClusterCount + 1, 32) * sizeof(uint32);   // + the never-visible index
+ 		BitmapSize = FMath::Max(BitmapSize, (uint32)sizeof(uint32));  // At least one uint32
+ 
+ 		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+@@ -475,8 +479,8 @@
+ 	// Create selected cluster buffer for Nanite-style debug visualization
+ 	// One entry per leaf cluster, stores which cluster ID is selected based on LOD
+ 	{
+-		uint32 BufferSize = LeafClusterCount * sizeof(uint32);
+-		BufferSize = FMath::Max(BufferSize, (uint32)sizeof(uint32));  // At least one uint32
++		// + one entry for the never-visible index Streamed SOG pool positions without a cluster use
++		uint32 BufferSize = (LeafClusterCount + 1) * sizeof(uint32);
+ 
+ 		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+ 			TEXT("GaussianSelectedClusterBuffer"),
+@@ -544,7 +548,7 @@
+ 	// LOD cluster selected bitmap (same size as cluster visibility bitmap)
+ 	// Also needs SRV for GPU-driven LOD shader to read
+ 	{
+-		uint32 BitmapSize = FMath::DivideAndRoundUp(ClusterCount, 32) * sizeof(uint32);
++		uint32 BitmapSize = FMath::DivideAndRoundUp(ClusterCount + 1, 32) * sizeof(uint32);   // + the never-visible index
+ 		BitmapSize = FMath::Max(BitmapSize, (uint32)sizeof(uint32));
+ 
+ 		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+@@ -719,9 +723,51 @@
+ 				.SetStride(sizeof(uint32)));
+ 	}
+ 
++	// Streamed SOG: the chosen level per node, rewritten on the CPU for every view before culling
++	if (bStreamedLOD)
++	{
++		const uint32 NodeCount = FMath::Max(SharedData->StreamedLOD.Nodes.Num(), 1);
++		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
++			TEXT("GaussianStreamedNodeLevelBuffer"),
++			NodeCount * sizeof(uint32),
++			sizeof(uint32),
++			BUF_Dynamic | BUF_ShaderResource | BUF_StructuredBuffer)
++			.SetInitialState(ERHIAccess::SRVMask);
++		NodeLevelBuffer = RHICmdList.CreateBuffer(Desc);
++		void* Data = RHICmdList.LockBuffer(NodeLevelBuffer, 0, NodeCount * sizeof(uint32), RLM_WriteOnly);
++		FMemory::Memset(Data, 0xFF, NodeCount * sizeof(uint32));      // nothing selected until the first view
++		RHICmdList.UnlockBuffer(NodeLevelBuffer);
++		NodeLevelBufferSRV = RHICmdList.CreateShaderResourceView(
++			NodeLevelBuffer, FRHIViewDesc::CreateBufferSRV()
++				.SetType(FRHIViewDesc::EBufferType::Structured)
++				.SetStride(sizeof(uint32)));
++	}
++
+ 	bSupportsCompaction = true;
+ 	UE_LOG(LogTemp, Verbose, TEXT("GaussianSplatGPUResources: Created splat compaction buffers for %d total splats"), TotalSplatCount);
+ 	UE_LOG(LogTemp, Verbose, TEXT("GaussianSplatGPUResources: Created cluster buffers for %d clusters"), ClusterCount);
++}
++
++const FGaussianStreamedLOD* FGaussianSplatGPUResources::GetStreamedLOD() const
++{
++	return bStreamedLOD && SharedData.IsValid() && SharedData->bStreamedLOD ? &SharedData->StreamedLOD : nullptr;
++}
++
++int32 FGaussianSplatGPUResources::GetRecordRange() const
++{
++	return SharedData.IsValid() && SharedData->Residency.IsValid() ? int32(SharedData->PoolRecords) : SplatCount;
++}
++
++void FGaussianSplatGPUResources::UploadNodeLevels(FRHICommandListBase& RHICmdList, const TArray<uint32>& NodeLevels)
++{
++	if (!NodeLevelBuffer.IsValid() || NodeLevels.Num() == 0)
++	{
++		return;
++	}
++	const uint32 Bytes = FMath::Min<uint32>(NodeLevels.Num() * sizeof(uint32), NodeLevelBuffer->GetSize());
++	void* Data = RHICmdList.LockBuffer(NodeLevelBuffer, 0, Bytes, RLM_WriteOnly);
++	FMemory::Memcpy(Data, NodeLevels.GetData(), Bytes);
++	RHICmdList.UnlockBuffer(NodeLevelBuffer);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatShaders.cpp	2026-09-29 19:11:57
+@@ -19,6 +19,8 @@
+ // Cluster culling shaders
+ IMPLEMENT_GLOBAL_SHADER(FClusterCullingResetCS, "/Plugin/NanoGS/Private/ClusterCulling.usf", "ResetCounterCS", SF_Compute);
+ IMPLEMENT_GLOBAL_SHADER(FClusterCullingCS, "/Plugin/NanoGS/Private/ClusterCulling.usf", "MainCS", SF_Compute);
++IMPLEMENT_GLOBAL_SHADER(FStreamedUploadBlocksCS, "/Plugin/NanoGS/Private/StreamedUpload.usf", "UploadBlocksCS", SF_Compute);
++IMPLEMENT_GLOBAL_SHADER(FStreamedUpdateClustersCS, "/Plugin/NanoGS/Private/StreamedUpload.usf", "UpdateClustersCS", SF_Compute);
+ 
+ // Splat compaction shaders (GPU-driven work reduction)
+ IMPLEMENT_GLOBAL_SHADER(FCompactSplatsCS, "/Plugin/NanoGS/Private/CompactSplats.usf", "MainCS", SF_Compute);
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatStreaming.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatStreaming.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatStreaming.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatStreaming.cpp	2026-09-29 19:11:57
+@@ -0,0 +1,354 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#include "GaussianSplatStreaming.h"
++#include "HAL/IConsoleManager.h"
++
++static TAutoConsoleVariable<int32> CVarGSStreamingMaxReads(
++	TEXT("gs.StreamingMaxReads"),
++	32,
++	TEXT("Streamed SOG: most page reads in flight per asset."),
++	ECVF_RenderThreadSafe);
++
++static TAutoConsoleVariable<int32> CVarGSStreamingMaxUploads(
++	TEXT("gs.StreamingMaxUploadsPerFrame"),
++	16,
++	TEXT("Streamed SOG: most pages moved into the pool per asset and frame (bounds the upload cost of a frame)."),
++	ECVF_RenderThreadSafe);
++
++FGaussianStreamedResidency::~FGaussianStreamedResidency()
++{
++	Detach();
++}
++
++void FGaussianStreamedResidency::Initialize(const FGaussianStreamedLOD& InLOD, const TArray<FGaussianGPUCluster>& AssetClusters,
++	uint32 PoolSplats, const FByteBulkData* InSource)
++{
++	LOD = &InLOD;
++	Source = InSource;
++	Clusters = AssetClusters;
++	NumLevels = InLOD.NumLevels;
++	const int32 Pinned = NumLevels - 1;
++	PinnedRecords = InLOD.LevelSplatCounts.IsValidIndex(Pinned) ? uint32(InLOD.LevelSplatCounts[Pinned]) : 0u;
++	DynamicBase = Align(PinnedRecords, BlockRecords);
++	NumBlocks = PoolSplats / BlockRecords;
++	PoolRecords = DynamicBase + NumBlocks * BlockRecords;
++
++	// One page per (node, finer level) run; pages hold read handles, so the array is sized once
++	int32 NumPages = 0;
++	for (const FGaussianStreamedLODNode& Node : InLOD.Nodes)
++	{
++		for (int32 L = 0; L < Pinned; ++L)
++		{
++			NumPages += (Node.SplatCounts[L] > 0 && Node.ClusterCounts[L] > 0) ? 1 : 0;
++		}
++	}
++	Pages.SetNum(NumPages);
++	PageIndex.Init(INDEX_NONE, InLOD.Nodes.Num() * NumLevels);
++	uint32 LargestPage = 0;
++	int32 P = 0;
++	for (int32 N = 0; N < InLOD.Nodes.Num(); ++N)
++	{
++		const FGaussianStreamedLODNode& Node = InLOD.Nodes[N];
++		for (int32 L = 0; L < Pinned; ++L)
++		{
++			if (Node.SplatCounts[L] == 0 || Node.ClusterCounts[L] == 0)
++			{
++				continue;
++			}
++			FPage& Page = Pages[P];
++			Page.Node = uint32(N);
++			Page.Level = uint32(L);
++			Page.FirstCluster = Node.FirstCluster[L];
++			Page.NumClusters = Node.ClusterCounts[L];
++			Page.RecordStart = Clusters[int32(Page.FirstCluster)].SplatStartIndex;   // a run's records are contiguous
++			Page.RecordCount = Node.SplatCounts[L];
++			LargestPage = FMath::Max(LargestPage, Page.NumClusters);
++			PageIndex[N * NumLevels + L] = P++;
++		}
++	}
++
++	FreeBlocks.Reset(NumBlocks);
++	for (uint32 B = NumBlocks; B-- > 0;)
++	{
++		FreeBlocks.Add(B);                            // popped from the back: lowest blocks first
++	}
++	FreedThisUpdate.Init(false, int32(NumBlocks));
++	bActive = Source != nullptr && NumBlocks > 0 && Pages.Num() > 0;
++	if (bActive && LargestPage > NumBlocks)
++	{
++		UE_LOG(LogTemp, Warning, TEXT("Streamed SOG: the largest page needs %u blocks but the pool has %u (gs.StreamingPoolSplats); those levels will never load"),
++			LargestPage, NumBlocks);
++	}
++}
++
++void FGaussianStreamedResidency::MakeInitialGPUState(TArray<FGaussianGPUCluster>& InOutClusters, TArray<uint32>& OutPoolClusters,
++	uint32 Dummy) const
++{
++	OutPoolClusters.Init(Dummy, int32(PoolRecords));
++	for (int32 C = 0; C < InOutClusters.Num(); ++C)
++	{
++		FGaussianGPUCluster& Cluster = InOutClusters[C];
++		if (Cluster.LODLevel == uint32(NumLevels - 1))
++		{
++			// The coarsest level stays where the asset has it: the start of the pool
++			for (uint32 I = 0; I < Cluster.SplatCount; ++I)
++			{
++				OutPoolClusters[int32(Cluster.SplatStartIndex + I)] = uint32(C);
++			}
++		}
++		else
++		{
++			Cluster.SplatStartIndex = 0;
++			Cluster.SplatCount = 0;                   // not resident: culling skips it
++		}
++	}
++}
++
++uint32 FGaussianStreamedResidency::Resolve(uint32 Node, uint32 Desired, uint64 Frame)
++{
++	const FGaussianStreamedLODNode& N = LOD->Nodes[int32(Node)];
++	for (int32 L = int32(Desired); L < NumLevels; ++L)
++	{
++		if (N.SplatCounts[L] == 0)
++		{
++			continue;
++		}
++		if (L == NumLevels - 1)
++		{
++			return uint32(L);
++		}
++		const int32 P = PageOf(Node, uint32(L));
++		if (P != INDEX_NONE && Pages[P].State == EPageState::Resident)
++		{
++			Pages[P].LastUsed = Frame;
++			return uint32(L);
++		}
++	}
++	return MAX_uint32;
++}
++
++void FGaussianStreamedResidency::Request(uint32 Node, uint32 Desired, float Priority)
++{
++	if (!bActive || int32(Desired) >= NumLevels - 1)
++	{
++		return;
++	}
++	const int32 P = PageOf(Node, Desired);
++	if (P == INDEX_NONE)
++	{
++		return;
++	}
++	FPage& Page = Pages[P];
++	if (Page.State == EPageState::Absent)
++	{
++		Page.State = EPageState::Requested;
++		Page.Priority = Priority;
++		Requested.Add(P);
++	}
++	else if (Page.State == EPageState::Requested)
++	{
++		Page.Priority = FMath::Max(Page.Priority, Priority);
++	}
++}
++
++bool FGaussianStreamedResidency::Allocate(FPage& Page, uint64 Frame, uint32 DummyCluster)
++{
++	while (uint32(FreeBlocks.Num()) < Page.NumClusters)
++	{
++		// Evict the least recently used resident page that no view has used this frame
++		FPage* Victim = nullptr;
++		for (FPage& Other : Pages)
++		{
++			if (Other.State == EPageState::Resident && Other.LastUsed < Frame && (!Victim || Other.LastUsed < Victim->LastUsed))
++			{
++				Victim = &Other;
++			}
++		}
++		if (!Victim)
++		{
++			return false;
++		}
++		Evict(*Victim);
++	}
++	Page.Blocks.Reset(int32(Page.NumClusters));
++	for (uint32 K = 0; K < Page.NumClusters; ++K)
++	{
++		const uint32 Block = FreeBlocks.Pop(EAllowShrinking::No);
++		FreedThisUpdate[int32(Block)] = false;        // reused: the upload rewrites its positions
++		Page.Blocks.Add(Block);
++	}
++	return true;
++}
++
++void FGaussianStreamedResidency::Evict(FPage& Page)
++{
++	for (uint32 K = 0; K < Page.NumClusters; ++K)
++	{
++		Uploads.Clusters.Add(FUintVector4(Page.FirstCluster + K, 0, 0, 0));
++	}
++	for (uint32 Block : Page.Blocks)
++	{
++		FreeBlocks.Add(Block);
++		FreedThisUpdate[int32(Block)] = true;
++		FreedList.Add(Block);
++	}
++	Page.Blocks.Reset();
++	Page.State = EPageState::Absent;
++	++Evictions;
++}
++
++bool FGaussianStreamedResidency::Update(uint64 Frame, uint32 DummyCluster)
++{
++	bool bChanged = false;
++	FreedList.Reset();
++
++	// Finished reads go into the pool
++	const int32 MaxUploads = FMath::Max(1, CVarGSStreamingMaxUploads.GetValueOnRenderThread());
++	int32 Uploaded = 0;
++	for (int32 I = 0; I < Loading.Num();)
++	{
++		FPage& Page = Pages[Loading[I]];
++		if (!Page.Read.IsCompleted() || Uploaded >= MaxUploads)
++		{
++			++I;
++			continue;
++		}
++		const bool bOk = Page.Read.IsOk() && Page.Data.GetSize() >= uint64(Page.RecordCount) * RecordBytes;
++		Page.Read.Reset();
++		Loading.RemoveAtSwap(I, EAllowShrinking::No);
++		if (!bOk)
++		{
++			if (Failures++ == 0)
++			{
++				UE_LOG(LogTemp, Warning, TEXT("Streamed SOG: a page read failed (node %u, level %u); the node keeps a coarser level"), Page.Node, Page.Level);
++			}
++			Page.State = EPageState::Absent;
++			Page.Data = FIoBuffer();
++			continue;
++		}
++		if (!Allocate(Page, Frame, DummyCluster))
++		{
++			Page.State = EPageState::Absent;              // everything resident is in use this frame; asked again later
++			Page.Data = FIoBuffer();
++			continue;
++		}
++		const uint8* Data = Page.Data.GetData();
++		for (uint32 K = 0; K < Page.NumClusters; ++K)
++		{
++			const uint32 C = Page.FirstCluster + K;
++			const FGaussianGPUCluster& Cluster = Clusters[int32(C)];
++			const uint32 Block = Page.Blocks[int32(K)];
++			const uint32 SourceBlock = uint32(Uploads.Records.Num()) / (BlockRecords * RecordBytes);
++			const int32 At = Uploads.Records.AddZeroed(BlockRecords * RecordBytes);
++			FMemory::Memcpy(&Uploads.Records[At], Data + uint64(Cluster.SplatStartIndex - Page.RecordStart) * RecordBytes,
++				Cluster.SplatCount * RecordBytes);
++			Uploads.Blocks.Add(FUintVector4(BlockRecord(Block), C, Cluster.SplatCount, SourceBlock));
++			Uploads.Clusters.Add(FUintVector4(C, BlockRecord(Block), Cluster.SplatCount, 0));
++		}
++		Page.Data = FIoBuffer();
++		Page.State = EPageState::Resident;
++		Page.LastUsed = Frame;
++		++Loads;
++		++Uploaded;
++		bChanged = true;
++	}
++
++	// Blocks freed by evictions and not reused: their pool positions point at the dummy cluster again
++	for (uint32 Block : FreedList)
++	{
++		if (FreedThisUpdate[int32(Block)])
++		{
++			Uploads.Blocks.Add(FUintVector4(BlockRecord(Block), DummyCluster, 0, 0));
++			FreedThisUpdate[int32(Block)] = false;
++		}
++	}
++	bChanged = bChanged || FreedList.Num() > 0;
++
++	// Issue the requested reads, largest priority first; the rest are asked for again by later frames. Only as many as
++	// the pool can take: free blocks plus pages no view drew this frame, less what the reads in flight will need
++	// (otherwise a view that wants more than the pool holds would re-read pages it can never place, every frame).
++	if (bActive && Requested.Num() > 0)
++	{
++		int64 Room = FreeBlocks.Num();
++		for (const FPage& Page : Pages)
++		{
++			Room += (Page.State == EPageState::Resident && Page.LastUsed < Frame) ? int64(Page.NumClusters) : 0;
++		}
++		for (int32 P : Loading)
++		{
++			Room -= int64(Pages[P].NumClusters);
++		}
++		Requested.Sort([this](int32 A, int32 B) { return Pages[A].Priority > Pages[B].Priority; });
++		const int32 MaxReads = FMath::Max(1, CVarGSStreamingMaxReads.GetValueOnRenderThread());
++		for (int32 P : Requested)
++		{
++			FPage& Page = Pages[P];
++			if (Page.State != EPageState::Requested)
++			{
++				continue;
++			}
++			if (Loading.Num() >= MaxReads || int64(Page.NumClusters) > Room)
++			{
++				Page.State = EPageState::Absent;
++				continue;
++			}
++			Room -= int64(Page.NumClusters);
++			FBulkDataBatchRequest::NewBatch(1)
++				.Read(*Source, uint64(Page.RecordStart) * RecordBytes, uint64(Page.RecordCount) * RecordBytes, AIOP_Normal, Page.Data)
++				.Issue(Page.Read);
++			Page.State = EPageState::Loading;
++			Loading.Add(P);
++		}
++	}
++	for (int32 P : Requested)
++	{
++		if (Pages[P].State == EPageState::Requested)
++		{
++			Pages[P].State = EPageState::Absent;
++		}
++	}
++	Requested.Reset();
++
++	if (bChanged)
++	{
++		++Generation;
++	}
++	return bChanged;
++}
++
++void FGaussianStreamedResidency::Detach()
++{
++	bActive = false;
++	for (int32 P : Loading)
++	{
++		FPage& Page = Pages[P];
++		Page.Read.Cancel();
++		Page.Read.Reset();                            // waits for the read to finish
++		Page.Data = FIoBuffer();
++		Page.State = EPageState::Absent;
++	}
++	Loading.Reset();
++	for (int32 P : Requested)
++	{
++		Pages[P].State = EPageState::Absent;
++	}
++	Requested.Reset();
++	Source = nullptr;
++}
++
++FGaussianStreamedResidency::FStats FGaussianStreamedResidency::GetStats() const
++{
++	FStats Stats;
++	Stats.TotalPages = Pages.Num();
++	Stats.TotalBlocks = int32(NumBlocks);
++	Stats.UsedBlocks = int32(NumBlocks) - FreeBlocks.Num();
++	for (const FPage& Page : Pages)
++	{
++		Stats.ResidentPages += Page.State == EPageState::Resident ? 1 : 0;
++		Stats.LoadingPages += Page.State == EPageState::Loading ? 1 : 0;
++	}
++	Stats.Loads = Loads;
++	Stats.Evictions = Evictions;
++	Stats.Failures = Failures;
++	return Stats;
++}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-09-29 19:11:57
+@@ -3,6 +3,7 @@
+ #include "NanoGS.h"
+ #include "GaussianSplatViewExtension.h"
+ #include "GaussianSplatRenderer.h"
++#include "GaussianSplatRenderData.h"
+ #include "GaussianSplatSceneProxy.h"
+ #include "GaussianGlobalAccumulator.h"
+ #include "Interfaces/IPluginManager.h"
+@@ -300,29 +301,35 @@
+ 	if (Budget == 0)
+ 	{
+ 		Accumulator.BudgetLODScale = 1.0f;
++		Accumulator.LastNonStreamedVisible = 0;
+ 		return;
+ 	}
+ 	if (!Accumulator.bVisibleCountReadbackPending || !Accumulator.VisibleCountReadback->IsReady())
+ 	{
+ 		return;
+ 	}
++	// Streamed SOG proxies choose levels that fit the budget themselves (ChooseStreamedLevels); the controller
++	// only scales the other proxies' thresholds, into whatever the streamed choice left last frame
+ 	const uint32 NumProxies = Accumulator.VisibleCountReadbackProxies;
+ 	const uint32* Counts = static_cast<const uint32*>(Accumulator.VisibleCountReadback->Lock(NumProxies * sizeof(uint32)));
+ 	uint64 Visible = 0;
+ 	for (uint32 Index = 0; Index < NumProxies; ++Index)
+ 	{
+-		Visible += Counts[Index];
++		const bool bStreamed = Accumulator.VisibleCountReadbackStreamed.IsValidIndex(int32(Index)) && Accumulator.VisibleCountReadbackStreamed[Index];
++		Visible += bStreamed ? 0 : Counts[Index];
+ 	}
+ 	Accumulator.VisibleCountReadback->Unlock();
+ 	Accumulator.bVisibleCountReadbackPending = false;
++	Accumulator.LastNonStreamedVisible = Visible;
+ 
+-	const double Target = 0.9 * Budget;
++	const double Available = double(Budget > Accumulator.LastStreamedSelected ? Budget - Accumulator.LastStreamedSelected : 0);
++	const double Target = FMath::Max(0.9 * Available, 1.0);
+ 	double Scale = Accumulator.BudgetLODScale;
+-	if (Visible > 0.95 * Budget)   // keep 5% headroom for camera motion
++	if (Visible > 0.95 * Available)   // keep 5% headroom for camera motion
+ 	{
+ 		Scale *= FMath::Clamp(FMath::Sqrt(double(Visible) / Target), 1.05, 2.0);
+ 	}
+-	else if (Visible < 0.7 * Budget && Scale > 1.0)
++	else if (Visible < 0.7 * Available && Scale > 1.0)
+ 	{
+ 		Scale *= FMath::Clamp(FMath::Sqrt(double(Visible) / Target), 0.8, 0.98);
+ 	}
+@@ -330,7 +337,8 @@
+ }
+ 
+ /** After the visible-count prefix sum: copy the per-proxy (uncapped) counts for UpdateBudgetLODScale. */
+-static void EnqueueVisibleCountReadback(FRHICommandListImmediate& RHICmdList, FGaussianGlobalAccumulator* Accumulator, uint32 NumProxies)
++static void EnqueueVisibleCountReadback(FRHICommandListImmediate& RHICmdList, FGaussianGlobalAccumulator* Accumulator, uint32 NumProxies,
++	const TArray<bool>& bStreamed)
+ {
+ 	if (Accumulator->bVisibleCountReadbackPending || NumProxies == 0 || !Accumulator->GlobalVisibleCountArrayBuffer.IsValid())
+ 	{
+@@ -345,9 +353,320 @@
+ 	Accumulator->VisibleCountReadback->EnqueueCopy(RHICmdList, Accumulator->GlobalVisibleCountArrayBuffer, NumProxies * sizeof(uint32));
+ 	RHICmdList.Transition(FRHITransitionInfo(Accumulator->GlobalVisibleCountArrayBuffer, ERHIAccess::CopySrc, ERHIAccess::SRVCompute));
+ 	Accumulator->VisibleCountReadbackProxies = NumProxies;
++	Accumulator->VisibleCountReadbackStreamed = bStreamed;
+ 	Accumulator->bVisibleCountReadbackPending = true;
+ }
+ 
++/** Debug: log the Streamed SOG level choice. */
++TAutoConsoleVariable<int32> CVarGSStreamedLODStats(
++	TEXT("gs.StreamedLODStats"),
++	0,
++	TEXT("Debug: 1 = log the Streamed SOG LOD choice (visible nodes and splats per level) about once a second."),
++	ECVF_RenderThreadSafe);
++
++/** One Streamed SOG proxy's level choice for a view. */
++struct FStreamedLODChoice
++{
++	FGaussianSplatGPUResources* Resources = nullptr;
++	const FGaussianStreamedLOD* LOD = nullptr;
++	FMatrix LocalToWorld = FMatrix::Identity;
++	float Threshold = 0.0f;
++	TArray<uint32> Levels;            // per node; MAX_uint32 = not drawn
++	TArray<float> Coverage;           // per node: f^2 (0 = outside the frustum); streaming priority
++	uint64 Selected = 0;              // splats in the chosen levels
++};
++
++/**
++ * The streamed threshold rule is looser than NanoGS's own LOD metric at the same value: in the campus quad view,
++ * Errors[l] * f^2 <= (2T)^2 costs about what NanoGS's LOD costs at T (both at the component default, 0.03).
++ */
++static constexpr double GStreamedThresholdScale = 2.0;
++
++/**
++ * Streamed SOG LOD: choose one level per lod-meta.json node for this view.
++ *  - Coverage: a node of radius r at distance d covers f = r / (r + d * tan(fov/2)) of the half-screen (1 when the
++ *    camera is inside it).
++ *  - Budget (bBudget, PlayCanvas's approach): every visible node starts at its coarsest level and is refined, largest
++ *    coverage-weighted error reduction per added splat first, until the chosen splats fill Budget.
++ *  - No budget: a node takes its coarsest level whose error, a relative image error, is within the LOD error threshold
++ *    at that coverage: Errors[l] * f^2 <= T^2.
++ *  Nodes outside the frustum draw nothing. ForceLevel >= 0 (gs.DebugForceLODLevel) picks that level everywhere.
++ */
++static void ChooseStreamedLevels(const FSceneView& View, TArray<FStreamedLODChoice>& Choices, bool bBudget, uint64 Budget,
++	int32 ForceLevel)
++{
++	const FMatrix& Proj = View.ViewMatrices.GetViewToClip();
++	const bool bPerspective = View.IsPerspectiveProjection();
++	const double ProjScale = FMath::Max(Proj.M[0][0], Proj.M[1][1]);   // 1 / tan(fov/2); orthographic: 1 / half-height
++	const FVector CameraPos = View.ViewMatrices.GetViewOrigin();
++	bBudget = bBudget && ForceLevel < 0;
++
++	TArray<TArray<float>> Coverage;
++	TArray<TArray<uint32>> Targets;
++	Coverage.SetNum(Choices.Num());
++	Targets.SetNum(Choices.Num());
++	uint64 Spent = 0;
++
++	for (int32 C = 0; C < Choices.Num(); ++C)
++	{
++		FStreamedLODChoice& Choice = Choices[C];
++		const FGaussianStreamedLOD& LOD = *Choice.LOD;
++		const int32 NumNodes = LOD.Nodes.Num();
++		Choice.Levels.Init(MAX_uint32, NumNodes);
++		Coverage[C].Init(0.0f, NumNodes);
++		Targets[C].Init(MAX_uint32, NumNodes);
++		const double Scale = Choice.LocalToWorld.GetMaximumAxisScale();
++		const double Threshold = GStreamedThresholdScale * double(Choice.Threshold);
++		const double Threshold2 = Threshold * Threshold;
++		for (int32 N = 0; N < NumNodes; ++N)
++		{
++			const FGaussianStreamedLODNode& Node = LOD.Nodes[N];
++			int32 Finest = INDEX_NONE;
++			int32 Coarsest = INDEX_NONE;
++			for (int32 L = 0; L < LOD.NumLevels; ++L)
++			{
++				if (Node.SplatCounts[L] > 0)
++				{
++					Finest = Finest == INDEX_NONE ? L : Finest;
++					Coarsest = L;
++				}
++			}
++			const FVector Center = Choice.LocalToWorld.TransformPosition(FVector((Node.BoundsMin + Node.BoundsMax) * 0.5f));
++			const double Radius = 0.5 * FVector(Node.BoundsMax - Node.BoundsMin).Size() * Scale;
++			if (Finest == INDEX_NONE || !View.ViewFrustum.IntersectSphere(Center, Radius))
++			{
++				continue;
++			}
++			double F = 1.0;
++			if (bPerspective)
++			{
++				const double Distance = FMath::Max(0.0, FVector::Dist(Center, CameraPos) - Radius);
++				F = Radius / FMath::Max(Radius + Distance / ProjScale, UE_SMALL_NUMBER);
++			}
++			else
++			{
++				F = FMath::Min(1.0, Radius * ProjScale);
++			}
++			const double F2 = F * F;
++			Coverage[C][N] = float(F2);
++
++			int32 Level = Finest;
++			if (ForceLevel >= 0)
++			{
++				Level = Coarsest;
++				for (int32 L = FMath::Min(ForceLevel, LOD.NumLevels - 1); L <= Coarsest; ++L)
++				{
++					if (Node.SplatCounts[L] > 0)
++					{
++						Level = L;
++						break;
++					}
++				}
++			}
++			else
++			{
++				for (int32 L = Coarsest; L > Finest; --L)
++				{
++					if (Node.SplatCounts[L] > 0 && double(Node.Errors[L]) * F2 <= Threshold2)
++					{
++						Level = L;
++						break;
++					}
++				}
++			}
++			// With a budget the refinement may go all the way to the finest level; the threshold applies without one
++			Targets[C][N] = uint32(bBudget ? Finest : Level);
++			Choice.Levels[N] = uint32(bBudget ? Coarsest : Level);
++			Spent += Node.SplatCounts[Choice.Levels[N]];
++		}
++	}
++
++	if (bBudget && Spent < Budget)
++	{
++		// Greedy refinement. A node's next step jumps to the finer level with the best error reduction per splat
++		// (not just the adjacent one), which keeps each node's sequence of steps in decreasing value order.
++		struct FStep
++		{
++			double Value;
++			int32 Choice;
++			int32 Node;
++			uint32 Level;
++		};
++		auto NextStep = [&](int32 C, int32 N, FStep& Out) -> bool
++		{
++			const FGaussianStreamedLODNode& Node = Choices[C].LOD->Nodes[N];
++			const uint32 Current = Choices[C].Levels[N];
++			double Best = 0.0;
++			bool bFound = false;
++			for (int32 L = int32(Current) - 1; L >= int32(Targets[C][N]); --L)
++			{
++				if (Node.SplatCounts[L] == 0)
++				{
++					continue;
++				}
++				const double Gain = double(Node.Errors[Current]) - double(Node.Errors[L]);
++				const double Cost = double(Node.SplatCounts[L]) - double(Node.SplatCounts[Current]);
++				const double Value = Cost <= 0.0 ? UE_BIG_NUMBER : Coverage[C][N] * Gain / Cost;
++				if (Gain > 0.0 && Value > Best)
++				{
++					Best = Value;
++					Out = { Value, C, N, uint32(L) };
++					bFound = true;
++				}
++			}
++			return bFound;
++		};
++		auto ByValue = [](const FStep& A, const FStep& B) { return A.Value > B.Value; };
++		TArray<FStep> Heap;
++		for (int32 C = 0; C < Choices.Num(); ++C)
++		{
++			for (int32 N = 0; N < Choices[C].Levels.Num(); ++N)
++			{
++				FStep Step;
++				if (Choices[C].Levels[N] != MAX_uint32 && NextStep(C, N, Step))
++				{
++					Heap.HeapPush(Step, ByValue);
++				}
++			}
++		}
++		while (Heap.Num() > 0 && Spent < Budget)
++		{
++			FStep Step;
++			Heap.HeapPop(Step, ByValue);
++			const FGaussianStreamedLODNode& Node = Choices[Step.Choice].LOD->Nodes[Step.Node];
++			uint32& Level = Choices[Step.Choice].Levels[Step.Node];
++			const uint64 Before = Node.SplatCounts[Level];
++			if (Spent - Before + Node.SplatCounts[Step.Level] > Budget)
++			{
++				// Too big: try the adjacent finer level instead, else leave the node here
++				int32 Adjacent = int32(Level) - 1;
++				while (Adjacent >= int32(Step.Level) && Node.SplatCounts[Adjacent] == 0)
++				{
++					--Adjacent;
++				}
++				if (Adjacent <= int32(Step.Level) || Spent - Before + Node.SplatCounts[Adjacent] > Budget
++					|| Node.Errors[Adjacent] >= Node.Errors[Level])
++				{
++					continue;
++				}
++				Step.Level = uint32(Adjacent);
++			}
++			Spent = Spent - Before + Node.SplatCounts[Step.Level];
++			Level = Step.Level;
++			FStep Next;
++			if (NextStep(Step.Choice, Step.Node, Next))
++			{
++				Heap.HeapPush(Next, ByValue);
++			}
++		}
++	}
++
++	for (int32 C = 0; C < Choices.Num(); ++C)
++	{
++		FStreamedLODChoice& Choice = Choices[C];
++		Choice.Coverage = MoveTemp(Coverage[C]);
++		Choice.Selected = 0;
++		for (int32 N = 0; N < Choice.Levels.Num(); ++N)
++		{
++			if (Choice.Levels[N] != MAX_uint32)
++			{
++				Choice.Selected += Choice.LOD->Nodes[N].SplatCounts[Choice.Levels[N]];
++			}
++		}
++	}
++
++	static double LastLog = 0.0;
++	if (CVarGSStreamedLODStats.GetValueOnRenderThread() != 0 && FPlatformTime::Seconds() - LastLog > 1.0)
++	{
++		LastLog = FPlatformTime::Seconds();
++		for (const FStreamedLODChoice& Choice : Choices)
++		{
++			TArray<int32> Nodes;
++			TArray<uint64> Splats;
++			Nodes.Init(0, Choice.LOD->NumLevels);
++			Splats.Init(0, Choice.LOD->NumLevels);
++			for (int32 N = 0; N < Choice.Levels.Num(); ++N)
++			{
++				if (Choice.Levels[N] != MAX_uint32)
++				{
++					++Nodes[Choice.Levels[N]];
++					Splats[Choice.Levels[N]] += Choice.LOD->Nodes[N].SplatCounts[Choice.Levels[N]];
++				}
++			}
++			FString PerLevel;
++			for (int32 L = 0; L < Choice.LOD->NumLevels; ++L)
++			{
++				PerLevel += FString::Printf(TEXT(" L%d %d/%llu"), L, Nodes[L], Splats[L]);
++			}
++			UE_LOG(LogTemp, Display, TEXT("gs.StreamedLODStats: %llu splats selected (budget %s, threshold %.3f); nodes/splats per level:%s"),
++				Choice.Selected, bBudget ? *FString::Printf(TEXT("%llu"), Budget) : TEXT("none"), Choice.Threshold, *PerLevel);
++		}
++	}
++}
++
++/**
++ * Streamed SOG residency: keep the pages this view draws, ask for the levels it wants, move finished reads into the
++ * pools (GPU uploads before culling), then draw only resident levels. The coarsest level is always resident.
++ */
++static void ResolveStreamedResidency(FRHICommandListImmediate& RHICmdList, TArray<FStreamedLODChoice>& Choices)
++{
++	const uint64 Frame = GFrameNumberRenderThread;
++	TArray<FGaussianSplatRenderData*, TInlineAllocator<4>> Streaming;
++	for (FStreamedLODChoice& Choice : Choices)
++	{
++		FGaussianSplatRenderData* Data = Choice.Resources->GetSharedRenderData();
++		FGaussianStreamedResidency* Residency = Data ? Data->Residency.Get() : nullptr;
++		if (!Residency)
++		{
++			continue;
++		}
++		for (int32 N = 0; N < Choice.Levels.Num(); ++N)
++		{
++			if (Choice.Levels[N] != MAX_uint32)
++			{
++				Residency->Resolve(uint32(N), Choice.Levels[N], Frame);          // keeps what's drawn from eviction
++				Residency->Request(uint32(N), Choice.Levels[N], Choice.Coverage[N]);
++			}
++		}
++		Streaming.AddUnique(Data);
++	}
++	for (FGaussianSplatRenderData* Data : Streaming)
++	{
++		Data->Residency->Update(Frame, Data->DummyCluster);
++		FGaussianSplatRenderer::DispatchStreamedUploads(RHICmdList, *Data);
++	}
++	for (FStreamedLODChoice& Choice : Choices)
++	{
++		FGaussianSplatRenderData* Data = Choice.Resources->GetSharedRenderData();
++		if (!Data || !Data->Residency.IsValid())
++		{
++			continue;
++		}
++		Choice.Selected = 0;
++		for (int32 N = 0; N < Choice.Levels.Num(); ++N)
++		{
++			if (Choice.Levels[N] != MAX_uint32)
++			{
++				Choice.Levels[N] = Data->Residency->Resolve(uint32(N), Choice.Levels[N], Frame);
++				Choice.Selected += Choice.Levels[N] != MAX_uint32 ? Choice.LOD->Nodes[N].SplatCounts[Choice.Levels[N]] : 0;
++			}
++		}
++	}
++
++	static double LastLog = 0.0;
++	if (CVarGSStreamedLODStats.GetValueOnRenderThread() != 0 && Streaming.Num() > 0 && FPlatformTime::Seconds() - LastLog > 1.0)
++	{
++		LastLog = FPlatformTime::Seconds();
++		for (FGaussianSplatRenderData* Data : Streaming)
++		{
++			const FGaussianStreamedResidency::FStats Stats = Data->Residency->GetStats();
++			UE_LOG(LogTemp, Display, TEXT("gs.StreamedLODStats: residency %d/%d pages resident, %d loading, blocks %d/%d, %llu loads, %llu evictions, %llu failed reads"),
++				Stats.ResidentPages, Stats.TotalPages, Stats.LoadingPages, Stats.UsedBlocks, Stats.TotalBlocks,
++				Stats.Loads, Stats.Evictions, Stats.Failures);
++		}
++	}
++}
++
+ static FGaussianSortKeyParams GetSortKeyParams(const FSceneView& View)
+ {
+ 	FGaussianSortKeyParams SortKeys;
+@@ -585,7 +904,7 @@
+ 		for (FProxyRenderInfo& Info : VisibleProxies)
+ 		{
+ 			Info.GlobalBaseOffset = TotalSplatCount;
+-			TotalSplatCount += (uint32)Info.Proxy->GetSplatCount();
++			TotalSplatCount += (uint32)Info.Proxy->GetRenderSplatCount();
+ 		}
+ 
+ 		if (TotalSplatCount == 0)
+@@ -640,6 +959,14 @@
+ 					bCanSkip = false;
+ 					break;
+ 				}
++				// Streamed SOG residency: reads in flight or a changed resident set re-run the level choice
++				const FGaussianSplatRenderData* SharedData = GPUResources->GetSharedRenderData();
++				if (SharedData && SharedData->Residency.IsValid()
++					&& (SharedData->Residency->HasPendingReads() || GPUResources->CachedStreamingGeneration != SharedData->Residency->GetGeneration()))
++				{
++					bCanSkip = false;
++					break;
++				}
+ 			}
+ 		}
+ 
+@@ -690,6 +1017,7 @@
+ 				TArray<FProxyRenderInfo>& ValidProxies = PassState->ValidProxies;
+ 				ValidProxies.Reserve(VisibleProxies.Num());
+ 				uint32 NewTotalSplatCount = 0;
++				uint32 NewMaxVisibleSplatCount = 0;   // Streamed SOG proxies draw at most one level per node
+ 
+ 				for (const auto& Info : VisibleProxies)
+ 				{
+@@ -698,7 +1026,9 @@
+ 					{
+ 						FProxyRenderInfo ValidInfo = Info;
+ 						ValidInfo.GlobalBaseOffset = NewTotalSplatCount;
+-						NewTotalSplatCount += (uint32)Info.Proxy->GetSplatCount();
++						NewTotalSplatCount += (uint32)Info.Proxy->GetRenderSplatCount();
++						const FGaussianSplatGPUResources* Resources = Info.Proxy->GetGPUResources();
++						NewMaxVisibleSplatCount += Resources->bStreamedLOD ? uint32(Resources->TotalSplatCount) : (uint32)Info.Proxy->GetRenderSplatCount();
+ 						ValidProxies.Add(ValidInfo);
+ 					}
+ 				}
+@@ -727,9 +1057,6 @@
+ 					Info.Proxy->TryInitializeColorTexture(RHICmdList);
+ 				}
+ 
+-				// Ensure global buffers are large enough for all splats
+-				RawAccumulator->ResizeIfNeeded(RHICmdList, NewTotalSplatCount);
+-
+ 				// Re-check if all valid proxies support Nanite compaction
+ 				bool bAllValidNanite = true;
+ 				for (const auto& Info : ValidProxies)
+@@ -748,6 +1075,46 @@
+ 					bAllValidNanite = false;
+ 				}
+ 
++				// Ensure global buffers are large enough: compaction outputs visible splats only (a Streamed SOG
++				// proxy one level per node); the fallback path writes every splat of every proxy
++				RawAccumulator->ResizeIfNeeded(RHICmdList, bAllValidNanite ? NewMaxVisibleSplatCount : NewTotalSplatCount);
++
++				// Streamed SOG proxies: choose each node's level for this view, jointly within the budget (the
++				// budget left by other proxies' visible splats at the last readback)
++				TArray<FStreamedLODChoice> StreamedChoices;
++				TArray<int32> StreamedChoiceOfProxy;
++				StreamedChoiceOfProxy.Init(INDEX_NONE, ValidProxies.Num());
++				if (!bCanSkipAdjusted)
++				{
++					for (int32 ProxyIdx = 0; ProxyIdx < ValidProxies.Num(); ++ProxyIdx)
++					{
++						FGaussianSplatGPUResources* GPUResources = ValidProxies[ProxyIdx].Proxy->GetGPUResources();
++						const FGaussianStreamedLOD* StreamedLOD = GPUResources ? GPUResources->GetStreamedLOD() : nullptr;
++						if (StreamedLOD && GPUResources->NodeLevelBuffer.IsValid())
++						{
++							StreamedChoiceOfProxy[ProxyIdx] = StreamedChoices.Num();
++							FStreamedLODChoice& Choice = StreamedChoices.AddDefaulted_GetRef();
++							Choice.Resources = GPUResources;
++							Choice.LOD = StreamedLOD;
++							Choice.LocalToWorld = ValidProxies[ProxyIdx].LocalToWorld;
++							Choice.Threshold = ValidProxies[ProxyIdx].Proxy->GetLODErrorThreshold();
++						}
++					}
++					uint64 StreamedSelected = 0;
++					if (StreamedChoices.Num() > 0)
++					{
++						const uint64 OtherVisible = FMath::Min<uint64>(RawAccumulator->LastNonStreamedVisible, MaxRenderBudget);
++						ChooseStreamedLevels(*SceneView, StreamedChoices, MaxRenderBudget > 0, MaxRenderBudget - OtherVisible,
++							CurrentDebugForceLODLevel);
++						ResolveStreamedResidency(RHICmdList, StreamedChoices);
++						for (const FStreamedLODChoice& Choice : StreamedChoices)
++						{
++							StreamedSelected += Choice.Selected;
++						}
++					}
++					RawAccumulator->LastStreamedSelected = StreamedSelected;
++				}
++
+ 				if (bAllValidNanite)
+ 				{
+ 					//==================================================
+@@ -774,8 +1141,9 @@
+ 							// --------------------------------------------------
+ 							uint32 CumulativeSplatCount = 0;
+ 
+-							for (const auto& Info : ValidProxies)
++							for (int32 ProxyIdx = 0; ProxyIdx < ValidProxies.Num(); ++ProxyIdx)
+ 							{
++								const FProxyRenderInfo& Info = ValidProxies[ProxyIdx];
+ 								// Budget early-out: if cumulative total already exceeds budget,
+ 								// skip culling/compaction for remaining (farther) proxies
+ 								if (MaxRenderBudget > 0 && CumulativeSplatCount >= MaxRenderBudget)
+@@ -785,9 +1153,17 @@
+ 
+ 								FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+ 								if (!GPUResources) continue;  // Extra safety check
+-								int32 SplatCount = Info.Proxy->GetSplatCount();
++								// Streamed SOG with a residency pool: the passes walk the pool (every record is an original splat)
++								int32 SplatCount = Info.Proxy->GetRenderSplatCount();
+ 								int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+ 
++								// Streamed SOG: the level chosen per node, read by the culling pass
++								const int32 ChoiceIdx = StreamedChoiceOfProxy[ProxyIdx];
++								if (ChoiceIdx != INDEX_NONE)
++								{
++									GPUResources->UploadNodeLevels(RHICmdList, StreamedChoices[ChoiceIdx].Levels);
++								}
++
+ 								// Cluster culling → fills ClusterVisibilityBitmap
+ 								FGaussianSplatRenderer::DispatchClusterCulling(
+ 									RHICmdList, *SceneView, GPUResources,
+@@ -801,7 +1177,9 @@
+ 								// PrepareIndirectArgs → fills IndirectDispatchArgsBuffer for CalcViewData
+ 								FGaussianSplatRenderer::DispatchPrepareIndirectArgs(RHICmdList, GPUResources);
+ 
+-								CumulativeSplatCount += (uint32)SplatCount;
++								// Streamed SOG proxies fit their choice into the budget left by the others, so only the others
++								// count toward this early-out (else a streamed proxy that fills the budget would starve them)
++								CumulativeSplatCount += ChoiceIdx != INDEX_NONE ? 0u : (uint32)SplatCount;
+ 								NumProcessedProxies++;
+ 							}
+ 
+@@ -822,7 +1200,12 @@
+ 								RHICmdList, RawAccumulator, NumProcessedProxies, MaxRenderBudget);
+ 							if (MaxRenderBudget > 0)
+ 							{
+-								EnqueueVisibleCountReadback(RHICmdList, RawAccumulator, uint32(NumProcessedProxies));
++								TArray<bool> bStreamed;
++								for (int32 i = 0; i < NumProcessedProxies; i++)
++								{
++									bStreamed.Add(StreamedChoiceOfProxy[i] != INDEX_NONE);
++								}
++								EnqueueVisibleCountReadback(RHICmdList, RawAccumulator, uint32(NumProcessedProxies), bStreamed);
+ 							}
+ 
+ 							// --------------------------------------------------
+@@ -835,7 +1218,7 @@
+ 								const auto& Info = ValidProxies[i];
+ 								FGaussianSplatGPUResources* GPUResources = Info.Proxy->GetGPUResources();
+ 								if (!GPUResources) continue;  // Extra safety check
+-								int32 SplatCount = Info.Proxy->GetSplatCount();
++								int32 SplatCount = Info.Proxy->GetRenderSplatCount();
+ 								int32 OriginalSplatCount = SplatCount - GPUResources->LODSplatCount;
+ 
+ 								FGaussianSplatRenderer::DispatchCalcViewDataCompactedGlobal(
+@@ -889,6 +1272,8 @@
+ 								GPUResources->CachedErrorThreshold = Info.Proxy->GetLODErrorThreshold() * BudgetLODScale;
+ 								GPUResources->CachedDebugMode = CurrentDebugMode;
+ 								GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
++								GPUResources->CachedStreamingGeneration = GPUResources->GetSharedRenderData() && GPUResources->GetSharedRenderData()->Residency.IsValid()
++									? GPUResources->GetSharedRenderData()->Residency->GetGeneration() : 0u;
+ 								GPUResources->bHasCachedSortData = true;
+ 							}
+ 							else
+@@ -925,8 +1310,9 @@
+ 							// --------------------------------------------------
+ 							// Phase 1: Per-proxy ClusterCulling + CalcViewData
+ 							// --------------------------------------------------
+-							for (const auto& Info : ValidProxies)
++							for (int32 ProxyIdx = 0; ProxyIdx < ValidProxies.Num(); ++ProxyIdx)
+ 							{
++								const FProxyRenderInfo& Info = ValidProxies[ProxyIdx];
+ 								// Skip proxies that would write beyond the render budget
+ 								if (MaxRenderBudget > 0 && Info.GlobalBaseOffset >= MaxRenderBudget)
+ 								{
+@@ -939,6 +1325,10 @@
+ 								// Cluster culling for Nanite-enabled proxies
+ 								if (GPUResources->bEnableNanite && GPUResources->bHasClusterData)
+ 								{
++									if (StreamedChoiceOfProxy[ProxyIdx] != INDEX_NONE)
++									{
++										GPUResources->UploadNodeLevels(RHICmdList, StreamedChoices[StreamedChoiceOfProxy[ProxyIdx]].Levels);
++									}
+ 									FGaussianSplatRenderer::DispatchClusterCulling(
+ 										RHICmdList, *SceneView, GPUResources,
+ 										Info.LocalToWorld, Info.Proxy->GetLODErrorThreshold() * BudgetLODScale, Info.bUseLODRendering);
+@@ -949,7 +1339,7 @@
+ 								// overruns the budget-capped global buffers (48MB cap = 750k splats on
+ 								// iOS wrote OOB at 48MB+ offsets). Clamp to the remaining capacity —
+ 								// the sort and draw below already use CappedTotalSplatCount.
+-								int32 ProxySplatCount = Info.Proxy->GetSplatCount();
++								int32 ProxySplatCount = Info.Proxy->GetRenderSplatCount();
+ 								if (MaxRenderBudget > 0 && Info.GlobalBaseOffset + (uint32)ProxySplatCount > MaxRenderBudget)
+ 								{
+ 									ProxySplatCount = (int32)(MaxRenderBudget - Info.GlobalBaseOffset);
+@@ -1000,6 +1390,8 @@
+ 							GPUResources->CachedErrorThreshold = Info.Proxy->GetLODErrorThreshold() * BudgetLODScale;
+ 							GPUResources->CachedDebugMode = CurrentDebugMode;
+ 							GPUResources->CachedDebugForceLODLevel = CurrentDebugForceLODLevel;
++							GPUResources->CachedStreamingGeneration = GPUResources->GetSharedRenderData() && GPUResources->GetSharedRenderData()->Residency.IsValid()
++								? GPUResources->GetSharedRenderData()->Residency->GetGeneration() : 0u;
+ 							GPUResources->bHasCachedSortData = true;
+ 						}
+ 					}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/SOG/SOGCodec.cpp b/Plugins/NanoGS/Source/NanoGS/Private/SOG/SOGCodec.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/SOG/SOGCodec.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Private/SOG/SOGCodec.cpp	2026-09-29 19:11:57
+@@ -47,6 +47,8 @@
+         case Error::ImageSizeMismatch: return "ImageSizeMismatch";
+         case Error::BadQuatMode:       return "BadQuatMode";
+         case Error::LabelOutOfRange:   return "LabelOutOfRange";
++        case Error::BadLodMeta:        return "BadLodMeta";
++        case Error::BadChunk:          return "BadChunk";
+     }
+     return "Unknown";
+ }
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterTypes.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterTypes.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterTypes.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterTypes.h	2026-09-29 19:11:57
+@@ -205,8 +205,11 @@
+ 	/** LOD splat count (0 for leaf clusters) */
+ 	uint32 LODSplatCount;
+ 
++	/** Streamed SOG assets: the lod-meta.json node (FGaussianStreamedLOD::Nodes) this cluster belongs to */
++	uint32 StreamedNode;
++
+ 	/** Padding to 80 bytes (next 16-byte alignment) */
+-	uint32 Padding[3];
++	uint32 Padding[2];
+ 
+ 	FGaussianGPUCluster()
+ 		: BoundsMin(FVector3f::ZeroVector)
+@@ -219,8 +222,9 @@
+ 		, MaxError(0.0f)
+ 		, LODSplatStartIndex(0)
+ 		, LODSplatCount(0)
++		, StreamedNode(0)
+ 	{
+-		Padding[0] = Padding[1] = Padding[2] = 0;
++		Padding[0] = Padding[1] = 0;
+ 	}
+ 
+ 	/** Construct from CPU cluster data */
+@@ -239,8 +243,9 @@
+ 		, MaxError(Cluster.MaxError)
+ 		, LODSplatStartIndex(Cluster.LODSplatStartIndex)
+ 		, LODSplatCount(Cluster.LODSplatCount)
++		, StreamedNode(0)
+ 	{
+-		Padding[0] = Padding[1] = Padding[2] = 0;
++		Padding[0] = Padding[1] = 0;
+ 	}
+ };
+ 
+@@ -371,6 +376,87 @@
+ 		Ar << Hierarchy.TotalSplatCount;
+ 		Ar << Hierarchy.LODSplats;
+ 		Ar << Hierarchy.TotalLODSplatCount;
++		return Ar;
++	}
++};
++
++/**
++ * Streamed SOG LOD, imported from a lod-meta.json. Each leaf of its tree is a node: one region of the scene with
++ * up to NumLevels alternative representations (level 0 finest). Every (node, level) run of splats is split into
++ * clusters of up to 128 splats, stored in the cluster hierarchy as leaf clusters whose LODLevel is the level.
++ * Records are ordered coarsest level first, so the coarsest level is a prefix of the splat buffer. Each frame
++ * the renderer picks one level per node on the CPU and the culling pass keeps only that level's clusters.
++ */
++struct FGaussianStreamedLODNode
++{
++	/** Node bounds from lod-meta.json, in local space (cm) */
++	FVector3f BoundsMin = FVector3f::ZeroVector;
++	FVector3f BoundsMax = FVector3f::ZeroVector;
++
++	/** Per level: relative image error against the finest level (splat-transform --lod-errors), non-decreasing */
++	TArray<float> Errors;
++
++	/** Per level: splats, and the node's clusters [FirstCluster, FirstCluster + ClusterCounts) */
++	TArray<uint32> SplatCounts;
++	TArray<uint32> FirstCluster;
++	TArray<uint32> ClusterCounts;
++
++	friend FArchive& operator<<(FArchive& Ar, FGaussianStreamedLODNode& Node)
++	{
++		Ar << Node.BoundsMin;
++		Ar << Node.BoundsMax;
++		Ar << Node.Errors;
++		Ar << Node.SplatCounts;
++		Ar << Node.FirstCluster;
++		Ar << Node.ClusterCounts;
++		return Ar;
++	}
++};
++
++struct FGaussianStreamedLOD
++{
++	int32 NumLevels = 0;
++
++	/** True when the errors come from the file; false when derived from splat counts (log(finest / count)) */
++	bool bErrorsFromFile = false;
++
++	TArray<FGaussianStreamedLODNode> Nodes;
++
++	/** Splats per level over all nodes */
++	TArray<uint64> LevelSplatCounts;
++
++	bool IsValid() const { return NumLevels > 0 && Nodes.Num() > 0; }
++
++	/** Most splats one frame can select: every node at its largest level */
++	uint32 GetMaxSelectableSplats() const
++	{
++		uint64 Total = 0;
++		for (const FGaussianStreamedLODNode& Node : Nodes)
++		{
++			uint32 Largest = 0;
++			for (uint32 Count : Node.SplatCounts)
++			{
++				Largest = FMath::Max(Largest, Count);
++			}
++			Total += Largest;
++		}
++		return uint32(FMath::Min<uint64>(Total, MAX_uint32));
++	}
++
++	void Reset()
++	{
++		NumLevels = 0;
++		bErrorsFromFile = false;
++		Nodes.Empty();
++		LevelSplatCounts.Empty();
++	}
++
++	friend FArchive& operator<<(FArchive& Ar, FGaussianStreamedLOD& LOD)
++	{
++		Ar << LOD.NumLevels;
++		Ar << LOD.bErrorsFromFile;
++		Ar << LOD.Nodes;
++		Ar << LOD.LevelSplatCounts;
+ 		return Ar;
+ 	}
+ };
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianGlobalAccumulator.h	2026-09-29 19:11:57
+@@ -114,6 +114,9 @@
+ 	TUniquePtr<FRHIGPUBufferReadback> VisibleCountReadback;         ///< per-proxy visible counts (before the budget cap)
+ 	uint32 VisibleCountReadbackProxies = 0;
+ 	bool bVisibleCountReadbackPending = false;
++	TArray<bool> VisibleCountReadbackStreamed;   ///< per read-back proxy: Streamed SOG (its LOD choice meets the budget itself)
++	uint64 LastNonStreamedVisible = 0;           ///< other proxies' visible splats at the last readback
++	uint64 LastStreamedSelected = 0;             ///< splats the Streamed SOG level choice selected last frame
+ 
+ 	//----------------------------------------------------------------------
+ 	// Previous frame data for velocity calculation (per-view)
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatAsset.h	2026-09-29 19:11:57
+@@ -5,6 +5,7 @@
+ #include "CoreMinimal.h"
+ #include "UObject/ObjectMacros.h"
+ #include "Serialization/BulkData.h"
++#include "RenderCommandFence.h"
+ #include "GaussianDataTypes.h"
+ #include "GaussianClusterTypes.h"
+ #include "SOG/SOGTypes.h"
+@@ -21,9 +22,11 @@
+ 
+ // Serialization magic/version for format identification
+ #define GAUSSIAN_SPLAT_ASSET_MAGIC   0x47535056  // "GSPV"
+-#define GAUSSIAN_SPLAT_ASSET_VERSION 6         // 6: optional SOG payload (records, tables, palette)
+-#define GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY 5  // 5: SH buffer includes the DC coefficient. Assets without
+-                                               // SOG data are still written as 5 so older builds load them.
++#define GAUSSIAN_SPLAT_ASSET_VERSION 7         // 7: Streamed SOG LOD table (imported from lod-meta.json)
++#define GAUSSIAN_SPLAT_ASSET_VERSION_SOG 6     // 6: optional SOG payload (records, tables, palette)
++#define GAUSSIAN_SPLAT_ASSET_VERSION_LEGACY 5  // 5: SH buffer includes the DC coefficient. Each asset is written
++                                               // with the lowest version that holds its data, so older builds
++                                               // still load assets without SOG or streamed data.
+ 
+ /**
+  * Asset containing Gaussian Splatting data loaded from PLY files
+@@ -40,6 +43,8 @@
+ 	//~ Begin UObject Interface
+ 	virtual void Serialize(FArchive& Ar) override;
+ 	virtual void PostLoad() override;
++	virtual void BeginDestroy() override;
++	virtual bool IsReadyForFinishDestroy() override;
+ #if WITH_EDITOR
+ 	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+ #endif
+@@ -324,6 +329,13 @@
+ 	int64 GetSOGRecordDataSize() const { return SOGRecordBulkData.GetBulkDataSize(); }
+ 	int64 GetSOGPaletteDataSize() const { return SOGPaletteBulkData.GetBulkDataSize(); }
+ 
++	/** Streamed SOG residency: the record bulk data, read in ranges on demand; in memory after an import or a full copy. */
++	const FByteBulkData& GetSOGRecordBulkData() const { return SOGRecordBulkData; }
++	bool IsSOGRecordDataInMemory() const { return SOGRecordBulkData.IsBulkDataLoaded(); }
++
++	/** Read Count records starting at First, synchronously. */
++	bool ReadSOGRecords(uint32 First, uint32 Count, TArray<uint8>& OutData) const;
++
+ #if WITH_EDITOR
+ 	/**
+ 	 * Initialize a SOG asset: bounds and thumbnail from the decoded splats, the SOG payload from Records
+@@ -335,16 +347,55 @@
+ 	/** Store the SOG payload: Records must match SplatCount. */
+ 	void SetSOGData(const sog::DecodedAsset& Source, const TArray<sog::PackedSplat>& Records);
+ 
+-	/** Remove the SOG payload. */
++	/** Remove the SOG payload (and any Streamed SOG LOD table). */
+ 	void ClearSOGData();
++
++	/** One cluster of a Streamed SOG asset as the importer builds it. */
++	struct FStreamedClusterDesc
++	{
++		uint32 Node = 0;          // index into FGaussianStreamedLOD::Nodes
++		uint32 Level = 0;
++		uint32 SplatStart = 0;    // records [SplatStart, SplatStart + SplatCount)
++		uint32 SplatCount = 0;
++		FVector3f BoundsMin = FVector3f::ZeroVector;   // local space (cm)
++		FVector3f BoundsMax = FVector3f::ZeroVector;
++	};
++
++	/**
++	 * Initialize a Streamed SOG asset (lod-meta.json merged by the importer): Source holds every level's records
++	 * with one set of codebooks and one SH palette; Clusters tile the records coarsest level first; LOD is the
++	 * per-node level table. PreviewSplats (the finest level) give the thumbnail.
++	 */
++	void InitializeFromStreamedSOG(const TArray<FGaussianSplatData>& PreviewSplats, const sog::DecodedAsset& Source,
++		const TArray<FStreamedClusterDesc>& Clusters, FGaussianStreamedLOD&& LOD, EGaussianQualityLevel InQuality);
+ #endif
+ 
++	/** True for assets imported from a Streamed SOG (lod-meta.json): per-node LOD levels instead of NanoGS's LOD. */
++	bool HasStreamedLOD() const { return bHasStreamedLOD && StreamedLOD.IsValid(); }
++	const FGaussianStreamedLOD& GetStreamedLOD() const { return StreamedLOD; }
++
++	/** Streamed SOG: imported from lod-meta.json; renders one LOD level per node, chosen each frame. */
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	bool bHasStreamedLOD = false;
++
++	/** Streamed SOG: LOD levels (0 = finest) and lod-meta.json leaf nodes. */
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	int32 StreamedLODLevels = 0;
++
++	UPROPERTY(VisibleAnywhere, Category = "SOG")
++	int32 StreamedLODNodes = 0;
++
+ private:
+ 	sog::AssetConstants SOGConstants{};   // serialized in Serialize() (version 6)
+ 	TArray<float> SOGScaleLUT;            // 256 entries: exp(scale codebook)
+ 	TArray<float> SOGDCLUT;               // 256 entries: 0.5 + SH_C0 * sh0 codebook
+ 	FByteBulkData SOGRecordBulkData;      // SplatCount * 20 bytes
+ 	FByteBulkData SOGPaletteBulkData;     // SOGPaletteCount * shCoeffs * 8 bytes (half4)
++	FGaussianStreamedLOD StreamedLOD;     // serialized in Serialize() (version 7)
++
++	/** Stop the render data streaming from SOGRecordBulkData before it goes away or changes; bWait flushes. */
++	void DetachRenderDataStreaming(bool bWait);
++	FRenderCommandFence StreamingDetachFence;
+ 
+ #if WITH_EDITOR
+ 	/** Read the source file (PLY or SOG) into CPU splats; fills OutSOG for SOG sources. */
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderData.h	2026-09-29 19:11:57
+@@ -5,6 +5,7 @@
+ #include "CoreMinimal.h"
+ #include "GaussianDataTypes.h"
+ #include "GaussianClusterTypes.h"
++#include "GaussianSplatStreaming.h"
+ #include "RHI.h"
+ #include "RHIResources.h"
+ 
+@@ -85,6 +86,29 @@
+ 	FVector4f SOGFileToLocalRows[3] = { FVector4f::Zero(), FVector4f::Zero(), FVector4f::Zero() };
+ 	FVector3f SOGMeanMin = FVector3f::ZeroVector;
+ 	FVector3f SOGMeanMax = FVector3f::ZeroVector;
++
++	/** Streamed SOG assets: the per-node LOD table, kept on the CPU for the per-view level choice */
++	bool bStreamedLOD = false;
++	FGaussianStreamedLOD StreamedLOD;
++	/** Most splats one view can select (every node at its largest level); sizes per-proxy compaction */
++	uint32 MaxSelectableSplats = 0;
++
++	/**
++	 * Streamed SOG with a residency pool (gs.StreamingPoolSplats > 0, asset records on disk): SOGRecordBuffer is the
++	 * pool (coarsest level, then 128-record blocks), SplatClusterIndexBuffer maps pool positions to clusters, and
++	 * finer levels stream in and out (render thread). Null when every record is resident.
++	 */
++	TUniquePtr<FGaussianStreamedResidency> Residency;
++	FUnorderedAccessViewRHIRef SOGRecordBufferUAV;
++	FUnorderedAccessViewRHIRef ClusterBufferUAV;
++	FUnorderedAccessViewRHIRef SplatClusterIndexBufferUAV;
++	/** Records in SOGRecordBuffer: the asset's splat count, or the pool size when streaming */
++	uint32 PoolRecords = 0;
++	/** Streaming: cluster index of pool positions no cluster owns (one past the last cluster) */
++	uint32 DummyCluster = 0;
++
++	/** Render thread: stop reading the asset's records (the asset is being destroyed or rewritten). */
++	void DetachStreaming() { if (Residency.IsValid()) { Residency->Detach(); } }
+ 
+ 	int32 SplatCount = 0;
+ 	int32 SHBands = 0;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatRenderer.h	2026-09-29 19:11:57
+@@ -127,6 +127,12 @@
+ 		bool bUseLODRendering = false
+ 	);
+ 
++	/**
++	 * Streamed SOG residency: run the pool writes FGaussianStreamedResidency::Update recorded (pages moved into
++	 * blocks, freed blocks cleared, clusters repointed). Outside any render pass, before cluster culling.
++	 */
++	static void DispatchStreamedUploads(FRHICommandListImmediate& RHICmdList, class FGaussianSplatRenderData& Data);
++
+ 	// NOTE: DispatchCalcLODViewDataGPUDriven and DispatchUpdateDrawArgs have been removed
+ 	// in the unified approach. LOD splats are now processed by DispatchCalcViewData.
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-09-29 19:11:57
+@@ -322,6 +322,32 @@
+ 	/** Whether splat compaction is enabled and buffers are available */
+ 	bool bSupportsCompaction = false;
+ 
++	//----------------------------------------------------------------------
++	// Streamed SOG LOD (assets imported from lod-meta.json)
++	//----------------------------------------------------------------------
++
++	/** Culling keeps a cluster only when its level is the one chosen for its node (NanoGS.cpp) */
++	bool bStreamedLOD = false;
++
++	/** Level chosen per node for the view being culled (0xFFFFFFFF: none); written on the CPU before culling */
++	FBufferRHIRef NodeLevelBuffer;
++	FShaderResourceViewRHIRef NodeLevelBufferSRV;
++
++	/** The asset's per-node LOD table (shared render data), or null for other assets */
++	const FGaussianStreamedLOD* GetStreamedLOD() const;
++
++	/** Upload the chosen level per node (NodeLevels.Num() == node count) before DispatchClusterCulling */
++	void UploadNodeLevels(FRHICommandListBase& RHICmdList, const TArray<uint32>& NodeLevels);
++
++	/** The shared render data (holds the Streamed SOG residency, if any) */
++	FGaussianSplatRenderData* GetSharedRenderData() const { return SharedData.Get(); }
++
++	/** Records the per-splat passes walk: the Streamed SOG pool when streaming, else every splat */
++	int32 GetRecordRange() const;
++
++	/** Camera-static cache: the residency generation the cached sort was built with */
++	uint32 CachedStreamingGeneration = 0;
++
+ 	/** Get position format as uint for shader */
+ 	uint32 GetPositionFormatUint() const { return static_cast<uint32>(PositionFormat); }
+ 
+@@ -390,6 +416,9 @@
+ 
+ 	/** Get splat count */
+ 	int32 GetSplatCount() const { return SplatCount; }
++
++	/** Splats the per-splat passes walk: the Streamed SOG pool when streaming, else GetSplatCount() */
++	int32 GetRenderSplatCount() const { return GPUResources ? GPUResources->GetRecordRange() : SplatCount; }
+ 
+ 	/** Get rendering parameters.
+ 	 *  SHOrder and LODErrorThreshold honor the gs.OverrideSHOrder / gs.OverrideLODErrorThreshold
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-09-29 19:11:57
+@@ -457,6 +457,10 @@
+ 	DECLARE_GLOBAL_SHADER(FClusterCullingCS);
+ 	SHADER_USE_PARAMETER_STRUCT(FClusterCullingCS, FGlobalShader);
+ 
++	/** Streamed SOG assets: keep the clusters of the level chosen per node (NodeLevelBuffer) instead of walking parents */
++	class FStreamedDim : SHADER_PERMUTATION_BOOL("CLUSTER_CULLING_STREAMED");
++	using FPermutationDomain = TShaderPermutationDomain<FStreamedDim>;
++
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianGPUCluster>, ClusterBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, VisibleClusterBuffer)
+@@ -482,6 +486,8 @@
+ 		SHADER_PARAMETER(uint32, UseLODRendering)
+ 		// Debug: Force specific LOD level (-1 = auto, 0 = leaf, 1+ = specific level)
+ 		SHADER_PARAMETER(int32, DebugForceLODLevel)
++		// Streamed permutation only
++		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, NodeLevelBuffer)
+ 	END_SHADER_PARAMETER_STRUCT()
+ 
+ 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+@@ -493,6 +499,60 @@
+ 	{
+ 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+ 		OutEnvironment.SetDefine(TEXT("THREADGROUP_SIZE"), 64);
++	}
++};
++
++//----------------------------------------------------------------------
++// Streamed SOG residency uploads (StreamedUpload.usf)
++//----------------------------------------------------------------------
++
++/** Copy uploaded pages into the record pool and map their pool positions to their clusters (or clear blocks) */
++class FStreamedUploadBlocksCS : public FGlobalShader
++{
++	DECLARE_GLOBAL_SHADER(FStreamedUploadBlocksCS);
++	SHADER_USE_PARAMETER_STRUCT(FStreamedUploadBlocksCS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_SRV(ByteAddressBuffer, UploadRecords)
++		SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, UploadBlocks)
++		SHADER_PARAMETER_UAV(RWByteAddressBuffer, RecordPool)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, PoolClusterIndex)
++		SHADER_PARAMETER(uint32, DummyCluster)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
++	}
++
++	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
++	{
++		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
++		OutEnvironment.SetDefine(TEXT("UPLOAD_BLOCKS"), 1);
++	}
++};
++
++/** Point clusters at their pool blocks, or mark them not resident */
++class FStreamedUpdateClustersCS : public FGlobalShader
++{
++	DECLARE_GLOBAL_SHADER(FStreamedUpdateClustersCS);
++	SHADER_USE_PARAMETER_STRUCT(FStreamedUpdateClustersCS, FGlobalShader);
++
++	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
++		SHADER_PARAMETER_SRV(StructuredBuffer<uint4>, ClusterUpdates)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<FGaussianGPUCluster>, ClusterBufferRW)
++		SHADER_PARAMETER(uint32, NumClusterUpdates)
++	END_SHADER_PARAMETER_STRUCT()
++
++	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
++	{
++		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
++	}
++
++	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
++	{
++		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
++		OutEnvironment.SetDefine(TEXT("UPDATE_CLUSTERS"), 1);
+ 	}
+ };
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h	2026-09-29 19:11:57
+@@ -0,0 +1,123 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#pragma once
++
++#include "CoreMinimal.h"
++#include "GaussianClusterTypes.h"
++#include "IO/IoBuffer.h"
++#include "Serialization/BulkData.h"
++
++/**
++ * Streamed SOG residency (gs.StreamingPoolSplats > 0). The coarsest LOD level stays resident at the start of the
++ * record pool; every finer (node, level) run of the asset's records is a page, read on demand from the record bulk
++ * data into 128-record blocks of the pool, and evicted least recently used first when the pool is full. The level
++ * choice only ever draws resident levels (Resolve), so culling never meets a missing page.
++ *
++ * Render thread only, except Detach (any thread, while the render thread is idle or from a render command).
++ */
++class NANOGS_API FGaussianStreamedResidency
++{
++public:
++	static constexpr uint32 BlockRecords = 128;       // one cluster per block (clusters hold at most 128 splats)
++	static constexpr uint32 RecordBytes = 20;         // sog::PackedSplat
++
++	FGaussianStreamedResidency() = default;
++	~FGaussianStreamedResidency();                    // cancels and waits for reads in flight
++
++	/**
++	 * Build the page table. AssetClusters is the asset's cluster table (records in asset order); PoolSplats the room for
++	 * streamed records beyond the resident coarsest level; Source the asset's record bulk data.
++	 */
++	void Initialize(const FGaussianStreamedLOD& InLOD, const TArray<FGaussianGPUCluster>& AssetClusters, uint32 PoolSplats,
++		const FByteBulkData* InSource);
++
++	/** Records in the pool: the coarsest level, padding to a block boundary, then the blocks. */
++	uint32 GetPoolRecords() const { return PoolRecords; }
++	uint32 GetPinnedRecords() const { return PinnedRecords; }
++
++	/** The GPU cluster table with finer levels not resident, and the pool position -> cluster map (Dummy = none). */
++	void MakeInitialGPUState(TArray<FGaussianGPUCluster>& InOutClusters, TArray<uint32>& OutPoolClusters, uint32 Dummy) const;
++
++	/** The finest resident level of Node at or coarser than Desired (MAX_uint32: none); marks its page used this frame. */
++	uint32 Resolve(uint32 Node, uint32 Desired, uint64 Frame);
++
++	/** Ask for Node's Desired level; larger Priority loads first. Requests last one Update. */
++	void Request(uint32 Node, uint32 Desired, float Priority);
++
++	/**
++	 * Move finished reads into the pool (evicting pages not used this frame) and issue the requested reads. The GPU
++	 * writes this implies accumulate in GetUploads(). Returns true when the resident set changed.
++	 */
++	bool Update(uint64 Frame, uint32 DummyCluster);
++
++	/** GPU writes recorded by Update, consumed and reset by FGaussianSplatRenderer::DispatchStreamedUploads. */
++	struct FUploads
++	{
++		TArray<uint8> Records;                        // BlockRecords * RecordBytes per uploaded block, zero padded
++		TArray<FUintVector4> Blocks;                  // x = first pool record, y = cluster (or dummy), z = records, w = block in Records
++		TArray<FUintVector4> Clusters;                // x = cluster, y = first pool record, z = records (0: not resident)
++		bool IsEmpty() const { return Blocks.IsEmpty() && Clusters.IsEmpty(); }
++		void Reset() { Records.Reset(); Blocks.Reset(); Clusters.Reset(); }
++	};
++	FUploads& GetUploads() { return Uploads; }
++
++	/** Stop reading: cancel reads in flight and forget the source (its asset is being destroyed or changed). */
++	void Detach();
++
++	bool IsActive() const { return bActive; }
++	bool HasPendingReads() const { return Loading.Num() > 0; }
++	uint32 GetGeneration() const { return Generation; }           // changes whenever the resident set changes
++
++	struct FStats
++	{
++		int32 ResidentPages = 0, LoadingPages = 0, TotalPages = 0;
++		int32 UsedBlocks = 0, TotalBlocks = 0;
++		uint64 Loads = 0, Evictions = 0, Failures = 0;
++	};
++	FStats GetStats() const;
++
++private:
++	enum class EPageState : uint8 { Absent, Requested, Loading, Resident };
++
++	struct FPage
++	{
++		uint32 Node = 0;
++		uint32 Level = 0;
++		uint32 FirstCluster = 0;
++		uint32 NumClusters = 0;
++		uint32 RecordStart = 0;                       // in the asset's records
++		uint32 RecordCount = 0;
++		EPageState State = EPageState::Absent;
++		float Priority = 0.0f;
++		uint64 LastUsed = 0;
++		TArray<uint32> Blocks;                        // one per cluster while resident
++		FIoBuffer Data;
++		FBulkDataBatchRequest Read;
++	};
++
++	int32 PageOf(uint32 Node, uint32 Level) const { return PageIndex[int32(Node * uint32(NumLevels) + Level)]; }
++	uint32 BlockRecord(uint32 Block) const { return DynamicBase + Block * BlockRecords; }
++	bool Allocate(FPage& Page, uint64 Frame, uint32 DummyCluster);
++	void Evict(FPage& Page);
++
++	const FGaussianStreamedLOD* LOD = nullptr;
++	const FByteBulkData* Source = nullptr;
++	TArray<FGaussianGPUCluster> Clusters;             // the asset's cluster table (records in asset order)
++	TArray<FPage> Pages;
++	TArray<int32> PageIndex;                          // node * NumLevels + level -> page (INDEX_NONE: resident or absent)
++	TArray<int32> Requested;
++	TArray<int32> Loading;
++	TArray<uint32> FreeBlocks;
++	TBitArray<> FreedThisUpdate;                      // blocks freed by this Update: cleared on the GPU unless reused
++	TArray<uint32> FreedList;
++	FUploads Uploads;
++
++	int32 NumLevels = 0;
++	uint32 PinnedRecords = 0;
++	uint32 DynamicBase = 0;
++	uint32 NumBlocks = 0;
++	uint32 PoolRecords = 0;
++	uint32 Generation = 0;
++	bool bActive = false;
++	uint64 Loads = 0, Evictions = 0, Failures = 0;
++};
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/SOG/SOGTypes.h b/Plugins/NanoGS/Source/NanoGS/Public/SOG/SOGTypes.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/SOG/SOGTypes.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGS/Public/SOG/SOGTypes.h	2026-09-29 19:11:57
+@@ -6,7 +6,6 @@
+ 
+ #include <cstdint>
+ #include <string>
+-#include <utility>
+ #include <vector>
+ 
+ // Export macro for shared-library builds (NanoGS defines SOG_API=NANOGS_API); empty for static use.
+@@ -76,7 +75,8 @@
+ 
+ enum class Error {
+     Ok, NotZipOrFolder, UnsupportedZip, MissingMeta, BadMeta, BadVersion, MissingImage,
+-    BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange
++    BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange,
++    BadLodMeta, BadChunk                    // Streamed SOG: malformed lod-meta.json; a chunk that fails or mismatches it
+ };
+ SOG_API const char* ErrorName(Error e);
+ 
+@@ -93,20 +93,5 @@
+              uint32_t(s[0] | (s[1] << 8) | (s[2] << 16)) | (uint32_t(c[3]) << 24),
+              uint32_t(c[0] | (c[1] << 8) | (c[2] << 16)) };
+ }
+-
+-// Streamed SOG (lod-meta.json)
+-struct LodRun  { uint32_t file, offset, count; };
+-struct LodNode {
+-    float boundMin[3], boundMax[3];
+-    int32_t child[2] = {-1, -1};                          // interior nodes have exactly two children
+-    std::vector<std::pair<uint32_t, LodRun>> lods;        // leaf: level -> run
+-    std::vector<float> errors;                            // optional, non-decreasing per level
+-};
+-struct LodMeta {
+-    uint32_t lodLevels = 0;
+-    std::vector<uint32_t> counts;
+-    std::vector<std::string> filenames;                   // chunk meta.json paths
+-    std::vector<LodNode> nodes;                           // nodes[0] = root
+-};
+ 
+ } // namespace sog
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/GaussianSplatAssetFactory.cpp	2026-09-29 19:11:57
+@@ -4,6 +4,8 @@
+ #include "GaussianSplatAsset.h"
+ #include "PLYFileReader.h"
+ #include "GaussianSplatSOG.h"
++#include "SOG/GaussianSplatSOGReader.h"
++#include "SOGStreamed.h"
+ #include "EditorFramework/AssetImportData.h"
+ #include "Misc/FeedbackContext.h"
+ #include "Misc/ScopedSlowTask.h"
+@@ -19,10 +21,37 @@
+ 
+ 	Formats.Add(TEXT("ply;PLY Gaussian Splatting File"));
+ 	Formats.Add(TEXT("sog;SOG Gaussian Splatting File (PlayCanvas)"));
+-	// Unbundled SOG folders import through their meta.json; FactoryCanImport rejects any other JSON.
+-	Formats.Add(TEXT("json;SOG Gaussian Splatting meta.json (unbundled)"));
++	// Unbundled SOG folders import through their meta.json, Streamed SOG through its lod-meta.json;
++	// FactoryCanImport rejects any other JSON.
++	Formats.Add(TEXT("json;SOG Gaussian Splatting meta.json (unbundled) or lod-meta.json (Streamed SOG)"));
+ }
+ 
++namespace
++{
++	/** Streamed SOG manifests: lod-meta.json next to its chunk folders. */
++	bool IsStreamedSOGPath(const FString& Path)
++	{
++		return FPaths::GetCleanFilename(Path).Equals(TEXT("lod-meta.json"), ESearchCase::IgnoreCase);
++	}
++
++	/** Axis-aligned bounds of a file-frame box after SOG's file -> local transform (column-major 4x4). */
++	void FileBoundsToLocal(const float Min[3], const float Max[3], const float M[16], FVector3f& OutMin, FVector3f& OutMax)
++	{
++		OutMin = FVector3f(MAX_flt);
++		OutMax = FVector3f(-MAX_flt);
++		for (int32 Corner = 0; Corner < 8; ++Corner)
++		{
++			const float P[3] = { (Corner & 1) ? Max[0] : Min[0], (Corner & 2) ? Max[1] : Min[1], (Corner & 4) ? Max[2] : Min[2] };
++			const FVector3f L(
++				M[0] * P[0] + M[4] * P[1] + M[8] * P[2] + M[12],
++				M[1] * P[0] + M[5] * P[1] + M[9] * P[2] + M[13],
++				M[2] * P[0] + M[6] * P[1] + M[10] * P[2] + M[14]);
++			OutMin = OutMin.ComponentMin(L);
++			OutMax = OutMax.ComponentMax(L);
++		}
++	}
++}
++
+ bool UGaussianSplatAssetFactory::FactoryCanImport(const FString& Filename)
+ {
+ 	const FString Extension = FPaths::GetExtension(Filename);
+@@ -33,6 +62,11 @@
+ 	if (Extension.Equals(TEXT("json"), ESearchCase::IgnoreCase))
+ 	{
+ 		FString Text;
++		if (IsStreamedSOGPath(Filename))
++		{
++			return FFileHelper::LoadFileToString(Text, *Filename)
++				&& Text.Contains(TEXT("\"lodLevels\"")) && Text.Contains(TEXT("\"tree\""));
++		}
+ 		return FPaths::GetCleanFilename(Filename).Equals(TEXT("meta.json"), ESearchCase::IgnoreCase)
+ 			&& FFileHelper::LoadFileToString(Text, *Filename)
+ 			&& Text.Contains(TEXT("\"means\"")) && Text.Contains(TEXT("\"quats\"")) && Text.Contains(TEXT("\"sh0\""));
+@@ -126,8 +160,8 @@
+ 
+ 	if (ReimportedAsset)
+ 	{
+-		// If Nanite was enabled before reimport, rebuild the cluster hierarchy
+-		if (bWasNaniteEnabled)
++		// If Nanite was enabled before reimport, rebuild the cluster hierarchy (Streamed SOG assets bring their own)
++		if (bWasNaniteEnabled && !ReimportedAsset->HasStreamedLOD())
+ 		{
+ 			UE_LOG(LogTemp, Log, TEXT("Reimport: Rebuilding Nanite cluster hierarchy (was enabled before reimport)"));
+ 			if (!ReimportedAsset->BuildNaniteClusterHierarchy())
+@@ -212,9 +246,119 @@
+ 	EObjectFlags Flags,
+ 	UGaussianSplatAsset* ExistingAsset)
+ {
++	if (IsStreamedSOGPath(FilePath))
++	{
++		return ImportStreamedSOGFile(FilePath, InParent, InName, Flags, ExistingAsset);
++	}
+ 	return GaussianSplatSOG::IsSOGPath(FilePath)
+ 		? ImportSOGFile(FilePath, InParent, InName, Flags, ExistingAsset)
+ 		: ImportPLYFile(FilePath, InParent, InName, Flags, ExistingAsset);
++}
++
++UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportStreamedSOGFile(
++	const FString& FilePath,
++	UObject* InParent,
++	FName InName,
++	EObjectFlags Flags,
++	UGaussianSplatAsset* ExistingAsset)
++{
++	FScopedSlowTask SlowTask(100.0f, FText::FromString(TEXT("Importing Streamed SOG Gaussian Splat...")));
++	SlowTask.MakeDialog(true);
++
++	// Load every chunk and merge the levels: shared codebooks, one SH palette, records coarsest level first
++	SlowTask.EnterProgressFrame(60.0f, FText::FromString(TEXT("Merging LOD chunks...")));
++	sog::StreamedAsset Streamed;
++	FString ErrorMessage;
++	if (!NanoGSReadStreamedSOG(FilePath, Streamed, ErrorMessage))
++	{
++		UE_LOG(LogTemp, Error, TEXT("Failed to read Streamed SOG: %s"), *ErrorMessage);
++		return nullptr;
++	}
++	const sog::DecodedAsset& Merged = Streamed.merged;
++	UE_LOG(LogTemp, Log, TEXT("Read Streamed SOG: %u splats in %u levels, %d leaves, %d clusters, SH bands %u, palette %u (from %llu chunk palette entries), errors %s"),
++		Merged.count, Streamed.lodLevels, int32(Streamed.leaves.size()), int32(Streamed.clusters.size()), Merged.shBands, Merged.paletteCount,
++		(unsigned long long)Streamed.sourcePaletteEntries, Streamed.errorsFromFile ? TEXT("from the file") : TEXT("from splat counts"));
++
++	// Per-node LOD table and clusters, bounds in local space
++	SlowTask.EnterProgressFrame(10.0f, FText::FromString(TEXT("Building LOD table...")));
++	const float* FileToLocal = sog::kNanoGSFileToLocal;
++	const int32 NumLevels = int32(Streamed.lodLevels);
++	FGaussianStreamedLOD LOD;
++	LOD.NumLevels = NumLevels;
++	LOD.bErrorsFromFile = Streamed.errorsFromFile;
++	for (uint64 Count : Streamed.levelCounts)
++	{
++		LOD.LevelSplatCounts.Add(Count);
++	}
++	LOD.Nodes.SetNum(int32(Streamed.leaves.size()));
++	for (int32 Index = 0; Index < LOD.Nodes.Num(); ++Index)
++	{
++		const sog::StreamedLeaf& Leaf = Streamed.leaves[size_t(Index)];
++		FGaussianStreamedLODNode& Node = LOD.Nodes[Index];
++		FileBoundsToLocal(Leaf.boundMin, Leaf.boundMax, FileToLocal, Node.BoundsMin, Node.BoundsMax);
++		Node.Errors = TArray<float>(Leaf.errors.data(), int32(Leaf.errors.size()));
++		Node.SplatCounts.Init(0, NumLevels);
++		Node.FirstCluster.Init(0, NumLevels);
++		Node.ClusterCounts.Init(0, NumLevels);
++		for (int32 Level = 0; Level < NumLevels; ++Level)
++		{
++			Node.SplatCounts[Level] = Leaf.levels[size_t(Level)].count;
++		}
++	}
++	TArray<UGaussianSplatAsset::FStreamedClusterDesc> Clusters;
++	Clusters.SetNum(int32(Streamed.clusters.size()));
++	for (int32 Index = 0; Index < Clusters.Num(); ++Index)
++	{
++		const sog::StreamedCluster& Source = Streamed.clusters[size_t(Index)];
++		UGaussianSplatAsset::FStreamedClusterDesc& Desc = Clusters[Index];
++		Desc.Node = Source.leaf;
++		Desc.Level = Source.level;
++		Desc.SplatStart = Source.start;
++		Desc.SplatCount = Source.count;
++		FileBoundsToLocal(Source.boundMin, Source.boundMax, FileToLocal, Desc.BoundsMin, Desc.BoundsMax);
++		FGaussianStreamedLODNode& Node = LOD.Nodes[int32(Source.leaf)];
++		if (Node.ClusterCounts[int32(Source.level)]++ == 0)
++		{
++			Node.FirstCluster[int32(Source.level)] = uint32(Index);        // a run's clusters are consecutive
++		}
++	}
++
++	// The finest level gives the thumbnail
++	SlowTask.EnterProgressFrame(10.0f, FText::FromString(TEXT("Decoding preview...")));
++	TArray<FGaussianSplatData> Preview;
++	{
++		sog::DecodedAsset Finest = Merged;
++		uint32 Start = Merged.count;
++		for (const sog::StreamedLeaf& Leaf : Streamed.leaves)
++		{
++			if (Leaf.levels[0].count > 0)
++			{
++				Start = FMath::Min(Start, Leaf.levels[0].start);
++			}
++		}
++		Finest.splats.assign(Merged.splats.begin() + Start, Merged.splats.end());
++		Finest.count = uint32(Finest.splats.size());
++		GaussianSplatSOG::ToSplatData(Finest, Preview);
++	}
++
++	SlowTask.EnterProgressFrame(20.0f, FText::FromString(TEXT("Storing SOG records...")));
++	UGaussianSplatAsset* Asset = ExistingAsset;
++	if (!Asset)
++	{
++		Asset = NewObject<UGaussianSplatAsset>(InParent, UGaussianSplatAsset::StaticClass(), InName, Flags);
++	}
++	if (!Asset)
++	{
++		UE_LOG(LogTemp, Error, TEXT("Failed to create Gaussian Splat asset"));
++		return nullptr;
++	}
++	Asset->SourceFilePath = FilePath;
++	Asset->InitializeFromStreamedSOG(Preview, Merged, Clusters, MoveTemp(LOD), QualityLevel);
++	Asset->MarkPackageDirty();
++
++	UE_LOG(LogTemp, Log, TEXT("Successfully imported Streamed SOG Gaussian Splat asset: %d splats, %lld bytes (SOG records %lld, palette %lld)"),
++		Asset->GetSplatCount(), Asset->GetMemoryUsage(), Asset->GetSOGRecordDataSize(), Asset->GetSOGPaletteDataSize());
++	return Asset;
+ }
+ 
+ UGaussianSplatAsset* UGaussianSplatAssetFactory::ImportSOGFile(
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.cpp	2026-09-29 19:11:57
+@@ -2,6 +2,8 @@
+ 
+ #include "GaussianSplatSOGReader.h"
+ #include "SOGLoader.h"
++#include "SOGStreamed.h"
++#include "Async/ParallelFor.h"
+ #include "Misc/FileHelper.h"
+ #include "Misc/Paths.h"
+ 
+@@ -69,6 +71,65 @@
+ 	if (Result != sog::Error::Ok)
+ 	{
+ 		OutError = FString::Printf(TEXT("%s: %s (%s)"), *Path, *ToFString(Error), *ToFString(sog::ErrorName(Result)));
++		return false;
++	}
++	return true;
++}
++
++bool NanoGSReadStreamedSOG(const FString& LodMetaPath, sog::StreamedAsset& Out, FString& OutError)
++{
++	TArray<uint8> Bytes;
++	if (!FFileHelper::LoadFileToArray(Bytes, *LodMetaPath))
++	{
++		OutError = FString::Printf(TEXT("Cannot read %s"), *LodMetaPath);
++		return false;
++	}
++	sog::LodMeta Meta;
++	std::string Error;
++	sog::Error Result = sog::ParseLodMeta(reinterpret_cast<const char*>(Bytes.GetData()), size_t(Bytes.Num()), Meta, &Error);
++	if (Result != sog::Error::Ok)
++	{
++		OutError = FString::Printf(TEXT("%s: %s (%s)"), *LodMetaPath, *ToFString(Error), *ToFString(sog::ErrorName(Result)));
++		return false;
++	}
++	if (!Meta.environment.empty())
++	{
++		UE_LOG(LogTemp, Warning, TEXT("Streamed SOG: the environment chunk %s isn't imported (only the LOD tree is)"),
++			*ToFString(Meta.environment));
++	}
++
++	// Chunks are unbundled SOG folders named by their meta.json ("0_0/meta.json") or .sog bundles, relative to lod-meta.json
++	const FString Directory = FPaths::GetPath(LodMetaPath);
++	const sog::ChunkOpener Open = [Directory](const std::string& Path, std::string* OpenError) -> std::unique_ptr<sog::FileSource>
++	{
++		const FString Relative = ToFString(Path);
++		const FString Full = FPaths::Combine(Directory, Relative);
++		if (FPaths::GetCleanFilename(Relative).Equals(TEXT("meta.json"), ESearchCase::IgnoreCase))
++		{
++			return std::make_unique<FFolderSource>(FPaths::GetPath(Full));
++		}
++		TArray<uint8> ChunkBytes;
++		if (!FFileHelper::LoadFileToArray(ChunkBytes, *Full))
++		{
++			if (OpenError) { *OpenError = "cannot read " + Path; }
++			return nullptr;
++		}
++		return sog::MakeZipSource(std::vector<uint8_t>(ChunkBytes.GetData(), ChunkBytes.GetData() + ChunkBytes.Num()), OpenError);
++	};
++
++	sog::StreamedOptions Options;
++	Options.parallelFor = [](size_t Count, const std::function<void(size_t)>& Body)
++	{
++		ParallelFor(int32(Count), [&Body](int32 Index) { Body(size_t(Index)); });
++	};
++	Options.progress = [](const char* Stage)
++	{
++		UE_LOG(LogTemp, Log, TEXT("Streamed SOG import: %s"), UTF8_TO_TCHAR(Stage));
++	};
++	Result = sog::LoadStreamed(Meta, Open, Options, Out, &Error);
++	if (Result != sog::Error::Ok)
++	{
++		OutError = FString::Printf(TEXT("%s: %s (%s)"), *LodMetaPath, *ToFString(Error), *ToFString(sog::ErrorName(Result)));
+ 		return false;
+ 	}
+ 	return true;
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.h b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.h
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/GaussianSplatSOGReader.h	2026-09-29 19:11:57
+@@ -5,5 +5,10 @@
+ #include "CoreMinimal.h"
+ #include "SOG/SOGTypes.h"
+ 
++namespace sog { struct StreamedAsset; }
++
+ /** Load a bundled .sog or an unbundled SOG folder (via its meta.json) with Unreal's file APIs. */
+ bool NanoGSReadSOG(const FString& Path, sog::DecodedAsset& Out, FString& OutError);
++
++/** Load a Streamed SOG (lod-meta.json and its chunks) and merge every level into one asset (sog/SOGStreamed.h). */
++bool NanoGSReadStreamedSOG(const FString& LodMetaPath, sog::StreamedAsset& Out, FString& OutError);
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.cpp	2026-09-29 19:11:57
+@@ -0,0 +1,1132 @@
++// SOGStreamed.cpp — see SOGStreamed.h.
++#include "SOGStreamed.h"
++
++#include "SOGCodec.h"
++#include "SOGJson.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <iterator>
++#include <limits>
++#include <numeric>
++
++namespace sog {
++
++namespace {
++
++using ParallelFor = std::function<void(size_t, const std::function<void(size_t)>&)>;
++
++Error Fail(std::string* message, Error e, const std::string& text)
++{
++    if (message) {
++        *message = text;
++    }
++    return e;
++}
++
++void Run(const ParallelFor& parallelFor, size_t count, const std::function<void(size_t)>& body)
++{
++    if (parallelFor && count > 1) {
++        parallelFor(count, body);
++        return;
++    }
++    for (size_t i = 0; i < count; ++i) {
++        body(i);
++    }
++}
++
++// Deterministic across platforms (std:: distributions are not).
++struct Rng {
++    uint64_t state;
++    explicit Rng(uint64_t seed) : state(seed * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull) {}
++    uint64_t Next()
++    {
++        uint64_t z = (state += 0x9E3779B97F4A7C15ull);
++        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++        return z ^ (z >> 31);
++    }
++    double Uniform() { return double(Next() >> 11) * (1.0 / 9007199254740992.0); }   // [0, 1)
++};
++
++double Unlog(double n)
++{
++    return n < 0.0 ? -std::expm1(-n) : std::expm1(n);
++}
++
++uint32_t Round16(double v)
++{
++    const double r = std::floor(v + 0.5);
++    if (!(r > 0.0)) {
++        return 0;
++    }
++    return r >= 65535.0 ? 65535u : uint32_t(r);
++}
++
++// ---- lod-meta.json ----
++
++bool GetUInt(const json::Value* v, double limit, uint64_t& out)
++{
++    if (!v || !v->IsNumber() || !(v->number >= 0.0) || v->number > limit || v->number != std::floor(v->number)) {
++        return false;
++    }
++    out = uint64_t(v->number);
++    return true;
++}
++
++bool GetVec3(const json::Value* v, float out[3])
++{
++    if (!v || !v->IsArray() || v->array.size() != 3) {
++        return false;
++    }
++    for (int k = 0; k < 3; ++k) {
++        if (!v->array[k].IsNumber() || !std::isfinite(v->array[k].number)) {
++            return false;
++        }
++        out[k] = float(v->array[k].number);
++    }
++    return true;
++}
++
++bool SafeRelativePath(const std::string& p)
++{
++    if (p.empty() || p[0] == '/' || p[0] == '\\' || p.find(':') != std::string::npos) {
++        return false;
++    }
++    size_t start = 0;
++    while (start <= p.size()) {
++        size_t end = p.find_first_of("/\\", start);
++        if (end == std::string::npos) {
++            end = p.size();
++        }
++        if (p.compare(start, end - start, "..") == 0 && end - start == 2) {
++            return false;
++        }
++        start = end + 1;
++    }
++    return true;
++}
++
++struct TreeParser {
++    LodMeta& meta;
++    std::string error;
++
++    int32_t Parse(const json::Value& v, int depth)
++    {
++        const std::string where = "tree node " + std::to_string(meta.nodes.size());
++        if (depth > 64) {
++            error = "tree deeper than 64 levels";
++            return -1;
++        }
++        if (!v.IsObject()) {
++            error = where + " is not an object";
++            return -1;
++        }
++        const int32_t index = int32_t(meta.nodes.size());
++        meta.nodes.emplace_back();
++        LodNode node;
++        const json::Value* bound = v.Find("bound");
++        if (!bound || !GetVec3(bound->Find("min"), node.boundMin) || !GetVec3(bound->Find("max"), node.boundMax)) {
++            error = where + ": bad bound";
++            return -1;
++        }
++        const json::Value* lods = v.Find("lods");
++        const json::Value* children = v.Find("children");
++        if (lods && lods->type != json::Value::Type::Null) {
++            if (!lods->IsObject()) {
++                error = where + ": lods is not an object";
++                return -1;
++            }
++            node.lods.resize(meta.lodLevels);
++            for (const auto& item : lods->object) {
++                char* end = nullptr;
++                const long level = std::strtol(item.first.c_str(), &end, 10);
++                if (item.first.empty() || *end != '\0' || level < 0 || level >= long(meta.lodLevels)) {
++                    error = where + ": bad level \"" + item.first + "\"";
++                    return -1;
++                }
++                const json::Value& run = item.second;
++                uint64_t file = 0, offset = 0, count = 0;
++                if (!run.IsObject() || !GetUInt(run.Find("file"), 4294967295.0, file) ||
++                    (run.Find("offset") && !GetUInt(run.Find("offset"), 4294967295.0, offset)) ||
++                    (run.Find("count") && !GetUInt(run.Find("count"), 4294967295.0, count))) {
++                    error = where + ": bad run for level " + item.first;
++                    return -1;
++                }
++                if (file >= meta.filenames.size()) {
++                    error = where + ": file index " + std::to_string(file) + " out of range";
++                    return -1;
++                }
++                node.lods[size_t(level)] = { uint32_t(file), uint32_t(offset), uint32_t(count) };
++            }
++            if (const json::Value* errors = v.Find("errors")) {
++                if (!errors->IsArray() || errors->array.size() != meta.lodLevels) {
++                    error = where + ": errors must have lodLevels entries";
++                    return -1;
++                }
++                for (const json::Value& e : errors->array) {
++                    if (!e.IsNumber() || !std::isfinite(e.number) || e.number < 0.0) {
++                        error = where + ": errors must be finite and non-negative";
++                        return -1;
++                    }
++                    node.errors.push_back(float(e.number));
++                }
++            }
++            if (node.lods.empty()) {                         // lodLevels >= 1, so only reachable with no levels
++                error = where + ": leaf without levels";
++                return -1;
++            }
++        } else if (children) {
++            if (!children->IsArray() || children->array.empty()) {
++                error = where + ": children must be a non-empty array";
++                return -1;
++            }
++            for (const json::Value& child : children->array) {
++                const int32_t c = Parse(child, depth + 1);
++                if (c < 0) {
++                    return -1;
++                }
++                node.children.push_back(c);
++            }
++        } else {
++            error = where + " has neither lods nor children";
++            return -1;
++        }
++        meta.nodes[size_t(index)] = std::move(node);
++        return index;
++    }
++};
++
++// ---- Clustering ----
++
++constexpr size_t kLanes = 8;          // row stride multiple; lets the dot product vectorize without fast-math
++
++// Rows of D codes into one float codebook, stored with stride S (a multiple of kLanes); values past D decode as 0.
++struct Rows {
++    const uint8_t* codes = nullptr;   // n * S
++    const float* weight = nullptr;    // n
++    const float* codebook = nullptr;  // 256 values
++    size_t S = 0;
++    size_t D = 0;                     // meaningful values per row
++
++    void Decode(uint32_t row, float* out) const
++    {
++        const uint8_t* c = codes + size_t(row) * S;
++        size_t s = 0;
++        for (; s < D; ++s) {
++            out[s] = codebook[c[s]];
++        }
++        for (; s < S; ++s) {
++            out[s] = 0.0f;
++        }
++    }
++};
++
++inline float Dot(const float* a, const float* b, size_t S)
++{
++    float acc[kLanes] = {};
++    for (size_t s = 0; s < S; s += kLanes) {
++        for (size_t l = 0; l < kLanes; ++l) {
++            acc[l] += a[s + l] * b[s + l];
++        }
++    }
++    return ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
++}
++
++// Nearest centroid by |c|^2 - 2 x.c; returns the squared distance.
++inline uint32_t Nearest(const float* x, float xNorm, const float* C, const float* cNorm, uint32_t K, size_t S, float& dist)
++{
++    float best = std::numeric_limits<float>::max();
++    uint32_t bestK = 0;
++    for (uint32_t k = 0; k < K; ++k) {
++        const float d = cNorm[k] - 2.0f * Dot(x, C + size_t(k) * S, S);
++        if (d < best) {
++            best = d;
++            bestK = k;
++        }
++    }
++    dist = std::max(0.0f, best + xNorm);
++    return bestK;
++}
++
++constexpr size_t kBlock = 2048;       // rows per parallel work item
++constexpr uint32_t kSamplePerCentroid = 64;
++
++// Weighted k-means over rows `ids`: trains on at most kSamplePerCentroid * K rows (k-means++ then Lloyd), assigns
++// every row, and finishes with one weighted-mean update over all rows. K may shrink when rows run out.
++void KMeans(const Rows& X, const std::vector<uint32_t>& ids, uint32_t K, uint32_t iterations, uint64_t seed,
++            const ParallelFor& parallelFor, std::vector<float>& C, std::vector<uint32_t>& label)
++{
++    const size_t n = ids.size();
++    const size_t S = X.S;
++    K = uint32_t(std::min<size_t>(K, n));
++    C.clear();
++    label.assign(n, 0);
++    if (K == 0) {
++        return;
++    }
++    std::vector<float> row(S);
++    if (K == n) {
++        C.resize(size_t(K) * S);
++        for (size_t i = 0; i < n; ++i) {
++            X.Decode(ids[i], &C[i * S]);
++            label[i] = uint32_t(i);
++        }
++        return;
++    }
++
++    // Training sample: uniform without replacement (weights still apply)
++    Rng rng(seed);
++    std::vector<uint32_t> train = ids;
++    const size_t m = std::min<size_t>(n, size_t(K) * kSamplePerCentroid);
++    for (size_t i = 0; i < m; ++i) {
++        const size_t j = i + size_t(rng.Next() % uint64_t(n - i));
++        std::swap(train[i], train[j]);
++    }
++    train.resize(m);
++    std::vector<float> T(m * S), tNorm(m), tWeight(m);
++    for (size_t i = 0; i < m; ++i) {
++        X.Decode(train[i], &T[i * S]);
++        tNorm[i] = Dot(&T[i * S], &T[i * S], S);
++        tWeight[i] = X.weight[train[i]];
++    }
++
++    // k-means++ (weighted D^2 sampling)
++    C.assign(size_t(K) * S, 0.0f);
++    std::vector<float> d2(m, std::numeric_limits<float>::max());
++    auto pick = [&](const std::vector<double>& mass, double total) {
++        double r = rng.Uniform() * total;
++        for (size_t i = 0; i < m; ++i) {
++            r -= mass[i];
++            if (r < 0.0) {
++                return i;
++            }
++        }
++        return m - 1;
++    };
++    std::vector<double> mass(m);
++    double total = 0.0;
++    for (size_t i = 0; i < m; ++i) {
++        mass[i] = double(tWeight[i]);
++        total += mass[i];
++    }
++    uint32_t k = 0;
++    std::copy_n(&T[pick(mass, total) * S], S, &C[0]);
++    for (k = 1; k < K; ++k) {
++        const float* last = &C[size_t(k - 1) * S];
++        const float lastNorm = Dot(last, last, S);
++        total = 0.0;
++        for (size_t i = 0; i < m; ++i) {
++            const float d = std::max(0.0f, tNorm[i] + lastNorm - 2.0f * Dot(&T[i * S], last, S));
++            d2[i] = std::min(d2[i], d);
++            mass[i] = double(tWeight[i]) * double(d2[i]);
++            total += mass[i];
++        }
++        if (!(total > 0.0)) {
++            break;                                           // every sample sits on a centroid
++        }
++        std::copy_n(&T[pick(mass, total) * S], S, &C[size_t(k) * S]);
++    }
++    K = k;
++    C.resize(size_t(K) * S);
++
++    std::vector<float> cNorm(K);
++    auto updateNorms = [&]() {
++        for (uint32_t c = 0; c < K; ++c) {
++            cNorm[c] = Dot(&C[size_t(c) * S], &C[size_t(c) * S], S);
++        }
++    };
++    std::vector<double> sum(size_t(K) * S);
++    std::vector<double> wsum(K);
++    std::vector<uint32_t> tLabel(m);
++    std::vector<float> tDist(m);
++    for (uint32_t it = 0; it < iterations; ++it) {
++        updateNorms();
++        for (size_t i = 0; i < m; ++i) {
++            tLabel[i] = Nearest(&T[i * S], tNorm[i], C.data(), cNorm.data(), K, S, tDist[i]);
++        }
++        std::fill(sum.begin(), sum.end(), 0.0);
++        std::fill(wsum.begin(), wsum.end(), 0.0);
++        for (size_t i = 0; i < m; ++i) {
++            const double w = tWeight[i];
++            double* acc = &sum[size_t(tLabel[i]) * S];
++            const float* x = &T[i * S];
++            for (size_t s = 0; s < S; ++s) {
++                acc[s] += w * x[s];
++            }
++            wsum[tLabel[i]] += w;
++        }
++        for (uint32_t c = 0; c < K; ++c) {
++            if (wsum[c] > 0.0) {
++                for (size_t s = 0; s < S; ++s) {
++                    C[size_t(c) * S + s] = float(sum[size_t(c) * S + s] / wsum[c]);
++                }
++            } else {
++                // Empty centroid: move it to the sample farthest (weighted) from its own centroid
++                size_t far = 0;
++                for (size_t i = 1; i < m; ++i) {
++                    if (tWeight[i] * tDist[i] > tWeight[far] * tDist[far]) {
++                        far = i;
++                    }
++                }
++                std::copy_n(&T[far * S], S, &C[size_t(c) * S]);
++                tDist[far] = 0.0f;
++            }
++        }
++    }
++
++    // Assign every row, then move each centroid to the weighted mean of all its rows
++    updateNorms();
++    const size_t blocks = (n + kBlock - 1) / kBlock;
++    Run(parallelFor, blocks, [&](size_t b) {
++        std::vector<float> x(S);
++        float dist;
++        for (size_t i = b * kBlock, e = std::min(n, (b + 1) * kBlock); i < e; ++i) {
++            X.Decode(ids[i], x.data());
++            label[i] = Nearest(x.data(), Dot(x.data(), x.data(), S), C.data(), cNorm.data(), K, S, dist);
++        }
++    });
++    std::fill(sum.begin(), sum.end(), 0.0);
++    std::fill(wsum.begin(), wsum.end(), 0.0);
++    for (size_t i = 0; i < n; ++i) {
++        X.Decode(ids[i], row.data());
++        const double w = X.weight[ids[i]];
++        double* acc = &sum[size_t(label[i]) * S];
++        for (size_t s = 0; s < S; ++s) {
++            acc[s] += w * row[s];
++        }
++        wsum[label[i]] += w;
++    }
++    for (uint32_t c = 0; c < K; ++c) {
++        if (wsum[c] > 0.0) {
++            for (size_t s = 0; s < S; ++s) {
++                C[size_t(c) * S + s] = float(sum[size_t(c) * S + s] / wsum[c]);
++            }
++        }
++    }
++}
++
++// Largest-remainder split of `total` centroids by weight, at least one per non-empty group and at most its size.
++std::vector<uint32_t> Apportion(uint32_t total, const std::vector<double>& weight, const std::vector<size_t>& size)
++{
++    const size_t g = weight.size();
++    std::vector<uint32_t> out(g, 0);
++    const double wTotal = std::accumulate(weight.begin(), weight.end(), 0.0);
++    std::vector<std::pair<double, size_t>> remainder;
++    uint64_t used = 0;
++    for (size_t i = 0; i < g; ++i) {
++        if (size[i] == 0) {
++            continue;
++        }
++        const double quota = wTotal > 0.0 ? double(total) * weight[i] / wTotal : double(total) / double(g);
++        uint32_t a = std::max<uint32_t>(1, uint32_t(std::floor(quota)));
++        a = uint32_t(std::min<size_t>(a, size[i]));
++        out[i] = a;
++        used += a;
++        remainder.emplace_back(quota - std::floor(quota), i);
++    }
++    std::sort(remainder.begin(), remainder.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++    // Hand out what's left by remainder, then round-robin to groups with room
++    for (bool progress = true; used < total && progress;) {
++        progress = false;
++        for (const auto& r : remainder) {
++            if (used >= total) {
++                break;
++            }
++            if (out[r.second] < size[r.second]) {
++                ++out[r.second];
++                ++used;
++                progress = true;
++            }
++        }
++    }
++    // The one-per-group minimum can overshoot: take back from the largest shares
++    while (used > total) {
++        const size_t j = size_t(std::max_element(out.begin(), out.end()) - out.begin());
++        if (out[j] <= 1) {
++            break;
++        }
++        --out[j];
++        --used;
++    }
++    return out;
++}
++
++// Hierarchical weighted k-means: K centroids for rows `ids`. At most kLeafK centroids are fitted directly;
++// larger K first splits the rows into up to kLeafK groups and shares K among them by weight.
++constexpr uint32_t kLeafK = 256;
++
++void ClusterRows(const Rows& X, const std::vector<uint32_t>& ids, uint32_t K, uint32_t iterations, uint64_t seed,
++                 const ParallelFor& parallelFor, std::vector<float>& C, std::vector<uint32_t>& label)
++{
++    if (K <= kLeafK || ids.size() <= K) {
++        KMeans(X, ids, K, iterations, seed, parallelFor, C, label);
++        return;
++    }
++    const uint32_t groups = std::min(kLeafK, (K + kLeafK - 1) / kLeafK);
++    std::vector<float> coarse;
++    std::vector<uint32_t> coarseLabel;
++    KMeans(X, ids, groups, iterations, seed, parallelFor, coarse, coarseLabel);
++    const size_t G = coarse.size() / X.S;
++    std::vector<std::vector<uint32_t>> members(G);
++    std::vector<std::vector<uint32_t>> memberPos(G);
++    std::vector<double> weight(G, 0.0);
++    for (size_t i = 0; i < ids.size(); ++i) {
++        members[coarseLabel[i]].push_back(ids[i]);
++        memberPos[coarseLabel[i]].push_back(uint32_t(i));
++        weight[coarseLabel[i]] += X.weight[ids[i]];
++    }
++    std::vector<size_t> sizes(G);
++    for (size_t g = 0; g < G; ++g) {
++        sizes[g] = members[g].size();
++    }
++    const std::vector<uint32_t> share = Apportion(K, weight, sizes);
++    std::vector<std::vector<float>> subC(G);
++    std::vector<std::vector<uint32_t>> subLabel(G);
++    Run(parallelFor, G, [&](size_t g) {
++        if (share[g] > 0) {
++            ClusterRows(X, members[g], share[g], iterations, seed * 7919 + g + 1, nullptr, subC[g], subLabel[g]);
++        }
++    });
++    C.clear();
++    label.assign(ids.size(), 0);
++    uint32_t base = 0;
++    for (size_t g = 0; g < G; ++g) {
++        C.insert(C.end(), subC[g].begin(), subC[g].end());
++        for (size_t j = 0; j < memberPos[g].size(); ++j) {
++            label[memberPos[g][j]] = base + subLabel[g][j];
++        }
++        base += uint32_t(subC[g].size() / X.S);
++    }
++}
++
++// Weighted 1-D k-means into exactly 256 sorted values (repeats when there are fewer distinct values).
++void Codebook256(std::vector<std::pair<float, double>> values, uint32_t iterations, float out[256])
++{
++    std::sort(values.begin(), values.end());
++    // Merge equal values
++    std::vector<std::pair<float, double>> v;
++    for (const auto& p : values) {
++        if (p.second <= 0.0) {
++            continue;
++        }
++        if (!v.empty() && v.back().first == p.first) {
++            v.back().second += p.second;
++        } else {
++            v.push_back(p);
++        }
++    }
++    if (v.empty()) {
++        std::fill(out, out + 256, 0.0f);
++        return;
++    }
++    if (v.size() <= 256) {
++        for (size_t i = 0; i < 256; ++i) {
++            out[i] = v[std::min(i, v.size() - 1)].first;
++        }
++        return;
++    }
++    // Initialize at quantiles of weight^(1/3) (MSE-optimal codebooks space entries with density^(1/3), so the tails
++    // keep entries), then run Lloyd to convergence with a sorted sweep
++    double total = 0.0;
++    for (const auto& p : v) {
++        total += std::cbrt(p.second);
++    }
++    std::vector<double> c(256);
++    {
++        double acc = 0.0;
++        size_t j = 0;
++        for (size_t i = 0; i < v.size() && j < 256; ++i) {
++            acc += std::cbrt(v[i].second);
++            while (j < 256 && acc >= total * double(j) / 255.0) {
++                c[j++] = v[i].first;
++            }
++        }
++        for (; j < 256; ++j) {
++            c[j] = v.back().first;
++        }
++    }
++    std::vector<double> sum(256), wsum(256);
++    for (uint32_t it = 0; it < iterations * 32; ++it) {
++        std::fill(sum.begin(), sum.end(), 0.0);
++        std::fill(wsum.begin(), wsum.end(), 0.0);
++        size_t k = 0;
++        for (const auto& p : v) {
++            while (k + 1 < 256 && std::fabs(double(p.first) - c[k + 1]) <= std::fabs(double(p.first) - c[k])) {
++                ++k;
++            }
++            sum[k] += p.second * double(p.first);
++            wsum[k] += p.second;
++        }
++        bool moved = false;
++        for (size_t j = 0; j < 256; ++j) {
++            if (wsum[j] > 0.0) {
++                const double next = sum[j] / wsum[j];
++                moved = moved || next != c[j];
++                c[j] = next;
++            }
++        }
++        std::sort(c.begin(), c.end());
++        if (!moved) {
++            break;
++        }
++    }
++    for (size_t i = 0; i < 256; ++i) {
++        out[i] = float(c[i]);
++    }
++}
++
++uint8_t NearestIn(const float sorted[256], float v)
++{
++    const float* it = std::lower_bound(sorted, sorted + 256, v);
++    const int hi = int(it - sorted);
++    if (hi <= 0) {
++        return 0;
++    }
++    if (hi >= 256) {
++        return 255;
++    }
++    return (v - sorted[hi - 1] <= sorted[hi] - v) ? uint8_t(hi - 1) : uint8_t(hi);
++}
++
++uint32_t Morton10(uint32_t v)
++{
++    v &= 0x3FFu;
++    v = (v | (v << 16)) & 0x030000FFu;
++    v = (v | (v << 8)) & 0x0300F00Fu;
++    v = (v | (v << 4)) & 0x030C30C3u;
++    v = (v | (v << 2)) & 0x09249249u;
++    return v;
++}
++
++} // namespace
++
++Error ParseLodMeta(const char* text, size_t length, LodMeta& out, std::string* message)
++{
++    out = LodMeta();
++    json::Value root;
++    std::string why;
++    if (!json::Parse(text, length, root, &why) || !root.IsObject()) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: " + (why.empty() ? std::string("not an object") : why));
++    }
++    uint64_t value = 0;
++    if (const json::Value* v = root.Find("version")) {
++        if (!GetUInt(v, 1e6, value) || value != 1) {
++            return Fail(message, Error::BadLodMeta, "lod-meta.json: unsupported version (need 1)");
++        }
++        out.version = 1;
++    }
++    if (!GetUInt(root.Find("lodLevels"), 32.0, value) || value < 1) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: lodLevels must be 1-32");
++    }
++    out.lodLevels = uint32_t(value);
++    if (const json::Value* v = root.Find("count")) {
++        if (!GetUInt(v, 9007199254740992.0, out.count)) {
++            return Fail(message, Error::BadLodMeta, "lod-meta.json: bad count");
++        }
++    }
++    if (const json::Value* v = root.Find("counts")) {
++        if (!v->IsArray() || v->array.size() != out.lodLevels) {
++            return Fail(message, Error::BadLodMeta, "lod-meta.json: counts must have lodLevels entries");
++        }
++        for (const json::Value& c : v->array) {
++            if (!GetUInt(&c, 9007199254740992.0, value)) {
++                return Fail(message, Error::BadLodMeta, "lod-meta.json: bad counts");
++            }
++            out.counts.push_back(value);
++        }
++    }
++    if (const json::Value* v = root.Find("lodErrors")) {
++        out.lodErrors = v->type == json::Value::Type::Bool && v->boolean;
++    }
++    if (const json::Value* v = root.Find("environment")) {
++        if (!v->IsString() || !SafeRelativePath(v->string)) {
++            return Fail(message, Error::BadLodMeta, "lod-meta.json: bad environment path");
++        }
++        out.environment = v->string;
++    }
++    const json::Value* files = root.Find("filenames");
++    if (!files || !files->IsArray() || files->array.empty()) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: filenames must be a non-empty array");
++    }
++    for (const json::Value& f : files->array) {
++        if (!f.IsString() || !SafeRelativePath(f.string)) {
++            return Fail(message, Error::BadLodMeta, "lod-meta.json: bad chunk path in filenames");
++        }
++        out.filenames.push_back(f.string);
++    }
++    const json::Value* tree = root.Find("tree");
++    if (!tree) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: missing tree");
++    }
++    TreeParser parser{out, {}};
++    if (parser.Parse(*tree, 0) < 0) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: " + parser.error);
++    }
++    return Error::Ok;
++}
++
++Error LoadStreamed(const LodMeta& meta, const ChunkOpener& open, const StreamedOptions& options,
++                   StreamedAsset& out, std::string* message)
++{
++    out = StreamedAsset();
++    const uint32_t L = meta.lodLevels;
++    const ParallelFor& parallelFor = options.parallelFor;
++    auto progress = [&](const char* stage) {
++        if (options.progress) {
++            options.progress(stage);
++        }
++    };
++    if (L == 0 || meta.nodes.empty()) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: empty tree");
++    }
++    if (options.paletteSize < 1 || options.paletteSize > 65536 || options.clusterSize < 1) {
++        return Fail(message, Error::BadLodMeta, "bad merge options");
++    }
++
++    // Leaves with at least one splat, in tree order
++    std::vector<const LodNode*> leaves;
++    std::vector<uint8_t> used(meta.filenames.size(), 0);
++    for (const LodNode& node : meta.nodes) {
++        if (!node.IsLeaf()) {
++            continue;
++        }
++        bool any = false;
++        for (const LodRun& run : node.lods) {
++            if (run.count > 0) {
++                used[run.file] = 1;
++                any = true;
++            }
++        }
++        if (any) {
++            leaves.push_back(&node);
++        }
++    }
++    if (leaves.empty()) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: no leaf has splats");
++    }
++
++    // Load the referenced chunks
++    progress("Loading chunks");
++    struct Chunk {
++        DecodedAsset asset;
++        Error code = Error::Ok;
++        std::string error;
++    };
++    std::vector<Chunk> chunks(meta.filenames.size());
++    Run(parallelFor, chunks.size(), [&](size_t i) {
++        if (!used[i]) {
++            return;
++        }
++        Chunk& c = chunks[i];
++        std::string why;
++        std::unique_ptr<FileSource> source = open(meta.filenames[i], &why);
++        if (!source) {
++            c.code = Error::BadChunk;
++            c.error = meta.filenames[i] + ": " + why;
++            return;
++        }
++        const Error e = LoadSOG(*source, c.asset, &why);
++        if (e != Error::Ok) {
++            c.code = Error::BadChunk;
++            c.error = meta.filenames[i] + ": " + ErrorName(e) + (why.empty() ? "" : " (" + why + ")");
++        }
++        std::vector<uint16_t>().swap(c.asset.paletteHalf4);   // only the palette indices are needed
++    });
++    for (const Chunk& c : chunks) {
++        if (c.code != Error::Ok) {
++            return Fail(message, c.code, c.error);
++        }
++    }
++
++    // Validate runs; count what each chunk's codebook entries and palette entries are used for
++    uint64_t total = 0;
++    uint32_t shCoeffs = 0;
++    bool antialias = true;
++    struct Usage {
++        std::vector<double> scale, dc;
++        std::vector<float> label;
++    };
++    std::vector<Usage> usage(chunks.size());
++    for (size_t i = 0; i < chunks.size(); ++i) {
++        if (!used[i]) {
++            continue;
++        }
++        usage[i].scale.assign(256, 0.0);
++        usage[i].dc.assign(256, 0.0);
++        usage[i].label.assign(chunks[i].asset.paletteCount, 0.0f);
++        shCoeffs = std::max(shCoeffs, chunks[i].asset.shCoeffs);
++        antialias = antialias && chunks[i].asset.antialias;
++    }
++    for (const LodNode* leaf : leaves) {
++        for (uint32_t level = 0; level < L; ++level) {
++            const LodRun& run = leaf->lods[level];
++            if (run.count == 0) {
++                continue;
++            }
++            const DecodedAsset& a = chunks[run.file].asset;
++            if (uint64_t(run.offset) + run.count > a.count) {
++                return Fail(message, Error::BadChunk, meta.filenames[run.file] + ": a run ends past the chunk's " +
++                            std::to_string(a.count) + " splats");
++            }
++            total += run.count;
++            Usage& u = usage[run.file];
++            for (uint32_t i = run.offset; i < run.offset + run.count; ++i) {
++                const PackedSplat& s = a.splats[i];
++                for (int k = 0; k < 3; ++k) {
++                    u.scale[(s.scaleOpacity >> (8 * k)) & 0xFFu] += 1.0;
++                    u.dc[(s.dc >> (8 * k)) & 0xFFu] += 1.0;
++                }
++                if (a.shCoeffs > 0 && !((s.dc >> 24) & kFlagNoSH)) {
++                    u.label[s.meanZ_label >> 16] += 1.0f;
++                }
++            }
++        }
++    }
++    if (total >= (uint64_t(1) << 31)) {
++        return Fail(message, Error::BadLodMeta, "lod-meta.json: more than 2^31 splats");
++    }
++
++    DecodedAsset& m = out.merged;
++    m.count = uint32_t(total);
++    m.antialias = antialias;
++
++    // Shared codebooks for scale and DC, fitted to the chunks' entries weighted by use
++    progress("Fitting codebooks");
++    {
++        std::vector<std::pair<float, double>> scales, dcs;
++        for (size_t i = 0; i < chunks.size(); ++i) {
++            if (!used[i]) {
++                continue;
++            }
++            for (int e = 0; e < 256; ++e) {
++                // Scales: weight by linear size too, so large (visible) splats keep precise codebook entries
++                const float logScale = chunks[i].asset.scaleCodebook[e];
++                scales.emplace_back(logScale, usage[i].scale[size_t(e)] * std::exp(double(logScale)));
++                dcs.emplace_back(chunks[i].asset.sh0Codebook[e], usage[i].dc[size_t(e)]);
++            }
++        }
++        Codebook256(std::move(scales), options.iterations, m.scaleCodebook);
++        Codebook256(std::move(dcs), options.iterations, m.sh0Codebook);
++    }
++    std::vector<std::array<uint8_t, 256>> scaleMap(chunks.size()), dcMap(chunks.size());
++    for (size_t i = 0; i < chunks.size(); ++i) {
++        for (int e = 0; e < 256 && used[i]; ++e) {
++            scaleMap[i][size_t(e)] = NearestIn(m.scaleCodebook, chunks[i].asset.scaleCodebook[e]);
++            dcMap[i][size_t(e)] = NearestIn(m.sh0Codebook, chunks[i].asset.sh0Codebook[e]);
++        }
++    }
++
++    // One SH palette for all chunks
++    std::vector<std::vector<uint32_t>> labelMap(chunks.size());   // chunk palette entry -> merged label
++    if (shCoeffs > 0) {
++        progress("Merging SH palettes");
++        static const uint32_t kBands[16] = {0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 3};
++        m.shCoeffs = shCoeffs;
++        m.shBands = kBands[shCoeffs];
++        const size_t D = size_t(shCoeffs) * 3;
++        const size_t S = (D + kLanes - 1) / kLanes * kLanes;
++
++        // Chunk AC codebooks -> one input codebook (so rows stay one byte per value)
++        float input[256];
++        {
++            std::vector<std::pair<float, double>> values;
++            for (size_t i = 0; i < chunks.size(); ++i) {
++                const DecodedAsset& a = chunks[i].asset;
++                if (!used[i] || a.shCoeffs == 0) {
++                    continue;
++                }
++                std::vector<double> codeUse(256, 0.0);
++                for (uint32_t e = 0; e < a.paletteCount; ++e) {
++                    const float w = usage[i].label[e];
++                    if (w > 0.0f) {
++                        const uint8_t* idx = &a.paletteIndices[size_t(e) * a.shCoeffs * 3];
++                        for (size_t v = 0; v < size_t(a.shCoeffs) * 3; ++v) {
++                            codeUse[idx[v]] += w;
++                        }
++                    }
++                }
++                for (int e = 0; e < 256; ++e) {
++                    values.emplace_back(a.shNCodebook[e], codeUse[size_t(e)]);
++                }
++            }
++            Codebook256(std::move(values), options.iterations, input);
++        }
++
++        // Rows: every chunk palette entry in use; padding codes decode through Rows::D, never the codebook
++        std::vector<uint8_t> codes;
++        std::vector<float> weights;
++        for (size_t i = 0; i < chunks.size(); ++i) {
++            const DecodedAsset& a = chunks[i].asset;
++            if (!used[i] || a.shCoeffs == 0) {
++                continue;
++            }
++            uint8_t remap[256];
++            for (int e = 0; e < 256; ++e) {
++                remap[e] = NearestIn(input, a.shNCodebook[e]);
++            }
++            labelMap[i].assign(a.paletteCount, 0);
++            for (uint32_t e = 0; e < a.paletteCount; ++e) {
++                const float w = usage[i].label[e];
++                if (w <= 0.0f) {
++                    continue;
++                }
++                labelMap[i][e] = uint32_t(weights.size());
++                const uint8_t* idx = &a.paletteIndices[size_t(e) * a.shCoeffs * 3];
++                const size_t base = codes.size();
++                codes.resize(base + S, 0);
++                for (size_t v = 0; v < size_t(a.shCoeffs) * 3; ++v) {
++                    codes[base + v] = remap[idx[v]];
++                }
++                // Fewer bands than the merged palette: the missing coefficients are zero. Zero isn't a code,
++                // so give those values the code nearest 0 (exact when the codebook contains 0).
++                const uint8_t zero = NearestIn(input, 0.0f);
++                for (size_t v = size_t(a.shCoeffs) * 3; v < D; ++v) {
++                    codes[base + v] = zero;
++                }
++                weights.push_back(w);
++            }
++            std::vector<uint8_t>().swap(chunks[i].asset.paletteIndices);
++        }
++        out.sourcePaletteEntries = weights.size();
++
++        Rows rows;
++        rows.codes = codes.data();
++        rows.weight = weights.data();
++        rows.codebook = input;
++        rows.S = S;
++        rows.D = D;
++        std::vector<uint32_t> ids(weights.size());
++        std::iota(ids.begin(), ids.end(), 0u);
++        std::vector<float> centroids;
++        std::vector<uint32_t> rowLabel;
++        ClusterRows(rows, ids, options.paletteSize, options.iterations, 1, parallelFor, centroids, rowLabel);
++        const uint32_t K = uint32_t(centroids.size() / S);
++        for (size_t i = 0; i < chunks.size(); ++i) {
++            for (uint32_t& l : labelMap[i]) {
++                l = rowLabel[l];                             // unused entries map to 0 and are never read
++            }
++        }
++
++        // Quantize the merged palette with its own AC codebook
++        std::vector<double> centroidWeight(K, 0.0);
++        for (size_t r = 0; r < rowLabel.size(); ++r) {
++            centroidWeight[rowLabel[r]] += weights[r];
++        }
++        std::vector<std::pair<float, double>> values;
++        values.reserve(size_t(K) * D);
++        for (uint32_t k = 0; k < K; ++k) {
++            for (size_t v = 0; v < D; ++v) {
++                values.emplace_back(centroids[size_t(k) * S + v], centroidWeight[k]);
++            }
++        }
++        Codebook256(std::move(values), options.iterations, m.shNCodebook);
++        m.paletteCount = K;
++        m.paletteIndices.resize(size_t(K) * D);
++        for (uint32_t k = 0; k < K; ++k) {
++            for (size_t v = 0; v < D; ++v) {
++                m.paletteIndices[size_t(k) * D + v] = NearestIn(m.shNCodebook, centroids[size_t(k) * S + v]);
++            }
++        }
++    }
++
++    // Merged position range: the union of the chunks' (log-domain) ranges
++    for (int k = 0; k < 3; ++k) {
++        m.meanMin[k] = std::numeric_limits<double>::max();
++        m.meanMax[k] = -std::numeric_limits<double>::max();
++    }
++    for (size_t i = 0; i < chunks.size(); ++i) {
++        for (int k = 0; k < 3 && used[i]; ++k) {
++            m.meanMin[k] = std::min(m.meanMin[k], chunks[i].asset.meanMin[k]);
++            m.meanMax[k] = std::max(m.meanMax[k], chunks[i].asset.meanMax[k]);
++        }
++    }
++
++    // Records: coarsest level first, then leaves in tree order, Morton order inside each run
++    progress("Building records");
++    m.splats.resize(m.count);
++    if (options.keepSources) {
++        out.sources.resize(m.count);
++    }
++    out.lodLevels = L;
++    out.levelCounts.assign(L, 0);
++    out.leaves.resize(leaves.size());
++    struct Job { uint32_t leaf, level, start; };
++    std::vector<Job> jobs;
++    uint32_t cursor = 0;
++    for (uint32_t li = L; li-- > 0;) {
++        for (size_t f = 0; f < leaves.size(); ++f) {
++            StreamedLeaf& leaf = out.leaves[f];
++            if (leaf.levels.empty()) {
++                leaf.levels.resize(L);
++                std::copy_n(leaves[f]->boundMin, 3, leaf.boundMin);
++                std::copy_n(leaves[f]->boundMax, 3, leaf.boundMax);
++            }
++            const uint32_t count = leaves[f]->lods[li].count;
++            leaf.levels[li] = { cursor, count };
++            if (count > 0) {
++                jobs.push_back({ uint32_t(f), li, cursor });
++                cursor += count;
++                out.levelCounts[li] += count;
++            }
++        }
++    }
++    std::vector<std::vector<StreamedCluster>> jobClusters(jobs.size());
++    Run(parallelFor, jobs.size(), [&](size_t j) {
++        const Job& job = jobs[j];
++        const LodNode& node = *leaves[job.leaf];
++        const LodRun& run = node.lods[job.level];
++        const DecodedAsset& a = chunks[run.file].asset;
++        const std::array<uint8_t, 256>& sMap = scaleMap[run.file];
++        const std::array<uint8_t, 256>& cMap = dcMap[run.file];
++        const bool chunkSH = a.shCoeffs > 0;
++
++        struct Item { uint32_t morton; uint32_t index; float pos[3]; float radius; };
++        std::vector<Item> items(run.count);
++        float extent[3];
++        for (int k = 0; k < 3; ++k) {
++            extent[k] = std::max(node.boundMax[k] - node.boundMin[k], 1e-6f);
++        }
++        for (uint32_t i = 0; i < run.count; ++i) {
++            const PackedSplat& s = a.splats[run.offset + i];
++            const uint32_t q[3] = { s.meanXY & 0xFFFFu, s.meanXY >> 16, s.meanZ_label & 0xFFFFu };
++            Item& it = items[i];
++            uint32_t cell[3];
++            for (int k = 0; k < 3; ++k) {
++                const double n = a.meanMin[k] + (a.meanMax[k] - a.meanMin[k]) * (double(q[k]) / 65535.0);
++                it.pos[k] = float(Unlog(n));
++                const double t = (double(it.pos[k]) - node.boundMin[k]) / extent[k];
++                cell[k] = uint32_t(std::clamp(t, 0.0, 1.0) * 1023.0);
++            }
++            float largest = 0.0f;
++            for (int k = 0; k < 3; ++k) {
++                largest = std::max(largest, a.scaleCodebook[(s.scaleOpacity >> (8 * k)) & 0xFFu]);
++            }
++            it.radius = 3.0f * std::exp(largest);
++            it.morton = Morton10(cell[0]) | (Morton10(cell[1]) << 1) | (Morton10(cell[2]) << 2);
++            it.index = run.offset + i;
++        }
++        std::stable_sort(items.begin(), items.end(), [](const Item& x, const Item& y) { return x.morton < y.morton; });
++
++        for (uint32_t i = 0; i < run.count; ++i) {
++            const Item& it = items[i];
++            const PackedSplat& s = a.splats[it.index];
++            const uint32_t q[3] = { s.meanXY & 0xFFFFu, s.meanXY >> 16, s.meanZ_label & 0xFFFFu };
++            uint32_t g[3];
++            for (int k = 0; k < 3; ++k) {
++                const double n = a.meanMin[k] + (a.meanMax[k] - a.meanMin[k]) * (double(q[k]) / 65535.0);
++                const double range = m.meanMax[k] - m.meanMin[k];
++                g[k] = range > 0.0 ? Round16((n - m.meanMin[k]) / range * 65535.0) : 0u;
++            }
++            uint32_t flags = (s.dc >> 24) & 0xFFu;
++            uint32_t label = 0;
++            if (m.shCoeffs > 0) {
++                if (chunkSH && !(flags & kFlagNoSH)) {
++                    label = labelMap[run.file][s.meanZ_label >> 16];
++                } else {
++                    flags |= kFlagNoSH;
++                }
++            }
++            const uint32_t so = s.scaleOpacity;
++            if (options.keepSources) {
++                out.sources[job.start + i] = (uint64_t(run.file) << 32) | it.index;
++            }
++            PackedSplat& d = m.splats[job.start + i];
++            d.meanXY = g[0] | (g[1] << 16);
++            d.meanZ_label = g[2] | (label << 16);
++            d.quat = s.quat;
++            d.scaleOpacity = uint32_t(sMap[so & 0xFFu]) | (uint32_t(sMap[(so >> 8) & 0xFFu]) << 8) |
++                             (uint32_t(sMap[(so >> 16) & 0xFFu]) << 16) | (so & 0xFF000000u);
++            d.dc = uint32_t(cMap[s.dc & 0xFFu]) | (uint32_t(cMap[(s.dc >> 8) & 0xFFu]) << 8) |
++                   (uint32_t(cMap[(s.dc >> 16) & 0xFFu]) << 16) | (flags << 24);
++        }
++
++        for (uint32_t first = 0; first < run.count; first += options.clusterSize) {
++            StreamedCluster c;
++            c.leaf = job.leaf;
++            c.level = job.level;
++            c.start = job.start + first;
++            c.count = std::min(options.clusterSize, run.count - first);
++            for (int k = 0; k < 3; ++k) {
++                c.boundMin[k] = std::numeric_limits<float>::max();
++                c.boundMax[k] = -std::numeric_limits<float>::max();
++            }
++            for (uint32_t i = first; i < first + c.count; ++i) {
++                for (int k = 0; k < 3; ++k) {
++                    c.boundMin[k] = std::min(c.boundMin[k], items[i].pos[k] - items[i].radius);
++                    c.boundMax[k] = std::max(c.boundMax[k], items[i].pos[k] + items[i].radius);
++                }
++            }
++            jobClusters[j].push_back(c);
++        }
++    });
++    for (auto& list : jobClusters) {
++        out.clusters.insert(out.clusters.end(), list.begin(), list.end());
++    }
++
++    // Per-leaf errors: the file's when every leaf has them, else PlayCanvas's count-based fallback
++    bool fileErrors = meta.lodErrors;
++    for (const LodNode* leaf : leaves) {
++        fileErrors = fileErrors && leaf->errors.size() == L;
++    }
++    out.errorsFromFile = fileErrors;
++    for (size_t f = 0; f < leaves.size(); ++f) {
++        const LodNode& node = *leaves[f];
++        StreamedLeaf& leaf = out.leaves[f];
++        leaf.errors.assign(L, 0.0f);
++        uint32_t reference = 0;
++        for (uint32_t li = 0; li < L && reference == 0; ++li) {
++            reference = node.lods[li].count;
++        }
++        float previous = 0.0f;
++        for (uint32_t li = 0; li < L; ++li) {
++            const uint32_t count = node.lods[li].count;
++            float e = 0.0f;
++            if (fileErrors) {
++                e = node.errors[li];
++            } else if (count > 0) {
++                e = float(std::log(double(reference) / double(count)));
++            }
++            previous = std::max(previous, e);                // non-decreasing toward coarser levels
++            leaf.errors[li] = previous;
++        }
++    }
++
++    BuildGpuTables(m);
++    progress("Done");
++    return Error::Ok;
++}
++
++Error LoadStreamedPath(const std::string& lodMetaPath, const StreamedOptions& options, StreamedAsset& out,
++                       std::string* message)
++{
++    std::string file = lodMetaPath;
++    {
++        std::ifstream probe(file + "/lod-meta.json", std::ios::binary);
++        if (probe) {
++            file += "/lod-meta.json";
++        }
++    }
++    std::ifstream f(file, std::ios::binary);
++    if (!f) {
++        return Fail(message, Error::BadLodMeta, "cannot read " + file);
++    }
++    const std::string text((std::istreambuf_iterator<char>(f)), {});
++    LodMeta meta;
++    const Error e = ParseLodMeta(text.data(), text.size(), meta, message);
++    if (e != Error::Ok) {
++        return e;
++    }
++    const size_t slash = file.find_last_of("/\\");
++    const std::string dir = slash == std::string::npos ? "." : file.substr(0, slash);
++    ChunkOpener opener = [dir](const std::string& path, std::string* error) {
++        return OpenPath(dir + "/" + path, error);
++    };
++    return LoadStreamed(meta, opener, options, out, message);
++}
++
++} // namespace sog
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.h b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.h
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/SOG/SOGStreamed.h	2026-09-29 19:11:57
+@@ -0,0 +1,102 @@
++// SOGStreamed.h — Streamed SOG (lod-meta.json, version 1): parse the manifest, load its chunk SOGs and merge
++// every level into one DecodedAsset with shared codebooks and a single SH palette, plus the LOD tree over the
++// merged records. Import-time only: the renderer keeps one 20-byte record per splat and one palette, as for a
++// single .sog file.
++#pragma once
++
++#include "SOGLoader.h"
++#include "SOGTypes.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace sog {
++
++// ---- lod-meta.json ----
++
++struct LodRun { uint32_t file = 0, offset = 0, count = 0; };   // count 0: the leaf has no splats at this level
++
++struct LodNode {
++    float boundMin[3] = {0, 0, 0};
++    float boundMax[3] = {0, 0, 0};
++    std::vector<int32_t> children;      // interior node (splat-transform writes two)
++    std::vector<LodRun> lods;           // leaf: one run per level, lodLevels entries; empty for interior nodes
++    std::vector<float> errors;          // leaf: per-level errors as written, or empty
++    bool IsLeaf() const { return !lods.empty(); }
++};
++
++struct LodMeta {
++    uint32_t version = 0;               // 0: a pre-versioned file
++    uint32_t lodLevels = 0;             // level 0 is the finest
++    uint64_t count = 0;                 // total splats over all levels; 0 when absent
++    std::vector<uint64_t> counts;       // per level; empty when absent
++    bool lodErrors = false;             // the writer measured per-leaf errors
++    std::string environment;            // optional environment chunk outside the tree (not merged)
++    std::vector<std::string> filenames; // chunk meta.json paths relative to the lod-meta.json folder
++    std::vector<LodNode> nodes;         // depth first; nodes[0] is the root
++};
++
++Error ParseLodMeta(const char* text, size_t length, LodMeta& out, std::string* message = nullptr);
++
++// ---- Merged asset ----
++
++struct StreamedLevel { uint32_t start = 0, count = 0; };      // merged records [start, start + count)
++
++struct StreamedLeaf {
++    float boundMin[3] = {0, 0, 0};      // file frame, from lod-meta.json
++    float boundMax[3] = {0, 0, 0};
++    std::vector<float> errors;          // per level; non-decreasing, 0 at the finest level present
++    std::vector<StreamedLevel> levels;  // per level; count 0 where the leaf has no splats
++};
++
++struct StreamedCluster {
++    uint32_t leaf = 0, level = 0, start = 0, count = 0;       // count <= clusterSize
++    float boundMin[3] = {0, 0, 0};      // file frame: splat centres padded by 3 sigma of their largest axis
++    float boundMax[3] = {0, 0, 0};
++};
++
++struct StreamedAsset {
++    // Every level's splats. Records are ordered by level (coarsest first), then leaf (tree order), then
++    // Morton order within the leaf, so each (leaf, level) run and the whole coarsest level are contiguous.
++    DecodedAsset merged;
++    uint32_t lodLevels = 0;
++    bool errorsFromFile = false;        // false: derived from splat counts, log(finest / count), as PlayCanvas does
++    std::vector<StreamedLeaf> leaves;   // lod-meta.json leaves in tree order
++    std::vector<StreamedCluster> clusters;
++    std::vector<uint64_t> levelCounts;  // merged splats per level
++    uint64_t sourcePaletteEntries = 0;  // chunk palette entries in use before merging
++    std::vector<uint64_t> sources;      // with StreamedOptions::keepSources: chunk << 32 | splat, per record
++};
++
++struct StreamedOptions {
++    uint32_t paletteSize = 65536;       // merged SH palette entries; records keep 16-bit labels
++    uint32_t iterations = 8;            // Lloyd iterations for each k-means level
++    uint32_t clusterSize = 128;         // splats per cluster
++    bool keepSources = false;           // fill StreamedAsset::sources (tests)
++    // Runs body(i) for every i in [0, count), possibly concurrently. Null runs serially.
++    std::function<void(size_t count, const std::function<void(size_t)>& body)> parallelFor;
++    std::function<void(const char* stage)> progress;          // optional
++};
++
++// Opens one chunk given its path from filenames (relative to the lod-meta.json folder); must be thread safe
++// when options.parallelFor runs concurrently.
++using ChunkOpener = std::function<std::unique_ptr<FileSource>(const std::string& path, std::string* error)>;
++
++// Loads every chunk the tree references and merges them:
++//  - positions are requantized into the union of the chunks' ranges;
++//  - scales and DC colours snap to 256-entry codebooks fitted to all chunks (weighted by use);
++//  - the chunks' SH palettes (one per chunk, about one entry per splat) are clustered into one palette of
++//    options.paletteSize entries with two-level weighted k-means;
++//  - quaternions and opacities are copied unchanged.
++Error LoadStreamed(const LodMeta& meta, const ChunkOpener& open, const StreamedOptions& options,
++                   StreamedAsset& out, std::string* message = nullptr);
++
++// Standalone convenience: parse <path>/lod-meta.json (or the file itself) and load its chunks from disk.
++Error LoadStreamedPath(const std::string& lodMetaPath, const StreamedOptions& options, StreamedAsset& out,
++                       std::string* message = nullptr);
++
++} // namespace sog
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-09-29 19:11:57
+@@ -1,7 +1,8 @@
+ // Copyright Epic Games, Inc. All Rights Reserved.
+ 
+ // SOG import tests. They need the nanogs-sog repository's Phase 0 data; set NANOGS_SOG_TESTDATA to its
+-// data/ folder (scene_nosky.sog, scene_nosky_roundtrip.ply, blueprint_test/*.bin). Without it they skip.
++// data/ folder (scene_nosky.sog, scene_nosky_roundtrip.ply, blueprint_test/*.bin; Phase 4's streamed/scene/
++// lod-meta.json for the Streamed SOG test). Without it they skip.
+ //   UnrealEditor SHUTourDemo.uproject -ExecCmds="Automation RunTests NanoGS.SOG" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -NoP4
+ 
+ #include "CoreMinimal.h"
+@@ -17,6 +18,7 @@
+ #include "SOG/GaussianSplatSOGReader.h"
+ #include "SOG/SOGCodec.h"
+ #include "SOGJson.h"
++#include "SOGStreamed.h"
+ #include "HAL/FileManager.h"
+ #include "HAL/PlatformMisc.h"
+ #include "Misc/FileHelper.h"
+@@ -238,6 +240,140 @@
+ 		TestEqual(TEXT("Reloaded cluster count"), ReloadedAsset->GetClusterCount(), ClustersBefore);
+ 		TestTrue(TEXT("Reloaded constants identical"),
+ 			FMemory::Memcmp(&ReloadedAsset->GetSOGConstants(), &Asset->GetSOGConstants(), sizeof(sog::AssetConstants)) == 0);
++		ReloadedAsset->ClearFlags(RF_Public | RF_Standalone);
++		ReloadedAsset->MarkAsGarbage();
++		ResetLoaders(Reloaded);
++	}
++	Asset->ClearFlags(RF_Public | RF_Standalone);
++	Asset->MarkAsGarbage();
++
++	IFileManager::Get().Delete(*PackageFile, false, true, true);
++	IFileManager::Get().DeleteDirectory(*FPaths::GetPath(PackageFile), false, false);
++	CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
++	return true;
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSSOGStreamedImportTest, "NanoGS.SOG.StreamedImportSaveReload",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSSOGStreamedImportTest::RunTest(const FString& Parameters)
++{
++	const FString Dir = TestDataDir();
++	const FString SourcePath = Dir / TEXT("streamed/scene/lod-meta.json");
++	if (Dir.IsEmpty() || !FPaths::FileExists(SourcePath))
++	{
++		AddInfo(TEXT("NANOGS_SOG_TESTDATA/streamed/scene/lod-meta.json not found; skipping (tools/phase4/make_streamed.sh)"));
++		return true;
++	}
++	const FString PackageName = TEXT("/Game/NanoGS_SOGTest_Temp/StreamedTest");
++	const FString PackageFile = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
++
++	UPackage* Package = CreatePackage(*PackageName);
++	UGaussianSplatAssetFactory* Factory = NewObject<UGaussianSplatAssetFactory>();
++	TestTrue(TEXT("Factory accepts lod-meta.json"), Factory->FactoryCanImport(SourcePath));
++	bool bCanceled = false;
++	const double Start = FPlatformTime::Seconds();
++	UGaussianSplatAsset* Asset = Cast<UGaussianSplatAsset>(Factory->FactoryCreateFile(UGaussianSplatAsset::StaticClass(),
++		Package, TEXT("StreamedTest"), RF_Public | RF_Standalone, SourcePath, nullptr, GWarn, bCanceled));
++	if (!TestNotNull(TEXT("Factory imports the Streamed SOG"), Asset))
++	{
++		return false;
++	}
++	const double ImportSeconds = FPlatformTime::Seconds() - Start;
++	TestTrue(TEXT("Asset has a streamed LOD table"), Asset->HasStreamedLOD());
++	TestTrue(TEXT("Asset renders through cluster culling"), Asset->IsNaniteEnabled() && Asset->HasClusterHierarchy());
++	const FGaussianStreamedLOD& LOD = Asset->GetStreamedLOD();
++	const TArray<FGaussianCluster>& Clusters = Asset->GetClusterHierarchy().Clusters;
++	const int32 Total = Asset->GetSplatCount();
++
++	// The LOD table and the clusters agree, and together they tile the records coarsest level first
++	TArray<uint8> Covered;
++	Covered.Init(0, Total);
++	bool bConsistent = LOD.NumLevels > 0 && LOD.LevelSplatCounts.Num() == LOD.NumLevels;
++	bool bErrorsMonotone = true;
++	int32 ClusterSum = 0;
++	TArray<uint64> LevelSums;
++	LevelSums.Init(0, LOD.NumLevels);
++	for (const FGaussianStreamedLODNode& Node : LOD.Nodes)
++	{
++		bConsistent = bConsistent && Node.Errors.Num() == LOD.NumLevels && Node.SplatCounts.Num() == LOD.NumLevels;
++		for (int32 Level = 0; bConsistent && Level < LOD.NumLevels; ++Level)
++		{
++			bErrorsMonotone = bErrorsMonotone && (Level == 0 || Node.Errors[Level] >= Node.Errors[Level - 1]);
++			uint32 Splats = 0;
++			for (uint32 C = Node.FirstCluster[Level]; C < Node.FirstCluster[Level] + Node.ClusterCounts[Level]; ++C)
++			{
++				const FGaussianCluster& Cluster = Clusters[int32(C)];
++				bConsistent = bConsistent && Cluster.LODLevel == uint32(Level) && Cluster.SplatCount >= 1 && Cluster.SplatCount <= 128
++					&& Cluster.IsLeaf() && Cluster.SplatStartIndex + Cluster.SplatCount <= uint32(Total);
++				for (uint32 I = Cluster.SplatStartIndex; bConsistent && I < Cluster.SplatStartIndex + Cluster.SplatCount; ++I)
++				{
++					bConsistent = Covered[int32(I)]++ == 0;
++				}
++				Splats += Cluster.SplatCount;
++			}
++			bConsistent = bConsistent && Splats == Node.SplatCounts[Level];
++			ClusterSum += int32(Node.ClusterCounts[Level]);
++			LevelSums[Level] += Splats;
++		}
++	}
++	bConsistent = bConsistent && ClusterSum == Clusters.Num() && !Covered.Contains(0);
++	for (int32 Level = 0; bConsistent && Level < LOD.NumLevels; ++Level)
++	{
++		bConsistent = LevelSums[Level] == LOD.LevelSplatCounts[Level];
++	}
++	TestTrue(TEXT("Nodes, clusters and records are consistent (every record in exactly one cluster)"), bConsistent);
++	TestTrue(TEXT("Errors are non-decreasing toward coarser levels"), bErrorsMonotone);
++	bool bCoarsestPrefix = true;
++	const uint64 Coarsest = LOD.LevelSplatCounts.Last();
++	for (const FGaussianCluster& Cluster : Clusters)
++	{
++		bCoarsestPrefix = bCoarsestPrefix && ((Cluster.LODLevel == uint32(LOD.NumLevels - 1)) == (Cluster.SplatStartIndex < Coarsest));
++	}
++	TestTrue(TEXT("The coarsest level is a prefix of the records"), bCoarsestPrefix);
++	AddInfo(FString::Printf(TEXT("Streamed import: %d splats, %d levels, %d nodes, %d clusters, palette %d, max selectable %u, %.1f s (errors %s)"),
++		Total, LOD.NumLevels, LOD.Nodes.Num(), Clusters.Num(), Asset->SOGPaletteCount, LOD.GetMaxSelectableSplats(), ImportSeconds,
++		LOD.bErrorsFromFile ? TEXT("from the file") : TEXT("derived")));
++
++	// Records are the merge's output, unchanged
++	sog::StreamedAsset Merged;
++	FString Error;
++	TArray<uint8> Records;
++	Asset->GetSOGRecordData(Records);
++	if (TestTrue(TEXT("Reader merges the same file"), NanoGSReadStreamedSOG(SourcePath, Merged, Error)))
++	{
++		TestTrue(TEXT("Asset records equal the merged records"), Records.Num() == int32(Merged.merged.splats.size() * sizeof(sog::PackedSplat))
++			&& FMemory::Memcmp(Records.GetData(), Merged.merged.splats.data(), Records.Num()) == 0);
++	}
++	TestFalse(TEXT("A Nanite rebuild is refused for Streamed SOG"), Asset->BuildNaniteClusterHierarchy());
++
++	// Save (version 7) and reload
++	FSavePackageArgs SaveArgs;
++	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
++	SaveArgs.SaveFlags = SAVE_NoError;
++	const bool bSaved = UPackage::SavePackage(Package, Asset, *PackageFile, SaveArgs);
++	TestTrue(TEXT("Package saves"), bSaved);
++	Package->Rename(*FString::Printf(TEXT("/Temp/NanoGS_StreamedTest_Old_%s"), *FGuid::NewGuid().ToString()),
++		nullptr, REN_DontCreateRedirectors | REN_NonTransactional);
++	UPackage* Reloaded = bSaved ? LoadPackage(nullptr, *PackageName, LOAD_None) : nullptr;
++	UGaussianSplatAsset* ReloadedAsset = Reloaded ? FindObject<UGaussianSplatAsset>(Reloaded, TEXT("StreamedTest")) : nullptr;
++	if (TestNotNull(TEXT("Saved asset reloads"), ReloadedAsset))
++	{
++		const FGaussianStreamedLOD& Loaded = ReloadedAsset->GetStreamedLOD();
++		bool bSame = ReloadedAsset->HasStreamedLOD() && Loaded.NumLevels == LOD.NumLevels && Loaded.Nodes.Num() == LOD.Nodes.Num()
++			&& Loaded.LevelSplatCounts == LOD.LevelSplatCounts && Loaded.bErrorsFromFile == LOD.bErrorsFromFile;
++		for (int32 N = 0; bSame && N < LOD.Nodes.Num(); ++N)
++		{
++			const FGaussianStreamedLODNode& A = LOD.Nodes[N];
++			const FGaussianStreamedLODNode& B = Loaded.Nodes[N];
++			bSame = A.BoundsMin == B.BoundsMin && A.BoundsMax == B.BoundsMax && A.Errors == B.Errors && A.SplatCounts == B.SplatCounts
++				&& A.FirstCluster == B.FirstCluster && A.ClusterCounts == B.ClusterCounts;
++		}
++		TestTrue(TEXT("Reloaded LOD table identical"), bSame);
++		TArray<uint8> ReloadedRecords;
++		ReloadedAsset->GetSOGRecordData(ReloadedRecords);
++		TestTrue(TEXT("Reloaded records identical"), ReloadedRecords == Records);
++		TestEqual(TEXT("Reloaded cluster count"), ReloadedAsset->GetClusterCount(), Clusters.Num());
+ 		ReloadedAsset->ClearFlags(RF_Public | RF_Standalone);
+ 		ReloadedAsset->MarkAsGarbage();
+ 		ResetLoaders(Reloaded);
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h b/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h	2026-09-29 19:11:57
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Public/GaussianSplatAssetFactory.h	2026-09-29 19:11:57
+@@ -74,6 +74,15 @@
+ 		UGaussianSplatAsset* ExistingAsset = nullptr
+ 	);
+ 
++	/** Import a Streamed SOG (lod-meta.json and its chunk folders): every LOD level, merged into one asset. */
++	UGaussianSplatAsset* ImportStreamedSOGFile(
++		const FString& FilePath,
++		UObject* InParent,
++		FName InName,
++		EObjectFlags Flags,
++		UGaussianSplatAsset* ExistingAsset = nullptr
++	);
++
+ 	/** Dispatch on the file type. */
+ 	UGaussianSplatAsset* ImportFile(
+ 		const FString& FilePath,
