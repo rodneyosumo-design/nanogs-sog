@@ -25,6 +25,8 @@ PAIRS=(
     "sog/SOGZip.cpp|NanoGSEditor/Private/SOG/SOGZip.cpp"
     "sog/SOGLoader.h|NanoGSEditor/Private/SOG/SOGLoader.h"
     "sog/SOGLoader.cpp|NanoGSEditor/Private/SOG/SOGLoader.cpp"
+    "sog/SOGStreamed.h|NanoGSEditor/Private/SOG/SOGStreamed.h"
+    "sog/SOGStreamed.cpp|NanoGSEditor/Private/SOG/SOGStreamed.cpp"
 )
 WEBP_DST="$SRC/NanoGSEditor/Private/ThirdParty/libwebp"
 
