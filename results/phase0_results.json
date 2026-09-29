@@ -1,0 +1,208 @@
+{
+  "counts": {
+    "original_ply": 2575004,
+    "sog": 2575004,
+    "roundtrip_ply": 2575004
+  },
+  "sizes_bytes": {
+    "original_ply": 607702422,
+    "sog": 38801793,
+    "sog_bytes_per_splat": 15.068634068141254,
+    "ply_bytes_per_splat": 236.0005739796909
+  },
+  "meta": {
+    "version": 2,
+    "asset": {
+      "generator": "splat-transform v3.7.0"
+    },
+    "count": 2575004,
+    "means": {
+      "mins": [
+        -1.9169129631953672,
+        -1.5501164209288711,
+        -2.2823380291057047
+      ],
+      "maxs": [
+        2.196661168003333,
+        0.7884463280255266,
+        2.054027774783494
+      ],
+      "files": [
+        "means_l.webp",
+        "means_u.webp"
+      ]
+    },
+    "quats": {
+      "files": [
+        "quats.webp"
+      ]
+    },
+    "shN": {
+      "count": 65536,
+      "bands": 3,
+      "files": [
+        "shN_centroids.webp",
+        "shN_labels.webp"
+      ]
+    }
+  },
+  "decoder_vs_splat_transform": {
+    "pos_max_abs": 4.7610886788618245e-07,
+    "quat_max_abs(sign-aligned)": 1.2212453270876722e-15,
+    "scale_log_max_abs": 0.0,
+    "opacity_max_abs": 1.1644051167714053e-08,
+    "dc_max_abs": 0.0,
+    "sh_rest_max_abs": 0.0
+  },
+  "gpu_layout_vs_reference": {
+    "record_bytes": 20,
+    "pos_max_abs": 4.746500189334313e-06,
+    "pos_max_rel": 0.011863205003517506,
+    "quat_max_abs": 3.391107038508423e-07,
+    "scale_max_rel": 5.645590980165437e-08,
+    "opacity_max_abs": 7.433049820093629e-08,
+    "color_dc_max_abs": 2.678380988108131e-07,
+    "labels_equal": true
+  },
+  "frame": {
+    "ply_bbox_min": [
+      -5.7999,
+      -3.712,
+      -8.7996
+    ],
+    "ply_bbox_max": [
+      7.9949,
+      1.2,
+      6.7993
+    ],
+    "sog_bbox_min": [
+      -5.7999,
+      -3.712,
+      -8.7996
+    ],
+    "sog_bbox_max": [
+      7.9944,
+      1.2,
+      6.7993
+    ],
+    "ply_centroid": [
+      0.4547,
+      -0.3057,
+      -0.1844
+    ],
+    "sog_centroid": [
+      0.4546,
+      -0.3057,
+      -0.1845
+    ],
+    "same_frame": true
+  },
+  "matching": {
+    "mutual_nearest_fraction": 0.9999130098438682,
+    "unique_sog_targets": 2574850,
+    "seconds": 1.3
+  },
+  "fidelity_original_vs_sog": {
+    "position_error_mm": {
+      "p50": 0.1784266757637395,
+      "p95": 0.36581140775972876,
+      "p99": 0.44517944636513873,
+      "p99.9": 0.5488332059843994,
+      "max": 0.7026380599971096,
+      "mean": 0.1901172614138112
+    },
+    "position_error_vs_splat_size": {
+      "p50": 0.01882992496387111,
+      "p95": 0.08488284128258287,
+      "p99": 0.14229378638693105,
+      "p99.9": 0.24133970594040688,
+      "max": 0.6783879245718336,
+      "mean": 0.0282199392744286
+    },
+    "scale_log_error": {
+      "p50": 0.009211063385009766,
+      "p95": 0.018515825271606445,
+      "p99": 0.02482891082763672,
+      "p99.9": 0.03499889373779297,
+      "max": 4.823331356048584,
+      "mean": 0.009838491350410402
+    },
+    "rotation_error_deg": {
+      "p50": 0.8960886766372924,
+      "p95": 1.2454750797586407,
+      "p99": 1.4444673994900503,
+      "p99.9": 1.752885625649232,
+      "max": 176.0321008331345,
+      "mean": 0.7883042546593787
+    },
+    "rotation_error_deg_non_spherical": {
+      "p50": 0.8959923765851658,
+      "p95": 1.2455234228548655,
+      "p99": 1.4444933162669664,
+      "p99.9": 1.752992656724976,
+      "max": 176.0321008331345,
+      "mean": 0.7883303634221025
+    },
+    "opacity_error": {
+      "p50": 9.815955936964826e-09,
+      "p95": 0.00392156837759472,
+      "p99": 0.00392156858423931,
+      "p99.9": 0.003921568625552485,
+      "max": 0.8823529398987184,
+      "mean": 0.0019391400051798453
+    },
+    "dc_color_error_8bit_levels": {
+      "p50": 0.33711768388708235,
+      "p95": 0.7022699107509878,
+      "p99": 1.0692443721893599,
+      "p99.9": 2.9638709667860517,
+      "max": 102.82839047298002,
+      "mean": 0.36813439180727087
+    },
+    "sh_rest_rms_error": {
+      "p50": 0.016863176599144936,
+      "p95": 0.03460598234087223,
+      "p99": 0.047461457550525665,
+      "p99.9": 0.06988418918103033,
+      "max": 0.2223278135061264,
+      "mean": 0.018263115817898624
+    },
+    "sh_rest_rms_magnitude": {
+      "p50": 0.04825098440051079,
+      "p95": 0.09583701938390732,
+      "p99": 0.13243749275803557,
+      "p99.9": 0.19206881523132324,
+      "max": 0.40193310379981995,
+      "mean": 0.05224740769908004
+    },
+    "sh_rest_relative_error_where_significant": {
+      "p50": 0.3310191333293915,
+      "p95": 0.5191143035888672,
+      "p99": 0.6028098464012146,
+      "p99.9": 0.703467002749476,
+      "max": 1.7984896898269653,
+      "mean": 0.33076876133809563
+    }
+  },
+  "outliers": {
+    "matched_pairs": 2574780,
+    "rotation_gt_10deg": 73,
+    "rotation_gt_10deg_with_near_zero_norm_source_quat": 0,
+    "scale_log_error_gt_0.2": 85,
+    "scale_source_outside_codebook_range": 0,
+    "dc_error_gt_8_levels": 63,
+    "dc_source_outside_codebook_range": 23,
+    "opacity_error_gt_0.05": 90
+  },
+  "gpu_memory_projection_MB": {
+    "sog_records_base_splats": 51.50008,
+    "sog_records_incl_nanogs_lod": 68.65004,
+    "sh_palette_half4": 7.86432,
+    "luts_and_constants": 0.00216,
+    "total_sog_mode": 76.51436,
+    "nanogs_gpu_today_packed_core": 54.920032,
+    "nanogs_gpu_today_sh_float16": 329.520192,
+    "nanogs_gpu_today_total": 384.440224,
+    "nanogs_cooked_bulk_payload": 494
+  }
+}

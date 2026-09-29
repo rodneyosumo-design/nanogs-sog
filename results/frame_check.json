@@ -1,0 +1,25 @@
+{
+  "splats_checked": 200000,
+  "max_relative_covariance_difference": 3.1752853680393223e-16,
+  "p99_relative_covariance_difference": 1.9554168046943605e-16,
+  "position_mapping_matches_nanogs": true,
+  "det_fileToLocal": -1.0,
+  "fileToLocal_column_major_cm": [
+    0,
+    100,
+    0,
+    0,
+    0,
+    0,
+    -100,
+    0,
+    100,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1
+  ]
+}

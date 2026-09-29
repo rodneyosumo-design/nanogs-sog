@@ -1,0 +1,53 @@
+{
+  "color_dc" : {
+    "max_error" : 2.384185791015625e-07,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 1.0000000000000001e-05
+  },
+  "color_sh3 (half palette)" : {
+    "max_error" : 0.00017142295837402344,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 0.0050000000000000001
+  },
+  "covariance local (cm^2)" : {
+    "max_error" : 1.2997249023933675e-06,
+    "pass" : true,
+    "relative" : true,
+    "tolerance" : 0.0001
+  },
+  "gpu" : "Apple M4",
+  "gpu_ms" : 5.653749976772815,
+  "label" : {
+    "max_error" : 0,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 0
+  },
+  "opacity" : {
+    "max_error" : 5.9604644775390625e-08,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 9.9999999999999995e-07
+  },
+  "position (m)" : {
+    "max_error" : 3.814697265625e-06,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 2.0000000000000002e-05
+  },
+  "quat (w,x,y,z)" : {
+    "max_error" : 1.7881393432617188e-07,
+    "pass" : true,
+    "relative" : false,
+    "tolerance" : 1.0000000000000001e-05
+  },
+  "scale" : {
+    "max_error" : 9.2228563038407294e-08,
+    "pass" : true,
+    "relative" : true,
+    "tolerance" : 1.0000000000000001e-05
+  },
+  "splats" : 2575004
+}
