@@ -9,6 +9,11 @@
 #include <utility>
 #include <vector>
 
+// Export macro for shared-library builds (NanoGS defines SOG_API=NANOGS_API); empty for static use.
+#ifndef SOG_API
+#define SOG_API
+#endif
+
 namespace sog {
 
 inline constexpr float kSHC0 = 0.28209479177387814f;
@@ -65,15 +70,15 @@ struct DecodedAsset {
     float scaleLUT[256] = {};               // exp(scaleCodebook)
     float dcLUT[256] = {};                  // 0.5 + SH_C0 * sh0Codebook
     std::vector<uint16_t> paletteHalf4;     // paletteCount * shCoeffs * 4 halves (rgb + unused)
-
-    AssetConstants MakeConstants(const float fileToLocal[16]) const;
 };
+
+SOG_API AssetConstants MakeConstants(const DecodedAsset& asset, const float fileToLocal[16]);
 
 enum class Error {
     Ok, NotZipOrFolder, UnsupportedZip, MissingMeta, BadMeta, BadVersion, MissingImage,
     BadImage, LossyImage, ImageSizeMismatch, BadQuatMode, LabelOutOfRange
 };
-const char* ErrorName(Error e);
+SOG_API const char* ErrorName(Error e);
 
 // Each pointer is this splat's RGBA8 texel, decoded with libwebp WebPDecodeRGBA (exact bytes; never
 // ImageIO/CoreGraphics, which premultiply alpha). The caller has checked q[3] is 252..255.

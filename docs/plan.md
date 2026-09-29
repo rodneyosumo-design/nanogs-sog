@@ -62,7 +62,7 @@ up (the importer hard-codes Float32/Float16/Float16 bulk formats). SOG storage w
 
 **Phase 0: ground truth — done.** See [phase0-results.md](phase0-results.md).
 
-**Phase 1: ingestion and parser (NanoGSEditor).**
+**Phase 1: ingestion and parser (NanoGSEditor) — done** (decision A, 2026-09-29); see [phase1-results.md](phase1-results.md) for results and deviations.
 - Import factory for `.sog`, SOG folders and `lod-meta.json`; zips via Unreal's `FZipArchiveReader`.
 - Vendor the libwebp decoder (BSD) into the editor module only; Unreal 5.8's image decoder has no WebP.
 - Pack each splat into the 20-byte record (`sog/SOGTypes.h`), keeping Morton order; build the

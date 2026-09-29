@@ -22,14 +22,14 @@ struct SplatFloat {
     uint32_t shCoeffs = 0;                  // valid AC coefficients (0 when kFlagNoSH is set)
 };
 
-void DecodeSplat(const DecodedAsset& asset, size_t index, SplatFloat& out);
+SOG_API void DecodeSplat(const DecodedAsset& asset, size_t index, SplatFloat& out);
 
 // Fill scaleLUT, dcLUT and paletteHalf4 from the codebooks and palette indices.
-void BuildGpuTables(DecodedAsset& asset);
+SOG_API void BuildGpuTables(DecodedAsset& asset);
 
 // Quantizes a splat against the asset's existing ranges and codebooks. Positions outside
 // [meanMin, meanMax] (log-domain) clamp; scale and DC snap to the nearest codebook entry.
-class Encoder {
+class SOG_API Encoder {
 public:
     explicit Encoder(const DecodedAsset& asset);
     PackedSplat Encode(const SplatFloat& s, uint16_t label, uint8_t flags) const;
@@ -44,7 +44,7 @@ private:
     Sorted DcSorted;
 };
 
-uint16_t FloatToHalf(float f);
-float HalfToFloat(uint16_t h);
+SOG_API uint16_t FloatToHalf(float f);
+SOG_API float HalfToFloat(uint16_t h);
 
 } // namespace sog

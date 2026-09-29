@@ -11,10 +11,10 @@ current ~112 bytes per splat, most of which is Float16 spherical harmonics.
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Ground truth: encode the real scene, validate the format, frame, fidelity and GPU layout | **Done** — [results](docs/phase0-results.md) |
-| 1 | Editor importer: `.sog` / `meta.json` / `lod-meta.json` → cooked 20-byte records + tables | Not started |
+| 1 | Editor importer: `.sog` / SOG `meta.json` → cooked 20-byte records + tables (decision A) | **Done** — [results](docs/phase1-results.md); NanoGS side in pending Perforce changelist 363 |
 | 2 | GPU decode path in NanoGS's compute pass, 16-bit sort keys on mobile | Not started |
 | 3 | Mobile rasterization tuning (quad extents, reduced-resolution splat target) | Not started |
-| 4 | Streamed SOG LOD, residency budget, API/device-profile knobs | Not started |
+| 4 | Streamed SOG (`lod-meta.json`) import and LOD, residency budget, API/device-profile knobs | Not started |
 
 Full plan: [docs/plan.md](docs/plan.md).
 
@@ -23,9 +23,13 @@ Full plan: [docs/plan.md](docs/plan.md).
 | Path | Contents |
 |---|---|
 | `docs/` | Engineering plan, phase write-ups, comparison images |
-| `sog/SOGTypes.h` | CPU layout of the GPU-resident format (20-byte record, 112-byte constants, `PackSplat`) |
+| `sog/` | Engine-independent C++17 SOG library: types, CPU decode/encode, loader (zip, JSON, libwebp) |
 | `shaders/SOGDecode.metal` | GPU decode: position, quaternion, scale, opacity, SH0–SH3 colour, local-space covariance |
-| `tools/phase0/` | Reference SOG v2 decoder (Python), analysis, render comparison, blueprint tests |
+| `third_party/libwebp` | libwebp v1.6.0 decoder only (BSD-3) |
+| `tests/` | Library tests: `tests/run_tests.sh` (codec, 14 fixtures, full scene) |
+| `integration/` | Review snapshot of the NanoGS (Perforce) changes |
+| `tools/sync_nanogs.sh` | Copies `sog/` and libwebp into the NanoGS plugin, or `--check`s the copies |
+| `tools/phase0/`, `tools/phase1/` | Reference SOG v2 decoder (Python), analysis, render comparison, blueprint tests, fixture generator |
 | `results/` | Phase 0 measurements (JSON), golden test vectors, the real asset's `meta.json` |
 | `data/` | Large generated files (SOG, PLYs, renders, test binaries). Git-ignored; recreate with the script below |
 
@@ -42,3 +46,13 @@ tools/phase0/run_phase0.sh "/Volumes/External SSD/Unreal Projects/SHUTourDemo/So
 
 It installs the pinned `@playcanvas/splat-transform` (3.7.0) and a Python venv, encodes the PLY to SOG,
 round-trips it, runs the analysis and render comparison, and runs the Metal (GPU) and C++ blueprint tests.
+
+## Library tests (Phase 1)
+
+```bash
+tests/run_tests.sh
+```
+
+Builds `sog/` with the vendored libwebp (clang, `-Wall -Wextra -Wshadow -Werror`) and runs the codec, fixture
+and full-scene suites. The full-scene suite needs Phase 0's data. The Unreal-side tests
+(`NanoGS.SOG.*`) are described in [docs/phase1-results.md](docs/phase1-results.md).

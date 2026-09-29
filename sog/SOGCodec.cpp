@@ -51,17 +51,17 @@ const char* ErrorName(Error e)
     return "Unknown";
 }
 
-AssetConstants DecodedAsset::MakeConstants(const float fileToLocal[16]) const
+AssetConstants MakeConstants(const DecodedAsset& asset, const float fileToLocal[16])
 {
     AssetConstants c{};
     std::memcpy(c.fileToLocal, fileToLocal, sizeof(c.fileToLocal));
     for (int k = 0; k < 3; ++k) {
-        c.meanMin[k] = float(meanMin[k]);
-        c.meanMax[k] = float(meanMax[k]);
+        c.meanMin[k] = float(asset.meanMin[k]);
+        c.meanMax[k] = float(asset.meanMax[k]);
     }
-    c.count = count;
-    c.shCoeffs = shCoeffs;
-    c.antialias = antialias ? 1u : 0u;
+    c.count = asset.count;
+    c.shCoeffs = asset.shCoeffs;
+    c.antialias = asset.antialias ? 1u : 0u;
     return c;
 }
 

@@ -122,8 +122,8 @@ The plan's "~144 bytes per splat, 494 MB" was the cooked bulk payload, not GPU r
 ## 7. Not done, and why
 
 **No Unreal asset was created from the round-trip PLY.**
-- The editor was closed, and NanoGS's Nanite (cluster) build is only reachable from the Asset Actions menu.
-  It isn't scriptable.
+- The editor was closed. (This write-up originally also said NanoGS's Nanite build was menu-only; that was
+  wrong: `BuildNaniteClusterHierarchy` is `BlueprintCallable`, so it can be scripted. See Phase 1.)
 - An import would also have put a ~430 MB unversioned asset into the Perforce workspace.
 - The round-trip PLY's header is identical to the original's (same 59 properties, same order), so NanoGS
   reads it unchanged.
