@@ -24,7 +24,7 @@ in [integration/nanogs-phase1.patch](../integration/nanogs-phase1.patch).
 | `sog/SOGCodec.*` | Dependency-free CPU decode (double precision), GPU tables, IEEE half conversion, encoder for NanoGS's merged LOD splats |
 | `sog/SOGLoader.*` | Loads a bundled `.sog` or an unbundled folder through a `FileSource` interface; validates everything the spec requires |
 | `sog/SOGJson.*`, `sog/SOGZip.*` | Locale-independent JSON; zip reader (stored + deflate via zlib, CRC-checked) |
-| `third_party/libwebp` | libwebp v1.6.0 decoder only (generic + SSE2/SSE4.1 + NEON), BSD-3 |
+| `third_party/libwebp` | libwebp v1.6.0 decoder only (generic + SSE2/SSE4.1/AVX2 + NEON), BSD-3 |
 | `tests/` | `run_tests.sh`: codec, fixtures and full-scene suites |
 | `tools/phase1/make_fixtures.py` | 14 fixture files: valid (stored, deflate, folder, band 3, no SH) and one per error path |
 | `tools/sync_nanogs.sh` | Copies the library into the plugin, or `--check`s the copies are identical |
