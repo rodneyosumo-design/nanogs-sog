@@ -1,0 +1,1380 @@
+# NanoGS changes for Phase 5 (moment-matched LOD merge, Fab release fixes), on top of Phase 4
+# (nanogs-phase4.patch). All phases are in pending Perforce changelist 363 (shelved, not submitted).
+# LOD merge: LOD splats keep their group's mean and covariance (sum w_i (Sigma_i + d_i d_i^T), w_i ~ opacity x
+# footprint, Jacobi eigen-decomposition to rotation + scales) with opacity 1 - prod(1 - a_i) capped by the
+# children's coverage; SOG LOD records clamp scales above the codebook with opacity compensation. Tests:
+# NanoGS.Cluster.MomentMatchedMerge (ClusterLODMergeTests.cpp) and the LOD checks of NanoGS.SOG.ImportNaniteSaveReload.
+# Fab fixes: Win64 build (UE_NONCOPYABLE FGaussianStreamedResidency, Misc/Paths.h, C4668 off for libwebp), the
+# ClusterCulling counters merged into one CullingCounters buffer (7 UAVs, for D3D feature level 11.0), and
+# NanoGSCompat.h for UE 5.6/5.7 (FViewMatrices getters, OnPostEngineInit, RHICmdList texture calls).
+# Not in this patch: files vendored verbatim from this repo (sog/ -> Source/*/SOG, shaders/SOGDecode.ush,
+# third_party/libwebp incl. the new lossless_avx2.c), the Mac dylibs, and binary assets.
+# Verified on UE 5.8 Mac: BuildPlugin Mac+IOS, NanoGS.* tests 6/6, SHUCampusLevel renders (2026-10-06).
+
+diff -ruN a/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf b/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf
+--- a/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Shaders/Private/ClusterCulling.usf	2026-10-06 18:22:24
+@@ -12,8 +12,14 @@
+ // Output: Visible cluster indices and count
+ // Each entry is packed: lower 24 bits = cluster index, upper 8 bits = use LOD flag
+ RWStructuredBuffer<uint> VisibleClusterBuffer;
+-RWStructuredBuffer<uint> VisibleClusterCountBuffer;
+ 
++// The single-uint counters share one buffer: feature level 11.0 (D3D12 SM5, D3D11) allows 8 UAVs per shader
++RWStructuredBuffer<uint> CullingCounters;
++#define CULLING_COUNTER_VISIBLE_CLUSTERS 0   // visible clusters written to VisibleClusterBuffer
++#define CULLING_COUNTER_LOD_CLUSTERS     1   // unique parent clusters written to LODClusterBuffer
++#define CULLING_COUNTER_LOD_SPLAT_TOTAL  2   // sum of the selected parent clusters' LOD splat counts
++#define CULLING_COUNTER_LOD_SPLAT_OUTPUT 3   // valid LOD splat output (only reset here)
++
+ // Indirect draw argument buffer for GPU-driven rendering
+ // Structure: [0] IndexCountPerInstance, [1] InstanceCount, [2] StartIndexLocation, [3] BaseVertexLocation, [4] StartInstanceLocation
+ RWStructuredBuffer<uint> IndirectDrawArgsBuffer;
+@@ -30,14 +36,8 @@
+ // LOD cluster tracking - for rendering parent LOD splats
+ // Unique parent clusters that need their LOD splats rendered
+ RWStructuredBuffer<uint> LODClusterBuffer;
+-// Count of unique LOD clusters
+-RWStructuredBuffer<uint> LODClusterCountBuffer;
+ // Bitmap to track which parent clusters have been claimed (1 bit per cluster)
+ RWStructuredBuffer<uint> LODClusterSelectedBitmap;
+-// Total LOD splats to render (sum of all selected parent cluster LOD splat counts)
+-RWStructuredBuffer<uint> LODSplatTotalBuffer;
+-// Output count for GPU-driven LOD splat processing (reset before LOD processing)
+-RWStructuredBuffer<uint> LODSplatOutputCountBuffer;
+ // Whether LOD rendering is enabled
+ uint UseLODRendering;
+ 
+@@ -297,7 +297,7 @@
+ 
+ 	// Atomically append to visible cluster list with LOD info
+ 	uint visibleIndex;
+-	InterlockedAdd(VisibleClusterCountBuffer[0], 1, visibleIndex);
++	InterlockedAdd(CullingCounters[CULLING_COUNTER_VISIBLE_CLUSTERS], 1, visibleIndex);
+ 	VisibleClusterBuffer[visibleIndex] = PackClusterInfo(clusterIndex, useLOD);
+ 
+ 	// Atomically add this cluster's splat count to indirect draw instance count
+@@ -333,11 +333,11 @@
+ 			// Add this parent cluster to the LOD cluster list
+ 			FGaussianGPUCluster parentCluster = ClusterBuffer[selectedClusterID];
+ 			uint lodIdx;
+-			InterlockedAdd(LODClusterCountBuffer[0], 1, lodIdx);
++			InterlockedAdd(CullingCounters[CULLING_COUNTER_LOD_CLUSTERS], 1, lodIdx);
+ 			LODClusterBuffer[lodIdx] = selectedClusterID;
+ 
+ 			// Add this cluster's LOD splat count to the total
+-			InterlockedAdd(LODSplatTotalBuffer[0], parentCluster.LODSplatCount);
++			InterlockedAdd(CullingCounters[CULLING_COUNTER_LOD_SPLAT_TOTAL], parentCluster.LODSplatCount);
+ 		}
+ 	}
+ }
+@@ -352,7 +352,7 @@
+ 	// Thread 0 resets counters and indirect draw args
+ 	if (threadIndex == 0)
+ 	{
+-		VisibleClusterCountBuffer[0] = 0;
++		CullingCounters[CULLING_COUNTER_VISIBLE_CLUSTERS] = 0;
+ 
+ 		// Initialize indirect draw args
+ 		// [0] IndexCountPerInstance = 6 (2 triangles per quad)
+@@ -367,11 +367,11 @@
+ 		IndirectDrawArgsBuffer[4] = 0;
+ 
+ 		// Reset LOD cluster tracking counters
+-		LODClusterCountBuffer[0] = 0;
+-		LODSplatTotalBuffer[0] = 0;
++		CullingCounters[CULLING_COUNTER_LOD_CLUSTERS] = 0;
++		CullingCounters[CULLING_COUNTER_LOD_SPLAT_TOTAL] = 0;
+ 
+ 		// Reset LOD splat output counter for GPU-driven LOD processing
+-		LODSplatOutputCountBuffer[0] = 0;
++		CullingCounters[CULLING_COUNTER_LOD_SPLAT_OUTPUT] = 0;
+ 	}
+ 
+ 	// All threads help clear the visibility bitmap
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianClusterBuilder.cpp	2026-09-29 17:17:11
+@@ -2,6 +2,159 @@
+ 
+ #include "GaussianClusterBuilder.h"
+ 
++namespace
++{
++	/**
++	 * Rotation matrix of a quaternion (x, y, z, w) in column-vector convention, R[row][col]: the formula of QuatToMatrix
++	 * in GaussianDataTypes.ush, so R diag(s^2) R^T is the covariance the renderer draws for a splat.
++	 */
++	void QuatToMatrix(const FQuat4f& Q, double R[3][3])
++	{
++		const double Len = FMath::Sqrt(double(Q.X) * Q.X + double(Q.Y) * Q.Y + double(Q.Z) * Q.Z + double(Q.W) * Q.W);
++		const double Inv = Len > 0.0 ? 1.0 / Len : 0.0;
++		const double X = Q.X * Inv, Y = Q.Y * Inv, Z = Q.Z * Inv, W = Len > 0.0 ? Q.W * Inv : 1.0;
++		R[0][0] = 1.0 - 2.0 * (Y * Y + Z * Z); R[0][1] = 2.0 * (X * Y - W * Z);       R[0][2] = 2.0 * (X * Z + W * Y);
++		R[1][0] = 2.0 * (X * Y + W * Z);       R[1][1] = 1.0 - 2.0 * (X * X + Z * Z); R[1][2] = 2.0 * (Y * Z - W * X);
++		R[2][0] = 2.0 * (X * Z - W * Y);       R[2][1] = 2.0 * (Y * Z + W * X);       R[2][2] = 1.0 - 2.0 * (X * X + Y * Y);
++	}
++
++	/** Quaternion (x, y, z, w) of a rotation matrix (det +1); the inverse of QuatToMatrix (Shepperd's method). */
++	FQuat4f MatrixToQuat(const double R[3][3])
++	{
++		double X, Y, Z, W;
++		const double Trace = R[0][0] + R[1][1] + R[2][2];
++		if (Trace > 0.0)
++		{
++			const double S = 2.0 * FMath::Sqrt(Trace + 1.0); // 4w
++			W = 0.25 * S;
++			X = (R[2][1] - R[1][2]) / S;
++			Y = (R[0][2] - R[2][0]) / S;
++			Z = (R[1][0] - R[0][1]) / S;
++		}
++		else if (R[0][0] > R[1][1] && R[0][0] > R[2][2])
++		{
++			const double S = 2.0 * FMath::Sqrt(1.0 + R[0][0] - R[1][1] - R[2][2]); // 4x
++			W = (R[2][1] - R[1][2]) / S;
++			X = 0.25 * S;
++			Y = (R[0][1] + R[1][0]) / S;
++			Z = (R[0][2] + R[2][0]) / S;
++		}
++		else if (R[1][1] > R[2][2])
++		{
++			const double S = 2.0 * FMath::Sqrt(1.0 + R[1][1] - R[0][0] - R[2][2]); // 4y
++			W = (R[0][2] - R[2][0]) / S;
++			X = (R[0][1] + R[1][0]) / S;
++			Y = 0.25 * S;
++			Z = (R[1][2] + R[2][1]) / S;
++		}
++		else
++		{
++			const double S = 2.0 * FMath::Sqrt(1.0 + R[2][2] - R[0][0] - R[1][1]); // 4z
++			W = (R[1][0] - R[0][1]) / S;
++			X = (R[0][2] + R[2][0]) / S;
++			Y = (R[1][2] + R[2][1]) / S;
++			Z = 0.25 * S;
++		}
++		const double Inv = 1.0 / FMath::Sqrt(X * X + Y * Y + Z * Z + W * W);
++		return FQuat4f(float(X * Inv), float(Y * Inv), float(Z * Inv), float(W * Inv));
++	}
++
++	/**
++	 * Eigen-decomposition of a symmetric 3x3 matrix by cyclic Jacobi rotations: A = V diag(Eigen) V^T with the
++	 * eigenvectors in V's columns. V is returned as a rotation (det +1).
++	 */
++	void EigenSymmetric3(const double InA[3][3], double Eigen[3], double V[3][3])
++	{
++		double A[3][3];
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			for (int32 Col = 0; Col < 3; ++Col)
++			{
++				A[Row][Col] = InA[Row][Col];
++				V[Row][Col] = Row == Col ? 1.0 : 0.0;
++			}
++		}
++		static constexpr int32 Pairs[3][2] = { { 0, 1 }, { 0, 2 }, { 1, 2 } };
++		for (int32 Sweep = 0; Sweep < 32; ++Sweep)
++		{
++			const double Off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
++			const double Diag = A[0][0] * A[0][0] + A[1][1] * A[1][1] + A[2][2] * A[2][2];
++			if (Off <= 1e-24 * Diag)
++			{
++				break;
++			}
++			for (const int32* Pair : Pairs)
++			{
++				const int32 P = Pair[0], Q = Pair[1];
++				if (A[P][Q] == 0.0)
++				{
++					continue;
++				}
++				// Rotation J (identity except J[P][P] = J[Q][Q] = C, J[P][Q] = S, J[Q][P] = -S) that zeroes A[P][Q]:
++				// A <- J^T A J, V <- V J
++				const double Theta = (A[Q][Q] - A[P][P]) / (2.0 * A[P][Q]);
++				const double T = (Theta >= 0.0 ? 1.0 : -1.0) / (FMath::Abs(Theta) + FMath::Sqrt(Theta * Theta + 1.0));
++				const double C = 1.0 / FMath::Sqrt(T * T + 1.0);
++				const double S = T * C;
++				for (int32 K = 0; K < 3; ++K)
++				{
++					const double AKP = A[K][P], AKQ = A[K][Q];
++					A[K][P] = C * AKP - S * AKQ;
++					A[K][Q] = S * AKP + C * AKQ;
++				}
++				for (int32 K = 0; K < 3; ++K)
++				{
++					const double APK = A[P][K], AQK = A[Q][K];
++					A[P][K] = C * APK - S * AQK;
++					A[Q][K] = S * APK + C * AQK;
++				}
++				for (int32 K = 0; K < 3; ++K)
++				{
++					const double VKP = V[K][P], VKQ = V[K][Q];
++					V[K][P] = C * VKP - S * VKQ;
++					V[K][Q] = S * VKP + C * VKQ;
++				}
++			}
++		}
++		for (int32 K = 0; K < 3; ++K)
++		{
++			Eigen[K] = A[K][K];
++		}
++		const double Det = V[0][0] * (V[1][1] * V[2][2] - V[1][2] * V[2][1])
++			- V[0][1] * (V[1][0] * V[2][2] - V[1][2] * V[2][0])
++			+ V[0][2] * (V[1][0] * V[2][1] - V[1][1] * V[2][0]);
++		if (Det < 0.0)
++		{
++			for (int32 K = 0; K < 3; ++K)
++			{
++				V[K][2] = -V[K][2];
++			}
++		}
++	}
++
++	/** Covariance R diag(s^2) R^T of a splat, in its asset's local space (cm^2). */
++	void SplatCovariance(const FGaussianSplatData& Splat, double Out[3][3])
++	{
++		double R[3][3];
++		QuatToMatrix(Splat.Rotation, R);
++		const double S2[3] = { double(Splat.Scale.X) * Splat.Scale.X, double(Splat.Scale.Y) * Splat.Scale.Y, double(Splat.Scale.Z) * Splat.Scale.Z };
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			for (int32 Col = 0; Col < 3; ++Col)
++			{
++				Out[Row][Col] = R[Row][0] * S2[0] * R[Col][0] + R[Row][1] * S2[1] * R[Col][1] + R[Row][2] * S2[2] * R[Col][2];
++			}
++		}
++	}
++
++	/** A splat's largest cross-section, the product of its two largest axes (area / pi, cm^2). */
++	double Footprint(const FVector3f& Scale)
++	{
++		const double A = FMath::Abs(Scale.X), B = FMath::Abs(Scale.Y), C = FMath::Abs(Scale.Z);
++		return FMath::Max3(A * B, A * C, B * C);
++	}
++}
++
+ bool FGaussianClusterBuilder::BuildClusterHierarchy(
+ 	TArray<FGaussianSplatData>& InOutSplats,
+ 	FGaussianClusterHierarchy& OutHierarchy,
+@@ -437,128 +590,72 @@
+ 
+ 	// Clamp count to available splats
+ 	Count = FMath::Min(Count, Splats.Num() - StartIndex);
++	const FGaussianSplatData* Group = Splats.GetData() + StartIndex;
+ 
+-	// Calculate total opacity weight for weighted averaging
+-	float TotalWeight = 0.0f;
++	// Weights: opacity x footprint, each splat's share of the coverage it draws (opacity alone lets a small
++	// opaque splat pull the merged centre and colour as much as a large one)
++	TArray<double, TInlineAllocator<16>> Weights;
++	Weights.SetNumUninitialized(Count);
++	double Coverage = 0.0;
++	double Transparency = 1.0;
+ 	for (int32 i = 0; i < Count; i++)
+ 	{
+-		TotalWeight += Splats[StartIndex + i].Opacity;
++		const double Opacity = FMath::Clamp(double(Group[i].Opacity), 0.0, 1.0);
++		Weights[i] = Opacity * Footprint(Group[i].Scale);
++		Coverage += Weights[i];
++		Transparency *= 1.0 - Opacity;
+ 	}
+-
+-	if (TotalWeight < SMALL_NUMBER)
+-	{
+-		TotalWeight = 1.0f; // Avoid division by zero
+-	}
+-
+-	// Weighted centroid position
+-	FVector3f WeightedPosition = FVector3f::ZeroVector;
+-	FVector3f WeightedSHDC = FVector3f::ZeroVector;
+-
+ 	for (int32 i = 0; i < Count; i++)
+ 	{
+-		const FGaussianSplatData& Splat = Splats[StartIndex + i];
+-		float Weight = Splat.Opacity / TotalWeight;
+-
+-		WeightedPosition += Splat.Position * Weight;
+-
+-		// Average SH_DC directly (keeps same format as original splats)
+-		WeightedSHDC += Splat.SH_DC * Weight;
++		Weights[i] = Coverage > 0.0 ? Weights[i] / Coverage : 1.0 / Count;
+ 	}
+ 
+-	Result.Position = WeightedPosition;
+-	Result.SH_DC = WeightedSHDC;
+-
+-	// Combined scale: weighted average of original scales
+-	// Don't add position spread — it dominates over individual scales in dense scenes
+-	// and produces massively oversized LOD splats. The combined opacity handles
+-	// the increased visual impact of merging N splats into 1.
+-	FVector3f AvgScale = FVector3f::ZeroVector;
+-
++	FVector3d Mean(0.0);
++	FVector3d DC(0.0);
+ 	for (int32 i = 0; i < Count; i++)
+ 	{
+-		const FGaussianSplatData& Splat = Splats[StartIndex + i];
+-		float Weight = Splat.Opacity / TotalWeight;
+-		AvgScale += Splat.Scale * Weight;
++		Mean += Weights[i] * FVector3d(Group[i].Position);
++		DC += Weights[i] * FVector3d(Group[i].SH_DC);
+ 	}
+ 
+-	Result.Scale = AvgScale;
+-
+-	// Use identity rotation for merged splat (could compute average quaternion)
+-	Result.Rotation = FQuat4f::Identity;
+-
+-	// Combined opacity: probabilistic - 1 - product(1 - opacity_i)
+-	// For small opacities, this approximates the sum
+-	float CombinedTransparency = 1.0f;
++	// Moment-matched covariance: the merged Gaussian keeps the group's second moments,
++	//   Sigma = sum w_i (Sigma_i + (mu_i - mu)(mu_i - mu)^T),  Sigma_i = R_i diag(s_i^2) R_i^T,
++	// so it spans the area its children cover and follows their orientation. Averaging the scales instead shrinks
++	// the footprint by about the reduction ratio per level and leaves holes at coarse levels.
++	double Covariance[3][3] = {};
+ 	for (int32 i = 0; i < Count; i++)
+ 	{
+-		CombinedTransparency *= (1.0f - FMath::Clamp(Splats[StartIndex + i].Opacity, 0.0f, 1.0f));
++		double SplatCov[3][3];
++		SplatCovariance(Group[i], SplatCov);
++		const FVector3d D = FVector3d(Group[i].Position) - Mean;
++		const double Offset[3] = { D.X, D.Y, D.Z };
++		for (int32 Row = 0; Row < 3; Row++)
++		{
++			for (int32 Col = 0; Col < 3; Col++)
++			{
++				Covariance[Row][Col] += Weights[i] * (SplatCov[Row][Col] + Offset[Row] * Offset[Col]);
++			}
++		}
+ 	}
+-	Result.Opacity = FMath::Clamp(1.0f - CombinedTransparency, 0.0f, 1.0f);
++	double Variances[3];
++	double Axes[3][3];
++	EigenSymmetric3(Covariance, Variances, Axes);
+ 
+-	// Zero out SH coefficients (LOD splats don't need view-dependent effects)
+-	for (int32 i = 0; i < 15; i++)
+-	{
+-		Result.SH[i] = FVector3f::ZeroVector;
+-	}
++	constexpr double MinVariance = 1e-12; // cm^2; keeps round-off in rank-deficient covariances away from zero scales
++	Result.Position = FVector3f(Mean);
++	Result.SH_DC = FVector3f(DC);
++	Result.Rotation = MatrixToQuat(Axes);
++	Result.Scale = FVector3f(
++		float(FMath::Sqrt(FMath::Max(Variances[0], MinVariance))),
++		float(FMath::Sqrt(FMath::Max(Variances[1], MinVariance))),
++		float(FMath::Sqrt(FMath::Max(Variances[2], MinVariance))));
+ 
+-	return Result;
+-}
++	// Opacity: 1 - prod(1 - opacity_i) assumes the children overlap. Where they sit side by side, the merged splat
++	// spreads their coverage over a larger footprint, so cap opacity x footprint at the children's sum. The cap keeps
++	// the spread term from turning groups with far-apart children into large opaque splats.
++	const double Stacked = 1.0 - Transparency;
++	Result.Opacity = float(FMath::Clamp(FMath::Min(Stacked, Coverage / FMath::Max(Footprint(Result.Scale), MinVariance)), 0.0, 1.0));
+ 
+-FGaussianSplatData FGaussianClusterBuilder::MergeLODSplats(
+-	const TArray<FGaussianSplatData>& LODSplats,
+-	int32 StartIndex,
+-	int32 Count)
+-{
+-	FGaussianSplatData Result;
+-
+-	if (Count <= 0 || StartIndex < 0 || StartIndex >= LODSplats.Num())
+-	{
+-		return Result;
+-	}
+-
+-	Count = FMath::Min(Count, LODSplats.Num() - StartIndex);
+-
+-	// Calculate total opacity weight
+-	float TotalWeight = 0.0f;
+-	for (int32 i = 0; i < Count; i++)
+-	{
+-		TotalWeight += LODSplats[StartIndex + i].Opacity;
+-	}
+-
+-	if (TotalWeight < SMALL_NUMBER)
+-	{
+-		TotalWeight = 1.0f;
+-	}
+-
+-	// Weighted averages
+-	FVector3f WeightedPosition = FVector3f::ZeroVector;
+-	FVector3f WeightedSHDC = FVector3f::ZeroVector;
+-	FVector3f AvgScale = FVector3f::ZeroVector;
+-
+-	for (int32 i = 0; i < Count; i++)
+-	{
+-		const FGaussianSplatData& Splat = LODSplats[StartIndex + i];
+-		float Weight = Splat.Opacity / TotalWeight;
+-
+-		WeightedPosition += Splat.Position * Weight;
+-		WeightedSHDC += Splat.SH_DC * Weight;
+-		AvgScale += Splat.Scale * Weight;
+-	}
+-
+-	Result.Position = WeightedPosition;
+-	Result.SH_DC = WeightedSHDC;
+-
+-	Result.Scale = AvgScale;
+-	Result.Rotation = FQuat4f::Identity;
+-
+-	// Combined opacity
+-	float CombinedTransparency = 1.0f;
+-	for (int32 i = 0; i < Count; i++)
+-	{
+-		CombinedTransparency *= (1.0f - FMath::Clamp(LODSplats[StartIndex + i].Opacity, 0.0f, 1.0f));
+-	}
+-	Result.Opacity = FMath::Clamp(1.0f - CombinedTransparency, 0.0f, 1.0f);
+-
+ 	// Zero out SH coefficients (LOD splats don't need view-dependent effects)
+ 	for (int32 i = 0; i < 15; i++)
+ 	{
+@@ -699,7 +796,7 @@
+ 
+ 						if (SrcCount > 0)
+ 						{
+-							FGaussianSplatData MergedSplat = MergeLODSplats(ChildLODSplats, SrcStart, SrcCount);
++							FGaussianSplatData MergedSplat = MergeGaussians(ChildLODSplats, SrcStart, SrcCount);
+ 							Hierarchy.LODSplats.Add(MergedSplat);
+ 							NextLODSplatIndex++;
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatRenderer.cpp	2026-10-06 18:22:24
+@@ -1,6 +1,7 @@
+ // Copyright Epic Games, Inc. All Rights Reserved.
+ 
+ #include "GaussianSplatRenderer.h"
++#include "NanoGSCompat.h"
+ #include "GaussianSplatShaders.h"
+ #include "GaussianSplatSceneProxy.h"
+ #include "GaussianGlobalAccumulator.h"
+@@ -37,7 +38,7 @@
+ 	FGaussianGlobalAccumulator* Accumulator)
+ {
+ 	// Current frame data - use UN-JITTERED matrix to match CalcViewData's WorldToClip
+-	FMatrix CurTranslatedVP = View.ViewMatrices.GetTranslatedViewMatrix() * View.ViewMatrices.GetProjectionNoAAMatrix();
++	FMatrix CurTranslatedVP = View.ViewMatrices.GetTranslatedViewMatrix() * NanoGSCompat::ViewToClipNoAA(View.ViewMatrices);
+ 	FVector CurPreViewTranslation = View.ViewMatrices.GetPreViewTranslation();
+ 
+ 	// Use View.State as per-view key (unique per persistent viewport)
+@@ -362,9 +363,9 @@
+ 	Parameters.WorldToPLY = FMatrix44f(ComputeWorldToPLY(LocalToWorld));
+ 	// Use un-jittered projection matrix so ClipPosition is stable when camera is static
+ 	// (TAA/TSR jitter changes every frame, but we skip CalcViewData when camera is static)
+-	Parameters.WorldToClip = FMatrix44f(View.ViewMatrices.GetWorldToView() * View.ViewMatrices.GetProjectionNoAAMatrix());
++	Parameters.WorldToClip = FMatrix44f(NanoGSCompat::WorldToView(View.ViewMatrices) * NanoGSCompat::ViewToClipNoAA(View.ViewMatrices));
+ 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
+-	Parameters.WorldToView = FMatrix44f(View.ViewMatrices.GetWorldToView());
++	Parameters.WorldToView = FMatrix44f(NanoGSCompat::WorldToView(View.ViewMatrices));
+ 	Parameters.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
+ 
+ 	// Project for the splat target: the view rect, or the low-res target when drawing at reduced resolution
+@@ -372,7 +373,7 @@
+ 	const FVector2f TargetSize = FVector2f(ViewRect.Width(), ViewRect.Height()) * ResolutionScale;
+ 	Parameters.ScreenSize = TargetSize;
+ 
+-	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
++	const FMatrix& ProjMatrix = NanoGSCompat::ViewToClip(View.ViewMatrices);
+ 	Parameters.FocalLength = FVector2f(
+ 		ProjMatrix.M[0][0] * TargetSize.X * 0.5f,
+ 		ProjMatrix.M[1][1] * TargetSize.Y * 0.5f
+@@ -782,9 +783,9 @@
+ 	Parameters.WorldToPLY      = FMatrix44f(ComputeWorldToPLY(LocalToWorld));
+ 	// Use un-jittered projection matrix so ClipPosition is stable when camera is static
+ 	// (TAA/TSR jitter changes every frame, but we skip CalcViewData when camera is static)
+-	Parameters.WorldToClip     = FMatrix44f(View.ViewMatrices.GetWorldToView() * View.ViewMatrices.GetProjectionNoAAMatrix());
++	Parameters.WorldToClip     = FMatrix44f(NanoGSCompat::WorldToView(View.ViewMatrices) * NanoGSCompat::ViewToClipNoAA(View.ViewMatrices));
+ 	Parameters.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
+-	Parameters.WorldToView     = FMatrix44f(View.ViewMatrices.GetWorldToView());
++	Parameters.WorldToView     = FMatrix44f(NanoGSCompat::WorldToView(View.ViewMatrices));
+ 	Parameters.CameraPosition  = FVector3f(View.ViewMatrices.GetViewOrigin());
+ 
+ 	// Project for the splat target: the view rect, or the low-res target when drawing at reduced resolution
+@@ -792,7 +793,7 @@
+ 	const FVector2f TargetSize = FVector2f(ViewRect.Width(), ViewRect.Height()) * ResolutionScale;
+ 	Parameters.ScreenSize = TargetSize;
+ 
+-	const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
++	const FMatrix& ProjMatrix = NanoGSCompat::ViewToClip(View.ViewMatrices);
+ 	Parameters.FocalLength = FVector2f(
+ 		ProjMatrix.M[0][0] * TargetSize.X * 0.5f,
+ 		ProjMatrix.M[1][1] * TargetSize.Y * 0.5f
+@@ -1125,7 +1126,7 @@
+ 
+ 	// Transition buffers for compute
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->VisibleClusterBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->VisibleClusterCountBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
++	RHICmdList.Transition(FRHITransitionInfo(GPUResources->CullingCountersBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ClusterVisibilityBitmap, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SelectedClusterBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	if (GPUResources->bSupportsIndirectDraw)
+@@ -1135,23 +1136,17 @@
+ 
+ 	// Transition LOD cluster tracking buffers (always needed for reset)
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterCountBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterSelectedBitmap, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODSplatTotalBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODSplatOutputCountBuffer, ERHIAccess::Unknown, ERHIAccess::UAVCompute));
+ 
+ 	// Step 1: Reset the visible cluster counter, indirect draw args, visibility bitmap, selected cluster buffer, and LOD tracking buffers
+ 	{
+ 		FClusterCullingResetCS::FParameters ResetParams;
+-		ResetParams.VisibleClusterCountBuffer = GPUResources->VisibleClusterCountBufferUAV;
++		ResetParams.CullingCounters = GPUResources->CullingCountersBufferUAV;
+ 		ResetParams.IndirectDrawArgsBuffer = GPUResources->IndirectDrawArgsBufferUAV;
+ 		ResetParams.ClusterVisibilityBitmap = GPUResources->ClusterVisibilityBitmapUAV;
+ 		ResetParams.SelectedClusterBuffer = GPUResources->SelectedClusterBufferUAV;
+ 		ResetParams.LODClusterBuffer = GPUResources->LODClusterBufferUAV;
+-		ResetParams.LODClusterCountBuffer = GPUResources->LODClusterCountBufferUAV;
+ 		ResetParams.LODClusterSelectedBitmap = GPUResources->LODClusterSelectedBitmapUAV;
+-		ResetParams.LODSplatTotalBuffer = GPUResources->LODSplatTotalBufferUAV;
+-		ResetParams.LODSplatOutputCountBuffer = GPUResources->LODSplatOutputCountBufferUAV;
+ 		ResetParams.ClusterVisibilityBitmapSize = VisibilityBitmapSize;
+ 		ResetParams.LeafClusterCount = GPUResources->LeafClusterCount;
+ 		ResetParams.DebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();  // Must bind (shared .usf)
+@@ -1166,33 +1161,29 @@
+ 	}
+ 
+ 	// UAV barrier
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->VisibleClusterCountBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
++	RHICmdList.Transition(FRHITransitionInfo(GPUResources->CullingCountersBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->ClusterVisibilityBitmap, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->SelectedClusterBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterCountBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterSelectedBitmap, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODSplatTotalBuffer, ERHIAccess::UAVCompute, ERHIAccess::UAVCompute));
+ 
+ 	// Step 2: Run cluster culling with LOD selection
+ 	{
+ 		// Extract frustum planes from world-space ViewProjection matrix
+ 		// The shader transforms cluster bounds to world space, so frustum planes must also be in world space
+ 		FVector4f FrustumPlanes[6];
+-		ExtractFrustumPlanes(View.ViewMatrices.GetViewProjectionMatrix(), FrustumPlanes);
++		ExtractFrustumPlanes(NanoGSCompat::WorldToClip(View.ViewMatrices), FrustumPlanes);
+ 
+ 		FClusterCullingCS::FParameters CullingParams;
+ 		CullingParams.ClusterBuffer = GPUResources->ClusterBufferSRV;
+ 		CullingParams.VisibleClusterBuffer = GPUResources->VisibleClusterBufferUAV;
+-		CullingParams.VisibleClusterCountBuffer = GPUResources->VisibleClusterCountBufferUAV;
++		CullingParams.CullingCounters = GPUResources->CullingCountersBufferUAV;
+ 		CullingParams.IndirectDrawArgsBuffer = GPUResources->IndirectDrawArgsBufferUAV;
+ 		CullingParams.ClusterVisibilityBitmap = GPUResources->ClusterVisibilityBitmapUAV;
+ 		CullingParams.SelectedClusterBuffer = GPUResources->SelectedClusterBufferUAV;
+ 		CullingParams.LODClusterBuffer = GPUResources->LODClusterBufferUAV;
+-		CullingParams.LODClusterCountBuffer = GPUResources->LODClusterCountBufferUAV;
+ 		CullingParams.LODClusterSelectedBitmap = GPUResources->LODClusterSelectedBitmapUAV;
+-		CullingParams.LODSplatTotalBuffer = GPUResources->LODSplatTotalBufferUAV;
+ 		CullingParams.LocalToWorld = FMatrix44f(LocalToWorld);
+-		CullingParams.WorldToClip = FMatrix44f(View.ViewMatrices.GetViewProjectionMatrix());
++		CullingParams.WorldToClip = FMatrix44f(NanoGSCompat::WorldToClip(View.ViewMatrices));
+ 		CullingParams.ClusterCount = GPUResources->ClusterCount;
+ 		CullingParams.LeafClusterCount = GPUResources->LeafClusterCount;
+ 
+@@ -1205,7 +1196,7 @@
+ 		CullingParams.CameraPosition = FVector3f(View.ViewMatrices.GetViewOrigin());
+ 		// Use projection matrix scaling factor for FOV-based LOD (resolution-independent, like Nanite)
+ 		// ProjMatrix[1][1] = 1/tan(HalfFOV_Y), depends only on FOV, not viewport pixel size
+-		const FMatrix& ProjMatrix = View.ViewMatrices.GetProjectionMatrix();
++		const FMatrix& ProjMatrix = NanoGSCompat::ViewToClip(View.ViewMatrices);
+ 		CullingParams.ScreenHeight = FMath::Max(ProjMatrix.M[0][0], ProjMatrix.M[1][1]);
+ 		CullingParams.ErrorThreshold = FMath::Max(0.001f, ErrorThreshold);
+ 		CullingParams.LODBias = 0.0f;         // No bias (can be made configurable)
+@@ -1227,7 +1218,6 @@
+ 	}
+ 
+ 	// Transition for potential readback (for debugging/statistics)
+-	RHICmdList.Transition(FRHITransitionInfo(GPUResources->VisibleClusterCountBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ 	RHICmdList.Transition(FRHITransitionInfo(GPUResources->VisibleClusterBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ 
+ 	// Transition visibility bitmap and selected cluster buffer for CalcViewData to read
+@@ -1238,8 +1228,6 @@
+ 	if (bUseLODRendering)
+ 	{
+ 		RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+-		RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterCountBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+-		RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODSplatTotalBuffer, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ 		// Transition LODClusterSelectedBitmap to SRV for GPU-driven LOD shader to read
+ 		RHICmdList.Transition(FRHITransitionInfo(GPUResources->LODClusterSelectedBitmap, ERHIAccess::UAVCompute, ERHIAccess::SRVCompute));
+ 	}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSOG.cpp	2026-10-06 18:22:24
+@@ -2,13 +2,23 @@
+ 
+ #include "GaussianSplatSOG.h"
+ #include "Async/ParallelFor.h"
++#include "Misc/Paths.h"
+ 
++#include <algorithm>
++#include <atomic>
++
+ namespace GaussianSplatSOG
+ {
+ 	namespace
+ 	{
+ 		FReader GReader;
+ 		constexpr float MetersToUE = 100.0f;
++
++		/** Largest cross-section of a splat: the product of its two largest axes. */
++		double Footprint(const FVector3f& Scale)
++		{
++			return FMath::Max3(double(Scale.X) * Scale.Y, double(Scale.X) * Scale.Z, double(Scale.Y) * Scale.Z);
++		}
+ 	}
+ 
+ 	void SetReader(FReader InReader)
+@@ -101,12 +111,29 @@
+ 			OutRecords[Index] = Asset.splats[size_t(Order.IsEmpty() ? Index : Order[Index])];
+ 		}
+ 		const sog::Encoder Encoder(Asset);
++		// Merged LOD splats can be larger than any source splat. The codebook clamps those axes to its largest entry;
++		// raise the opacity by the lost cross-section so the splat keeps its coverage (opacity x footprint) where it can.
++		const float MaxScale = FMath::Exp(*std::max_element(Asset.scaleCodebook, Asset.scaleCodebook + 256));
++		std::atomic<int32> NumClamped{0};
+ 		ParallelFor(Splats.Num() - NumBase, [&](int32 Offset)
+ 		{
+ 			const int32 Index = NumBase + Offset;
+ 			sog::SplatFloat S;
+ 			FromSplatData(Splats[Index], S);
++			const float Largest = FMath::Max3(S.scale[0], S.scale[1], S.scale[2]);
++			if (Largest > MaxScale)
++			{
++				const FVector3f Scale(S.scale[0], S.scale[1], S.scale[2]);
++				const FVector3f Clamped = Scale.ComponentMin(FVector3f(MaxScale));
++				S.opacity = FMath::Min(1.0f, S.opacity * float(Footprint(Scale) / Footprint(Clamped)));
++				NumClamped.fetch_add(1, std::memory_order_relaxed);
++			}
+ 			OutRecords[Index] = Encoder.Encode(S, 0, uint8(sog::kFlagNoSH));
+ 		});
++		if (NumClamped.load() > 0)
++		{
++			UE_LOG(LogTemp, Log, TEXT("GaussianSplatSOG: %d of %d LOD splats exceed the scale codebook (%.1f cm) and are clamped to it"),
++				NumClamped.load(), Splats.Num() - NumBase, MaxScale * MetersToUE);
++		}
+ 	}
+ }
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Private/GaussianSplatSceneProxy.cpp	2026-10-06 18:22:24
+@@ -155,9 +155,8 @@
+ 	VisibleClusterBuffer.SafeRelease();
+ 	VisibleClusterBufferUAV.SafeRelease();
+ 	VisibleClusterBufferSRV.SafeRelease();
+-	VisibleClusterCountBuffer.SafeRelease();
+-	VisibleClusterCountBufferUAV.SafeRelease();
+-	VisibleClusterCountBufferSRV.SafeRelease();
++	CullingCountersBuffer.SafeRelease();
++	CullingCountersBufferUAV.SafeRelease();
+ 
+ 	// Release LOD splat buffers
+ 	LODSplatBuffer.SafeRelease();
+@@ -179,22 +178,13 @@
+ 	LODClusterBuffer.SafeRelease();
+ 	LODClusterBufferUAV.SafeRelease();
+ 	LODClusterBufferSRV.SafeRelease();
+-	LODClusterCountBuffer.SafeRelease();
+-	LODClusterCountBufferUAV.SafeRelease();
+-	LODClusterCountBufferSRV.SafeRelease();
+ 	LODClusterSelectedBitmap.SafeRelease();
+ 	LODClusterSelectedBitmapUAV.SafeRelease();
+ 	LODClusterSelectedBitmapSRV.SafeRelease();
+-	LODSplatTotalBuffer.SafeRelease();
+-	LODSplatTotalBufferUAV.SafeRelease();
+-	LODSplatTotalBufferSRV.SafeRelease();
+ 
+ 	// Release GPU-driven LOD rendering buffers
+ 	LODSplatClusterIndexBuffer.SafeRelease();
+ 	LODSplatClusterIndexBufferSRV.SafeRelease();
+-	LODSplatOutputCountBuffer.SafeRelease();
+-	LODSplatOutputCountBufferUAV.SafeRelease();
+-	LODSplatOutputCountBufferSRV.SafeRelease();
+ 
+ 	// Release splat compaction buffers
+ 	CompactedSplatIndicesBuffer.SafeRelease();
+@@ -222,12 +212,12 @@
+ 		.SetFlags(ETextureCreateFlags::ShaderResource)
+ 		.SetInitialState(ERHIAccess::SRVMask);
+ 
+-	DummyWhiteTexture = RHICreateTexture(TextureDesc);
++	DummyWhiteTexture = RHICmdList.CreateTexture(TextureDesc);
+ 
+ 	// Fill with white color
+ 	uint32 WhitePixel = 0xFFFFFFFF;  // RGBA = (255, 255, 255, 255)
+ 	FUpdateTextureRegion2D Region(0, 0, 0, 0, 1, 1);
+-	RHIUpdateTexture2D(DummyWhiteTexture, 0, Region, sizeof(uint32), (const uint8*)&WhitePixel);
++	RHICmdList.UpdateTexture2D(DummyWhiteTexture, 0, Region, sizeof(uint32), (const uint8*)&WhitePixel);
+ 
+ 	// Create SRV
+ 	DummyWhiteTextureSRV = RHICmdList.CreateShaderResourceView(
+@@ -377,25 +367,21 @@
+ 				.SetStride(sizeof(uint32)));
+ 	}
+ 
+-	// Create visible cluster count buffer (single uint, atomic counter)
++	// Cluster culling's atomic counters: 4 uints in one buffer (CULLING_COUNTER_* in ClusterCulling.usf)
+ 	{
+-		const uint32 BufferSize = sizeof(uint32);
++		const uint32 BufferSize = 4 * sizeof(uint32);
+ 		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+-			TEXT("GaussianVisibleClusterCountBuffer"),
++			TEXT("GaussianCullingCounters"),
+ 			BufferSize,
+ 			sizeof(uint32),
+ 			BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+ 			.SetInitialState(ERHIAccess::UAVCompute);
+-		VisibleClusterCountBuffer = RHICmdList.CreateBuffer(Desc);
++		CullingCountersBuffer = RHICmdList.CreateBuffer(Desc);
+ 
+-		VisibleClusterCountBufferUAV = RHICmdList.CreateUnorderedAccessView(
+-			VisibleClusterCountBuffer, FRHIViewDesc::CreateBufferUAV()
++		CullingCountersBufferUAV = RHICmdList.CreateUnorderedAccessView(
++			CullingCountersBuffer, FRHIViewDesc::CreateBufferUAV()
+ 				.SetType(FRHIViewDesc::EBufferType::Structured)
+ 				.SetStride(sizeof(uint32)));
+-		VisibleClusterCountBufferSRV = RHICmdList.CreateShaderResourceView(
+-			VisibleClusterCountBuffer, FRHIViewDesc::CreateBufferSRV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+ 	}
+ 
+ 	// Create indirect draw argument buffer for GPU-driven rendering
+@@ -505,27 +491,6 @@
+ 				.SetStride(sizeof(uint32)));
+ 	}
+ 
+-	// LOD cluster count buffer (atomic counter)
+-	{
+-		uint32 BufferSize = sizeof(uint32);
+-		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+-			TEXT("GaussianLODClusterCountBuffer"),
+-			BufferSize,
+-			sizeof(uint32),
+-			BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+-			.SetInitialState(ERHIAccess::UAVCompute);
+-		LODClusterCountBuffer = RHICmdList.CreateBuffer(Desc);
+-
+-		LODClusterCountBufferUAV = RHICmdList.CreateUnorderedAccessView(
+-			LODClusterCountBuffer, FRHIViewDesc::CreateBufferUAV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-		LODClusterCountBufferSRV = RHICmdList.CreateShaderResourceView(
+-			LODClusterCountBuffer, FRHIViewDesc::CreateBufferSRV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-	}
+-
+ 	// LOD cluster selected bitmap (same size as cluster visibility bitmap)
+ 	// Also needs SRV for GPU-driven LOD shader to read
+ 	{
+@@ -546,48 +511,6 @@
+ 				.SetStride(sizeof(uint32)));
+ 		LODClusterSelectedBitmapSRV = RHICmdList.CreateShaderResourceView(
+ 			LODClusterSelectedBitmap, FRHIViewDesc::CreateBufferSRV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-	}
+-
+-	// LOD splat total buffer (atomic counter for total LOD splats)
+-	{
+-		uint32 BufferSize = sizeof(uint32);
+-		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+-			TEXT("GaussianLODSplatTotalBuffer"),
+-			BufferSize,
+-			sizeof(uint32),
+-			BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+-			.SetInitialState(ERHIAccess::UAVCompute);
+-		LODSplatTotalBuffer = RHICmdList.CreateBuffer(Desc);
+-
+-		LODSplatTotalBufferUAV = RHICmdList.CreateUnorderedAccessView(
+-			LODSplatTotalBuffer, FRHIViewDesc::CreateBufferUAV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-		LODSplatTotalBufferSRV = RHICmdList.CreateShaderResourceView(
+-			LODSplatTotalBuffer, FRHIViewDesc::CreateBufferSRV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-	}
+-
+-	// LOD splat output count buffer (atomic counter for valid LOD splat output)
+-	{
+-		uint32 BufferSize = sizeof(uint32);
+-		FRHIBufferCreateDesc Desc = FRHIBufferCreateDesc::Create(
+-			TEXT("GaussianLODSplatOutputCountBuffer"),
+-			BufferSize,
+-			sizeof(uint32),
+-			BUF_UnorderedAccess | BUF_ShaderResource | BUF_StructuredBuffer)
+-			.SetInitialState(ERHIAccess::UAVCompute);
+-		LODSplatOutputCountBuffer = RHICmdList.CreateBuffer(Desc);
+-
+-		LODSplatOutputCountBufferUAV = RHICmdList.CreateUnorderedAccessView(
+-			LODSplatOutputCountBuffer, FRHIViewDesc::CreateBufferUAV()
+-				.SetType(FRHIViewDesc::EBufferType::Structured)
+-				.SetStride(sizeof(uint32)));
+-		LODSplatOutputCountBufferSRV = RHICmdList.CreateShaderResourceView(
+-			LODSplatOutputCountBuffer, FRHIViewDesc::CreateBufferSRV()
+ 				.SetType(FRHIViewDesc::EBufferType::Structured)
+ 				.SetStride(sizeof(uint32)));
+ 	}
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp
+--- a/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Private/NanoGS.cpp	2026-10-06 18:22:24
+@@ -1,6 +1,7 @@
+ // Copyright Epic Games, Inc. All Rights Reserved.
+ 
+ #include "NanoGS.h"
++#include "NanoGSCompat.h"
+ #include "GaussianSplatViewExtension.h"
+ #include "GaussianSplatRenderer.h"
+ #include "GaussianSplatRenderData.h"
+@@ -395,7 +396,7 @@
+ static void ChooseStreamedLevels(const FSceneView& View, TArray<FStreamedLODChoice>& Choices, bool bBudget, uint64 Budget,
+ 	int32 ForceLevel)
+ {
+-	const FMatrix& Proj = View.ViewMatrices.GetViewToClip();
++	const FMatrix& Proj = NanoGSCompat::ViewToClip(View.ViewMatrices);
+ 	const bool bPerspective = View.IsPerspectiveProjection();
+ 	const double ProjScale = FMath::Max(Proj.M[0][0], Proj.M[1][1]);   // 1 / tan(fov/2); orthographic: 1 / half-height
+ 	const FVector CameraPos = View.ViewMatrices.GetViewOrigin();
+@@ -705,7 +706,7 @@
+ 
+ 	// Defer view extension creation until GEngine is valid
+ 	// (StartupModule runs before GEngine is initialized, causing an ensure failure)
+-	PostEngineInitDelegateHandle = FCoreDelegates::GetOnPostEngineInit().AddRaw(this, &FNanoGSModule::OnPostEngineInit);
++	PostEngineInitDelegateHandle = NanoGSCompat::OnPostEngineInit().AddRaw(this, &FNanoGSModule::OnPostEngineInit);
+ 
+ 	UE_LOG(LogTemp, Log, TEXT("GaussianSplatting module started. Shader directory: %s"), *PluginShaderDir);
+ }
+@@ -914,7 +915,7 @@
+ 
+ 		// Check camera-static skip: if nothing has changed, skip Phase 1+2 and reuse cached sort
+ 		// Use ProjectionNoAAMatrix to ignore TSR/TAA per-frame jitter that changes every frame
+-		FMatrix CurrentVP = SceneView->ViewMatrices.GetWorldToView() * SceneView->ViewMatrices.GetProjectionNoAAMatrix();
++		FMatrix CurrentVP = NanoGSCompat::WorldToView(SceneView->ViewMatrices) * NanoGSCompat::ViewToClipNoAA(SceneView->ViewMatrices);
+ 		int32 CurrentDebugMode = DebugMode;
+ 		int32 CurrentDebugForceLODLevel = CVarDebugForceLODLevel.GetValueOnRenderThread();
+ 
+@@ -1484,7 +1485,7 @@
+ 	// Remove deferred init delegate
+ 	if (PostEngineInitDelegateHandle.IsValid())
+ 	{
+-		FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitDelegateHandle);
++		NanoGSCompat::OnPostEngineInit().Remove(PostEngineInitDelegateHandle);
+ 		PostEngineInitDelegateHandle.Reset();
+ 	}
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianClusterBuilder.h	2026-09-29 17:17:36
+@@ -67,6 +67,23 @@
+ 		const FBuildSettings& Settings = FBuildSettings(),
+ 		TArray<int32>* OutSplatOrder = nullptr);
+ 
++	/**
++	 * Merge splats into the single Gaussian that stands in for them at a coarser LOD. The result has the group's mean
++	 * and covariance, sum w_i (Sigma_i + (mu_i - mu)(mu_i - mu)^T), with weights w_i proportional to opacity x footprint
++	 * (the product of a splat's two largest axes); its rotation and scale are that covariance's eigenvectors and the
++	 * square roots of its eigenvalues. Opacity is 1 - prod(1 - opacity_i), capped so that opacity x footprint does not
++	 * exceed the children's sum. Higher-order SH are zero.
++	 *
++	 * @param Splats Array of splats to merge (original or LOD splats, same format)
++	 * @param StartIndex First splat index
++	 * @param Count Number of splats to merge
++	 * @return Merged splat in unified format
++	 */
++	static FGaussianSplatData MergeGaussians(
++		const TArray<FGaussianSplatData>& Splats,
++		int32 StartIndex,
++		int32 Count);
++
+ private:
+ 	/**
+ 	 * Internal structure for sorting splats by Morton code
+@@ -164,36 +181,6 @@
+ 	//----------------------------------------------------------------------
+ 	// LOD Generation (Unified Approach - LOD splats use same format as original splats)
+ 	//----------------------------------------------------------------------
+-
+-	/**
+-	 * Merge multiple Gaussians into a single representative Gaussian
+-	 * Used to create simplified LOD representations
+-	 * Returns FGaussianSplatData for unified buffer approach
+-	 *
+-	 * @param Splats Array of splats to merge
+-	 * @param StartIndex First splat index
+-	 * @param Count Number of splats to merge
+-	 * @return Merged splat in unified format
+-	 */
+-	static FGaussianSplatData MergeGaussians(
+-		const TArray<FGaussianSplatData>& Splats,
+-		int32 StartIndex,
+-		int32 Count);
+-
+-	/**
+-	 * Merge multiple LOD splats into a single representative
+-	 * Used for higher LOD levels
+-	 * Works with FGaussianSplatData for unified buffer approach
+-	 *
+-	 * @param LODSplats Array of LOD splats to merge (unified format)
+-	 * @param StartIndex First splat index
+-	 * @param Count Number of splats to merge
+-	 * @return Merged splat in unified format
+-	 */
+-	static FGaussianSplatData MergeLODSplats(
+-		const TArray<FGaussianSplatData>& LODSplats,
+-		int32 StartIndex,
+-		int32 Count);
+ 
+ 	/**
+ 	 * Generate LOD splats for all non-leaf clusters in the hierarchy
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSOG.h	2026-09-29 17:17:43
+@@ -41,7 +41,9 @@
+ 	/**
+ 	 * GPU records for a Nanite-built asset: the first NumBase records are the source records in the
+ 	 * cluster builder's order (Order[i] = source index of splat i), the rest are NanoGS's merged LOD
+-	 * splats quantized with the source's ranges and codebooks and flagged as having no SH.
++	 * splats quantized with the source's ranges and codebooks and flagged as having no SH. LOD scales
++	 * beyond the largest codebook entry clamp to it, with the opacity raised (up to 1) so that opacity
++	 * x footprint is kept.
+ 	 */
+ 	NANOGS_API void BuildRecords(const sog::DecodedAsset& Asset, const TArray<int32>& Order,
+ 		const TArray<FGaussianSplatData>& Splats, int32 NumBase, TArray<sog::PackedSplat>& OutRecords);
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatSceneProxy.h	2026-10-06 18:22:24
+@@ -131,10 +131,10 @@
+ 	FUnorderedAccessViewRHIRef VisibleClusterBufferUAV;
+ 	FShaderResourceViewRHIRef VisibleClusterBufferSRV;
+ 
+-	/** Visible cluster count buffer (atomic counter) */
+-	FBufferRHIRef VisibleClusterCountBuffer;
+-	FUnorderedAccessViewRHIRef VisibleClusterCountBufferUAV;
+-	FShaderResourceViewRHIRef VisibleClusterCountBufferSRV;
++	/** Cluster culling's atomic counters (4 uints, CULLING_COUNTER_* in ClusterCulling.usf): visible clusters,
++	 *  LOD clusters, LOD splat total, LOD splat output. One buffer so the culling shader fits in 8 UAVs. */
++	FBufferRHIRef CullingCountersBuffer;
++	FUnorderedAccessViewRHIRef CullingCountersBufferUAV;
+ 
+ 	/** Number of clusters */
+ 	int32 ClusterCount = 0;
+@@ -215,13 +215,6 @@
+ 	FUnorderedAccessViewRHIRef LODClusterBufferUAV;
+ 	FShaderResourceViewRHIRef LODClusterBufferSRV;
+ 
+-	/** Count of unique LOD clusters (atomic counter)
+-	 * Written by cluster culling, read back for LOD rendering dispatch
+-	 */
+-	FBufferRHIRef LODClusterCountBuffer;
+-	FUnorderedAccessViewRHIRef LODClusterCountBufferUAV;
+-	FShaderResourceViewRHIRef LODClusterCountBufferSRV;
+-
+ 	/** Bitmap to track which parent clusters have been claimed (1 bit per cluster)
+ 	 * Used during cluster culling to ensure each parent is only added once
+ 	 * Also read by GPU-driven LOD shader to check if cluster is selected
+@@ -230,13 +223,6 @@
+ 	FUnorderedAccessViewRHIRef LODClusterSelectedBitmapUAV;
+ 	FShaderResourceViewRHIRef LODClusterSelectedBitmapSRV;
+ 
+-	/** Total LOD splats to render (sum of all selected parent cluster LOD splat counts)
+-	 * Written by cluster culling, used for indirect draw args
+-	 */
+-	FBufferRHIRef LODSplatTotalBuffer;
+-	FUnorderedAccessViewRHIRef LODSplatTotalBufferUAV;
+-	FShaderResourceViewRHIRef LODSplatTotalBufferSRV;
+-
+ 	//----------------------------------------------------------------------
+ 	// GPU-driven LOD rendering resources
+ 	//----------------------------------------------------------------------
+@@ -247,14 +233,6 @@
+ 	 */
+ 	FBufferRHIRef LODSplatClusterIndexBuffer;
+ 	FShaderResourceViewRHIRef LODSplatClusterIndexBufferSRV;
+-
+-	/** Atomic counter for valid LOD splat output
+-	 * Written by CalcLODViewDataGPUDriven, read by UpdateDrawArgs
+-	 * Size: 4 bytes
+-	 */
+-	FBufferRHIRef LODSplatOutputCountBuffer;
+-	FUnorderedAccessViewRHIRef LODSplatOutputCountBufferUAV;
+-	FShaderResourceViewRHIRef LODSplatOutputCountBufferSRV;
+ 
+ 	/** Total splat count for buffer allocation (SplatCount + TotalLODSplats) */
+ 	int32 TotalSplatCount = 0;
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatShaders.h	2026-10-06 18:22:24
+@@ -423,17 +423,13 @@
+ 	SHADER_USE_PARAMETER_STRUCT(FClusterCullingResetCS, FGlobalShader);
+ 
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, VisibleClusterCountBuffer)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, CullingCounters)   // CULLING_COUNTER_* in ClusterCulling.usf
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, IndirectDrawArgsBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, ClusterVisibilityBitmap)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, SelectedClusterBuffer)
+ 		// LOD cluster tracking buffers
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterBuffer)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterCountBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterSelectedBitmap)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODSplatTotalBuffer)
+-		// GPU-driven LOD rendering
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODSplatOutputCountBuffer)
+ 		SHADER_PARAMETER(uint32, ClusterVisibilityBitmapSize)
+ 		SHADER_PARAMETER(uint32, LeafClusterCount)
+ 		// Debug: must match MainCS parameters (shared .usf file)
+@@ -464,15 +460,13 @@
+ 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER_SRV(StructuredBuffer<FGaussianGPUCluster>, ClusterBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, VisibleClusterBuffer)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, VisibleClusterCountBuffer)
++		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, CullingCounters)   // CULLING_COUNTER_* in ClusterCulling.usf
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, IndirectDrawArgsBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, ClusterVisibilityBitmap)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, SelectedClusterBuffer)
+ 		// LOD cluster tracking buffers
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterBuffer)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterCountBuffer)
+ 		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODClusterSelectedBitmap)
+-		SHADER_PARAMETER_UAV(RWStructuredBuffer<uint>, LODSplatTotalBuffer)
+ 		SHADER_PARAMETER(FMatrix44f, LocalToWorld)
+ 		SHADER_PARAMETER(FMatrix44f, WorldToClip)
+ 		SHADER_PARAMETER(uint32, ClusterCount)
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGS/Public/GaussianSplatStreaming.h	2026-10-06 18:22:24
+@@ -21,6 +21,8 @@
+ 	static constexpr uint32 BlockRecords = 128;       // one cluster per block (clusters hold at most 128 splats)
+ 	static constexpr uint32 RecordBytes = 20;         // sog::PackedSplat
+ 
++	UE_NONCOPYABLE(FGaussianStreamedResidency);   // holds in-flight bulk data reads; also keeps MSVC from exporting a copy constructor
++
+ 	FGaussianStreamedResidency() = default;
+ 	~FGaussianStreamedResidency();                    // cancels and waits for reads in flight
+ 
+diff -ruN a/Plugins/NanoGS/Source/NanoGS/Public/NanoGSCompat.h b/Plugins/NanoGS/Source/NanoGS/Public/NanoGSCompat.h
+--- a/Plugins/NanoGS/Source/NanoGS/Public/NanoGSCompat.h	1969-12-31 19:00:00
++++ b/Plugins/NanoGS/Source/NanoGS/Public/NanoGSCompat.h	2026-10-06 18:22:24
+@@ -0,0 +1,27 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++#pragma once
++
++// Engine API differences between the supported versions (5.6 - 5.8). 5.8 renamed the FViewMatrices getters
++// (GetViewMatrix -> GetWorldToView, ...) and deprecated the old names; FCoreDelegates::OnPostEngineInit became a getter.
++
++#include "Misc/CoreDelegates.h"
++#include "Misc/EngineVersionComparison.h"
++#include "SceneView.h"
++
++namespace NanoGSCompat
++{
++#if UE_VERSION_OLDER_THAN(5, 8, 0)
++	inline const FMatrix& WorldToView(const FViewMatrices& M) { return M.GetViewMatrix(); }
++	inline const FMatrix& ViewToClip(const FViewMatrices& M) { return M.GetProjectionMatrix(); }
++	inline const FMatrix& ViewToClipNoAA(const FViewMatrices& M) { return M.GetProjectionNoAAMatrix(); }
++	inline const FMatrix& WorldToClip(const FViewMatrices& M) { return M.GetViewProjectionMatrix(); }
++	inline FSimpleMulticastDelegate& OnPostEngineInit() { return FCoreDelegates::OnPostEngineInit; }
++#else
++	inline const FMatrix& WorldToView(const FViewMatrices& M) { return M.GetWorldToView(); }
++	inline const FMatrix& ViewToClip(const FViewMatrices& M) { return M.GetViewToClip(); }
++	inline const FMatrix& ViewToClipNoAA(const FViewMatrices& M) { return M.GetViewToClipNoAA(); }
++	inline const FMatrix& WorldToClip(const FViewMatrices& M) { return M.GetWorldToClip(); }
++	inline FSimpleMulticastDelegate& OnPostEngineInit() { return FCoreDelegates::GetOnPostEngineInit(); }
++#endif
++}
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs b/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs
+--- a/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGSEditor/NanoGSEditor.Build.cs	2026-10-06 18:22:24
+@@ -27,6 +27,9 @@
+ 		// libwebp's C files reuse file-local helper names; a unity build would merge them into one file.
+ 		bUseUnity = false;
+ 
++		// libwebp tests SIZE_MAX in #if before any header defines it (C4668 is an error under MSVC).
++		CppCompileWarningSettings.UndefinedIdentifierWarningLevel = WarningLevel.Off;
++
+ 		PublicDependencyModuleNames.AddRange(
+ 			new string[]
+ 			{
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/ClusterLODMergeTests.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/ClusterLODMergeTests.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/ClusterLODMergeTests.cpp	1969-12-31 19:00:00
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/ClusterLODMergeTests.cpp	2026-09-29 17:24:48
+@@ -0,0 +1,189 @@
++// Copyright Epic Games, Inc. All Rights Reserved.
++
++// LOD merge tests: FGaussianClusterBuilder::MergeGaussians must reproduce the moment-matched Gaussian of its group,
++// with covariances built the way the renderer builds them (QuatToMatrix in GaussianDataTypes.ush).
++//   UnrealEditor SHUTourDemo.uproject -ExecCmds="Automation RunTests NanoGS.Cluster" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -NoP4
++
++#include "CoreMinimal.h"
++#include "Misc/AutomationTest.h"
++
++#if WITH_DEV_AUTOMATION_TESTS
++
++#include "GaussianClusterBuilder.h"
++#include "Math/RandomStream.h"
++
++namespace
++{
++	struct FCov
++	{
++		double M[3][3] = {};
++	};
++
++	/** R diag(s^2) R^T with R written out as in GaussianDataTypes.ush QuatToMatrix (column-vector convention). */
++	FCov Covariance(const FGaussianSplatData& Splat)
++	{
++		const FQuat4f Q = Splat.Rotation.GetNormalized();
++		const double X = Q.X, Y = Q.Y, Z = Q.Z, W = Q.W;
++		const double R[3][3] = {
++			{ 1.0 - 2.0 * (Y * Y + Z * Z), 2.0 * (X * Y - W * Z), 2.0 * (X * Z + W * Y) },
++			{ 2.0 * (X * Y + W * Z), 1.0 - 2.0 * (X * X + Z * Z), 2.0 * (Y * Z - W * X) },
++			{ 2.0 * (X * Z - W * Y), 2.0 * (Y * Z + W * X), 1.0 - 2.0 * (X * X + Y * Y) } };
++		const double S2[3] = { FMath::Square(double(Splat.Scale.X)), FMath::Square(double(Splat.Scale.Y)), FMath::Square(double(Splat.Scale.Z)) };
++		FCov C;
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			for (int32 Col = 0; Col < 3; ++Col)
++			{
++				C.M[Row][Col] = R[Row][0] * S2[0] * R[Col][0] + R[Row][1] * S2[1] * R[Col][1] + R[Row][2] * S2[2] * R[Col][2];
++			}
++		}
++		return C;
++	}
++
++	double RelativeError(const FCov& A, const FCov& B)
++	{
++		double Num = 0.0, Den = 0.0;
++		for (int32 Row = 0; Row < 3; ++Row)
++		{
++			for (int32 Col = 0; Col < 3; ++Col)
++			{
++				Num += FMath::Square(A.M[Row][Col] - B.M[Row][Col]);
++				Den += FMath::Square(B.M[Row][Col]);
++			}
++		}
++		return FMath::Sqrt(Num / FMath::Max(Den, 1e-300));
++	}
++
++	double Footprint(const FVector3f& S)
++	{
++		return FMath::Max3(double(S.X) * S.Y, double(S.X) * S.Z, double(S.Y) * S.Z);
++	}
++
++	float Uniform(FRandomStream& Rng, float Min, float Max)
++	{
++		return Min + (Max - Min) * Rng.GetFraction();
++	}
++
++	FGaussianSplatData RandomSplat(FRandomStream& Rng, const FVector3f& Centre, float Spread)
++	{
++		FGaussianSplatData S;
++		S.Position = Centre + FVector3f(Uniform(Rng, -Spread, Spread), Uniform(Rng, -Spread, Spread), Uniform(Rng, -Spread, Spread));
++		S.Rotation = FQuat4f(Uniform(Rng, -1, 1), Uniform(Rng, -1, 1), Uniform(Rng, -1, 1), Uniform(Rng, -1, 1)).GetNormalized();
++		// Log-uniform scales from 0.01 to 10 cm: flat, needle-like and round splats
++		S.Scale = FVector3f(FMath::Pow(10.0f, Uniform(Rng, -2, 1)), FMath::Pow(10.0f, Uniform(Rng, -2, 1)), FMath::Pow(10.0f, Uniform(Rng, -2, 1)));
++		S.Opacity = Uniform(Rng, 0.02f, 1.0f);
++		S.SH_DC = FVector3f(Uniform(Rng, -2, 2), Uniform(Rng, -2, 2), Uniform(Rng, -2, 2));
++		return S;
++	}
++}
++
++IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNanoGSClusterMomentMatchedMergeTest, "NanoGS.Cluster.MomentMatchedMerge",
++	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
++
++bool FNanoGSClusterMomentMatchedMergeTest::RunTest(const FString& Parameters)
++{
++	FRandomStream Rng(20260929);
++
++	// One splat merges into itself: covariance, centre, colour and opacity survive the eigen-decomposition and the
++	// conversion back to a quaternion for any rotation and scale.
++	double SingleCov = 0.0, SingleOther = 0.0;
++	for (int32 Iter = 0; Iter < 2000; ++Iter)
++	{
++		const TArray<FGaussianSplatData> One = { RandomSplat(Rng, FVector3f(100, -50, 20), 10) };
++		const FGaussianSplatData M = FGaussianClusterBuilder::MergeGaussians(One, 0, 1);
++		SingleCov = FMath::Max(SingleCov, RelativeError(Covariance(M), Covariance(One[0])));
++		SingleOther = FMath::Max3(SingleOther, double((M.Position - One[0].Position).GetAbsMax()), double((M.SH_DC - One[0].SH_DC).GetAbsMax()));
++		SingleOther = FMath::Max(SingleOther, double(FMath::Abs(M.Opacity - One[0].Opacity)));
++	}
++	TestTrue(FString::Printf(TEXT("A single splat keeps its covariance (max relative error %.3g)"), SingleCov), SingleCov <= 1e-5);
++	TestTrue(FString::Printf(TEXT("A single splat keeps its centre, colour and opacity (max error %.3g)"), SingleOther), SingleOther <= 1e-4);
++
++	// Groups of four: mean and covariance are the moments of the group, weighted by opacity x footprint; opacity is
++	// 1 - prod(1 - a_i), capped so that opacity x footprint doesn't exceed the children's sum.
++	double GroupCov = 0.0, GroupMean = 0.0, GroupOpacity = 0.0;
++	for (int32 Iter = 0; Iter < 2000; ++Iter)
++	{
++		const float Spread = FMath::Pow(10.0f, Uniform(Rng, -1, 2));
++		TArray<FGaussianSplatData> Group;
++		for (int32 I = 0; I < 4; ++I)
++		{
++			Group.Add(RandomSplat(Rng, FVector3f(-300, 20, 500), Spread));
++		}
++		const FGaussianSplatData M = FGaussianClusterBuilder::MergeGaussians(Group, 0, Group.Num());
++
++		double Weights[4], Sum = 0.0, Transparency = 1.0;
++		for (int32 I = 0; I < 4; ++I)
++		{
++			Weights[I] = Group[I].Opacity * Footprint(Group[I].Scale);
++			Sum += Weights[I];
++			Transparency *= 1.0 - Group[I].Opacity;
++		}
++		FVector3d Mean(0.0);
++		for (int32 I = 0; I < 4; ++I)
++		{
++			Mean += Weights[I] / Sum * FVector3d(Group[I].Position);
++		}
++		FCov Want;
++		for (int32 I = 0; I < 4; ++I)
++		{
++			const FCov C = Covariance(Group[I]);
++			const FVector3d D = FVector3d(Group[I].Position) - Mean;
++			for (int32 Row = 0; Row < 3; ++Row)
++			{
++				for (int32 Col = 0; Col < 3; ++Col)
++				{
++					Want.M[Row][Col] += Weights[I] / Sum * (C.M[Row][Col] + D[Row] * D[Col]);
++				}
++			}
++		}
++		const double WantOpacity = FMath::Min(1.0 - Transparency, Sum / Footprint(M.Scale));
++		GroupCov = FMath::Max(GroupCov, RelativeError(Covariance(M), Want));
++		GroupMean = FMath::Max(GroupMean, (FVector3d(M.Position) - Mean).GetAbsMax());
++		GroupOpacity = FMath::Max(GroupOpacity, FMath::Abs(double(M.Opacity) - WantOpacity));
++	}
++	TestTrue(FString::Printf(TEXT("Merged covariance is the group's second moment (max relative error %.3g)"), GroupCov), GroupCov <= 1e-5);
++	TestTrue(FString::Printf(TEXT("Merged centre is the weighted mean (max error %.3g cm)"), GroupMean), GroupMean <= 1e-3);
++	TestTrue(FString::Printf(TEXT("Merged opacity is capped by coverage (max error %.3g)"), GroupOpacity), GroupOpacity <= 1e-5);
++
++	// Four flat splats tiling a tilted wall 2 sigma apart: the merged splat lies in the wall, stays as thin as its
++	// children and spreads over both of them (variance 4^2 + 4^2 per in-plane axis); side by side, its opacity is
++	// set by coverage (4 x 0.3 x 16 / 32 = 0.6), not by stacking (1 - 0.7^4 = 0.76).
++	{
++		const FQuat4f Wall = FQuat4f(FVector3f(0.3f, -0.8f, 0.5f).GetSafeNormal(), 0.7f);
++		const FVector3f U = Wall.RotateVector(FVector3f(1, 0, 0)), V = Wall.RotateVector(FVector3f(0, 1, 0)), N = Wall.RotateVector(FVector3f(0, 0, 1));
++		TArray<FGaussianSplatData> Tiles;
++		for (int32 I = 0; I < 4; ++I)
++		{
++			FGaussianSplatData S;
++			S.Position = FVector3f(50, 60, 70) + U * ((I & 1) ? 4.0f : -4.0f) + V * ((I & 2) ? 4.0f : -4.0f);
++			S.Rotation = Wall;
++			S.Scale = FVector3f(4.0f, 4.0f, 0.05f);
++			S.Opacity = 0.3f;
++			Tiles.Add(S);
++		}
++		const FGaussianSplatData M = FGaussianClusterBuilder::MergeGaussians(Tiles, 0, Tiles.Num());
++		// The thinnest merged axis is the wall normal
++		const FVector3f Axes[3] = { M.Rotation.RotateVector(FVector3f(1, 0, 0)), M.Rotation.RotateVector(FVector3f(0, 1, 0)), M.Rotation.RotateVector(FVector3f(0, 0, 1)) };
++		const int32 Thin = M.Scale.X <= M.Scale.Y ? (M.Scale.X <= M.Scale.Z ? 0 : 2) : (M.Scale.Y <= M.Scale.Z ? 1 : 2);
++		TestTrue(TEXT("Merged wall splat is oriented along the wall"), FMath::Abs(Axes[Thin] | N) >= 0.9999f);
++		TestTrue(TEXT("Merged wall splat stays as thin as its children"), FMath::IsNearlyEqual(M.Scale[Thin], 0.05f, 1e-4f));
++		TestTrue(TEXT("Merged wall splat spans its children"), FMath::IsNearlyEqual(M.Scale[(Thin + 1) % 3], FMath::Sqrt(32.0f), 1e-3f)
++			&& FMath::IsNearlyEqual(M.Scale[(Thin + 2) % 3], FMath::Sqrt(32.0f), 1e-3f));
++		TestTrue(FString::Printf(TEXT("Side-by-side children keep their coverage (opacity %.4f)"), M.Opacity), FMath::IsNearlyEqual(M.Opacity, 0.6f, 1e-4f));
++	}
++
++	// Stacked copies of one splat: same Gaussian, opacity 1 - prod(1 - a_i)
++	{
++		const TArray<FGaussianSplatData> Stack = { RandomSplat(Rng, FVector3f(0), 0), RandomSplat(Rng, FVector3f(0), 0) };
++		TArray<FGaussianSplatData> Copies = { Stack[0], Stack[0], Stack[0] };
++		Copies[1].Opacity = 0.5f;
++		Copies[2].Opacity = 0.25f;
++		const FGaussianSplatData M = FGaussianClusterBuilder::MergeGaussians(Copies, 0, Copies.Num());
++		const double Stacked = 1.0 - (1.0 - Copies[0].Opacity) * 0.5 * 0.75;
++		TestTrue(TEXT("Stacked copies keep the covariance"), RelativeError(Covariance(M), Covariance(Copies[0])) <= 1e-5);
++		TestTrue(FString::Printf(TEXT("Stacked copies combine opacity as 1 - prod(1 - a) (%.4f vs %.4f)"), M.Opacity, Stacked), FMath::IsNearlyEqual(double(M.Opacity), Stacked, 1e-5));
++	}
++	return true;
++}
++
++#endif // WITH_DEV_AUTOMATION_TESTS
+diff -ruN a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp
+--- a/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-10-08 10:11:12
++++ b/Plugins/NanoGS/Source/NanoGSEditor/Private/Tests/SOGImportTests.cpp	2026-09-29 17:18:40
+@@ -176,10 +176,21 @@
+ 
+ 	const sog::PackedSplat* Packed = reinterpret_cast<const sog::PackedSplat*>(Records.GetData());
+ 	const sog::AssetConstants& Constants = Asset->GetSOGConstants();
+-	const TArray<float>& ScaleLUT = Asset->GetSOGScaleLUT();
+ 	const TArray<FVector> Decoded = Asset->GetDecompressedPositions();
+-	double BaseErr = 0.0, LodErr = 0.0, LodScaleLog = 0.0, LodScaleLogSum = 0.0, LodOpacity = 0.0, DecodedErr = 0.0;
+-	int32 LodNoSH = 0;
++	// LOD records decode against the source's ranges and codebooks. Merged LOD splats can be larger than the largest
++	// codebook scale: those axes clamp to it and the opacity grows by the lost footprint (GaussianSplatSOG::BuildRecords).
++	sog::DecodedAsset Built = Source;
++	Built.splats.assign(Packed, Packed + Total);
++	Built.count = uint32(Total);
++	float MaxLogScale = Source.scaleCodebook[0];
++	for (const float LogScale : Source.scaleCodebook)
++	{
++		MaxLogScale = FMath::Max(MaxLogScale, LogScale);
++	}
++	const float MaxScale = FMath::Exp(MaxLogScale);
++	auto Footprint = [](const float* S) { return FMath::Max3(double(S[0]) * S[1], double(S[0]) * S[2], double(S[1]) * S[2]); };
++	double BaseErr = 0.0, LodErr = 0.0, LodScaleLog = 0.0, LodScaleLogSum = 0.0, LodRotation = 0.0, LodOpacity = 0.0, DecodedErr = 0.0;
++	int32 LodNoSH = 0, LodClamped = 0, LodInRangeAxes = 0;
+ 	for (int32 I = 0; I < Total; ++I)
+ 	{
+ 		const FVector3f Position = GaussianSplatSOG::DecodePosition(Constants, Packed[I]);
+@@ -192,25 +203,46 @@
+ 		}
+ 		LodErr = FMath::Max(LodErr, Err);
+ 		LodNoSH += ((Packed[I].dc >> 24) & sog::kFlagNoSH) ? 1 : 0;
+-		// Local scale axes are file (z, x, y), times 100
+-		const uint32 SO = Packed[I].scaleOpacity;
+-		const FVector3f Scale(ScaleLUT[(SO >> 16) & 0xFF] * 100.0f, ScaleLUT[SO & 0xFF] * 100.0f, ScaleLUT[(SO >> 8) & 0xFF] * 100.0f);
++
++		sog::SplatFloat Got, Want;
++		sog::DecodeSplat(Built, size_t(I), Got);
++		GaussianSplatSOG::FromSplatData(Expected[I], Want);
++		const double Dot = FMath::Abs(double(Got.rotation[0]) * Want.rotation[0] + double(Got.rotation[1]) * Want.rotation[1]
++			+ double(Got.rotation[2]) * Want.rotation[2] + double(Got.rotation[3]) * Want.rotation[3]);
++		LodRotation = FMath::Max(LodRotation, FMath::RadiansToDegrees(2.0 * FMath::Acos(FMath::Min(Dot, 1.0))));
++		bool bClamped = false;
+ 		for (int32 K = 0; K < 3; ++K)
+ 		{
+-			const double LogErr = FMath::Abs(FMath::Loge(double(Scale[K]) / double(FMath::Max(Expected[I].Scale[K], 1e-12f))));
++			if (Want.scale[K] > MaxScale)
++			{
++				bClamped = true;
++				LodScaleLog = FMath::Max(LodScaleLog, FMath::Abs(FMath::Loge(double(Got.scale[K]) / double(MaxScale))));
++				continue;
++			}
++			const double LogErr = FMath::Abs(FMath::Loge(double(Got.scale[K]) / double(FMath::Max(Want.scale[K], 1e-12f))));
+ 			LodScaleLog = FMath::Max(LodScaleLog, LogErr);
+ 			LodScaleLogSum += LogErr;
++			LodInRangeAxes++;
+ 		}
+-		LodOpacity = FMath::Max(LodOpacity, FMath::Abs(double(SO >> 24) / 255.0 - double(Expected[I].Opacity)));
++		float WantOpacity = Want.opacity;
++		if (bClamped)
++		{
++			const float Clamped[3] = { FMath::Min(Want.scale[0], MaxScale), FMath::Min(Want.scale[1], MaxScale), FMath::Min(Want.scale[2], MaxScale) };
++			WantOpacity = FMath::Min(1.0f, WantOpacity * float(Footprint(Want.scale) / Footprint(Clamped)));
++			LodClamped++;
++		}
++		LodOpacity = FMath::Max(LodOpacity, FMath::Abs(double(Got.opacity) - double(WantOpacity)));
+ 	}
+ 	const int32 NumLod = Total - Base;
+ 	AddInfo(FString::Printf(TEXT("Nanite: %d base + %d LOD splats, %d clusters; position vs reference build: base %.3g cm, LOD %.3g cm; ")
+-		TEXT("LOD scale |log error| max %.3g mean %.3g; LOD opacity max %.3g"),
+-		Base, NumLod, Asset->GetClusterCount(), BaseErr, LodErr, LodScaleLog, LodScaleLogSum / FMath::Max(1, 3 * NumLod), LodOpacity));
++		TEXT("LOD rotation max %.3g deg; LOD scale |log error| max %.3g mean %.3g; %d LOD splats clamped to the largest codebook scale; LOD opacity max %.3g"),
++		Base, NumLod, Asset->GetClusterCount(), BaseErr, LodErr, LodRotation, LodScaleLog, LodScaleLogSum / FMath::Max(1, LodInRangeAxes), LodClamped, LodOpacity));
+ 	TestTrue(TEXT("Base splats follow the builder's reordering"), BaseErr <= 0.01);
+ 	TestTrue(TEXT("LOD splats quantize within 0.1 cm"), LodErr <= 0.1);
+-	TestTrue(TEXT("LOD scales stay within the codebook's resolution"), LodScaleLog <= 0.25);
+-	TestTrue(TEXT("LOD opacity within one 8-bit step"), LodOpacity <= 0.5 / 255.0 + 1e-6);
++	TestTrue(TEXT("LOD rotations quantize within 1 degree"), LodRotation <= 1.0);
++	TestTrue(TEXT("LOD scales stay within the codebook's resolution (clamped axes at its largest entry)"), LodScaleLog <= 0.25);
++	TestTrue(TEXT("At most 0.1% of LOD splats exceed the codebook"), LodClamped <= NumLod / 1000);
++	TestTrue(TEXT("LOD opacity within one 8-bit step (clamped splats: coverage-preserving opacity)"), LodOpacity <= 0.5 / 255.0 + 1e-6);
+ 	TestEqual(TEXT("Every LOD splat is flagged as having no SH"), LodNoSH, NumLod);
+ 	TestTrue(TEXT("GetDecompressedPositions decodes the SOG records"), Decoded.Num() == Total && DecodedErr == 0.0);
+ 
